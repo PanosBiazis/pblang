@@ -1,0 +1,385 @@
+// Pure PBLang conversion-cost receipt validator and summarizer.
+// Validates paired conversion-cost receipts without rerunning measurements
+// and without claiming causal attribution or speedup proof.
+
+let PRIMARY_FIXTURE = "4d1ade5412d8b04539c409ddf8cebf14b259f00097143849368a32e61e208a83";
+let STAGE_FIXTURE = "5348b4beed7b8f6311e6c7af29f6af57f463fdead43d6b3a2e4b955b6095fde1";
+let METRICS = ["cpu_s", "wall_s", "maxrss_kib"];
+let SECURE_FILE = import("stdlib:secure_file.sapp");
+
+fn _require(condition, message) {
+    if not condition {
+        throw message;
+    }
+}
+
+fn _is_finite_nonneg(value) {
+    if type(value) != "number" { return false; }
+    let zero_probe = value * 0;
+    return value == value and zero_probe == 0 and value >= 0;
+}
+
+fn _sorted_nums(values) {
+    let out = [];
+    for v in values {
+        push(out, v);
+    }
+    return array_sort(out);
+}
+
+fn _median(values) {
+    _require(type(values) == "array" and len(values) > 0, "median requires non-empty array");
+    let ordered = _sorted_nums(values);
+    let n = len(ordered);
+    let mid = num_floor(n / 2);
+    if (n % 2) == 1 {
+        return ordered[mid];
+    }
+    return (ordered[mid - 1] + ordered[mid]) / 2;
+}
+
+fn _min_val(values) {
+    let ordered = _sorted_nums(values);
+    return ordered[0];
+}
+
+fn _max_val(values) {
+    let ordered = _sorted_nums(values);
+    return ordered[len(ordered) - 1];
+}
+
+fn _sum_vals(values) {
+    let total = 0;
+    for v in values {
+        total = total + v;
+    }
+    return total;
+}
+
+fn summarize(data, stages = false) {
+    _require(type(data) == "map", "receipt must be an object");
+    _require(map_has(data, "format") and data["format"] == "cycle16.conversion-measurement.v1", "unsupported receipt format");
+    _require(map_has(data, "group") and data["group"] == "escape", "unexpected workload");
+
+    let flags = ["passed", "source_hidden", "release_hashes_unchanged", "fixtures_removed"];
+    for key in flags {
+        let val = if map_has(data, key) { data[key] } else { nil };
+        _require(type(val) == "bool" and val == true, "unsuccessful or incomplete receipt: " + key);
+    }
+
+    let expected_fixture = if stages { STAGE_FIXTURE } else { PRIMARY_FIXTURE };
+    _require(map_has(data, "fixture_sha256") and data["fixture_sha256"] == expected_fixture, "fixture changed");
+    _require(
+        map_has(data, "samples_per_variant") and type(data["samples_per_variant"]) == "number" and data["samples_per_variant"] == 11
+        and map_has(data, "warmups_per_variant") and type(data["warmups_per_variant"]) == "number" and data["warmups_per_variant"] == 2,
+        "sample contract changed"
+    );
+
+    let limits = if map_has(data, "limits") { data["limits"] } else { nil };
+    _require(
+        type(limits) == "map" and len(map_keys(limits)) == 2
+        and map_has(limits, "group_s") and type(limits["group_s"]) == "number" and limits["group_s"] == 50
+        and map_has(limits, "sample_s") and type(limits["sample_s"]) == "number" and limits["sample_s"] == 5,
+        "measurement bounds changed"
+    );
+
+    let rows = if map_has(data, "rows") { data["rows"] } else { nil };
+    _require(type(rows) == "array" and len(rows) == 26, "expected all 26 invocations");
+
+    let samples = map{
+        baseline: [],
+        candidate: []
+    };
+
+    for index 26 {
+        let row = rows[index];
+        _require(type(row) == "map", "invalid sample");
+        let pair = num_floor(index / 2);
+        let order = if (pair % 2) == 0 { ["baseline", "candidate"] } else { ["candidate", "baseline"] };
+        let expected_variant = order[index % 2];
+        _require(
+            map_has(row, "pair") and type(row["pair"]) == "number" and row["pair"] == pair
+            and map_has(row, "variant") and row["variant"] == expected_variant,
+            "pair sequence changed"
+        );
+        let expected_warmup = pair < 2;
+        _require(
+            map_has(row, "warmup") and type(row["warmup"]) == "bool" and row["warmup"] == expected_warmup,
+            "warmup classification changed"
+        );
+        let first_err = if map_has(row, "first_error") { row["first_error"] } else { "missing" };
+        _require(
+            map_has(row, "exit") and type(row["exit"]) == "number" and row["exit"] == 0
+            and map_has(row, "stdout") and row["stdout"] == "escape_benchmark_pass\n"
+            and map_has(row, "stderr") and row["stderr"] == ""
+            and first_err == nil,
+            "sample oracle failed"
+        );
+        _require(
+            map_has(row, "timed_out") and type(row["timed_out"]) == "bool" and row["timed_out"] == false
+            and map_has(row, "owned_group_remaining") and type(row["owned_group_remaining"]) == "bool" and row["owned_group_remaining"] == false,
+            "sample timed out or left an owned process"
+        );
+
+        let all_metrics = ["cpu_s", "wall_s", "maxrss_kib", "cpu_user_s", "cpu_system_s"];
+        for metric in all_metrics {
+            let mv = if map_has(row, metric) { row[metric] } else { nil };
+            _require(_is_finite_nonneg(mv), "invalid metric: " + metric);
+        }
+        for key in METRICS {
+            _require(row[key] > 0, "zero measurement");
+        }
+        let cpu_diff = num_abs(row["cpu_s"] - (row["cpu_user_s"] + row["cpu_system_s"]));
+        _require(cpu_diff <= 0.000001, "CPU accounting mismatch");
+
+        if stages {
+            let phase = if map_has(row, "stage_ms") { row["stage_ms"] } else { nil };
+            _require(type(phase) == "array" and len(phase) == 3, "invalid stage durations");
+            for v in phase {
+                _require(_is_finite_nonneg(v), "invalid stage durations");
+            }
+            let total_phase = _sum_vals(phase);
+            _require(total_phase > 0 and total_phase <= row["wall_s"] * 1000 + 1, "stage durations exceed whole invocation");
+        }
+
+        if pair >= 2 {
+            push(samples[row["variant"]], row);
+        }
+    }
+
+    let summary = map{};
+    for metric in METRICS {
+        let base_vals = [];
+        let cand_vals = [];
+        let paired_pcts = [];
+        for i len(samples["baseline"]) {
+            let bv = samples["baseline"][i][metric];
+            let cv = samples["candidate"][i][metric];
+            push(base_vals, bv);
+            push(cand_vals, cv);
+            push(paired_pcts, 100 * (cv / bv - 1));
+        }
+        let b_med = _median(base_vals);
+        let c_med = _median(cand_vals);
+        summary[metric] = map{
+            baseline_median: b_med,
+            candidate_median: c_med,
+            median_ratio_change_percent: 100 * (c_med / b_med - 1),
+            paired_median_change_percent: _median(paired_pcts),
+            baseline_range: [_min_val(base_vals), _max_val(base_vals)],
+            candidate_range: [_min_val(cand_vals), _max_val(cand_vals)]
+        };
+    }
+
+    let result = map{
+        summary: summary,
+        measured_invocations: 22,
+        warmup_invocations: 4,
+        loadavg_before: if map_has(data, "loadavg_before") { data["loadavg_before"] } else { nil },
+        loadavg_after: if map_has(data, "loadavg_after") { data["loadavg_after"] } else { nil },
+        baseline: if map_has(data, "baseline") { data["baseline"] } else { nil },
+        candidate: if map_has(data, "candidate") { data["candidate"] } else { nil },
+        causal_attribution: false,
+        speedup_established: false,
+        p95_note: "For 11 samples nearest-rank p95 is the maximum, not an independent tail estimate."
+    };
+
+    if stages {
+        let stage_out = map{};
+        let variants = ["baseline", "candidate"];
+        let phase_names = ["imports", "compile", "run_100"];
+        for variant in variants {
+            let vrows = samples[variant];
+            let wall_ms = map{};
+            for pi 3 {
+                let col = [];
+                for r in vrows {
+                    push(col, r["stage_ms"][pi]);
+                }
+                wall_ms[phase_names[pi]] = _median(col);
+            }
+            let import_fracs = [];
+            for r in vrows {
+                push(import_fracs, r["stage_ms"][0] / _sum_vals(r["stage_ms"]));
+            }
+            stage_out[variant] = map{
+                median_wall_ms: wall_ms,
+                median_import_fraction_of_instrumented_interval: _median(import_fracs)
+            };
+        }
+        result["stages"] = stage_out;
+    }
+    return result;
+}
+
+fn read_receipt(path) {
+    let raw = SECURE_FILE.read_bytes(path, 1048576);
+    if not raw.ok {
+        throw "receipt read failed or exceeds 1 MiB: " + str(raw.error);
+    }
+    let text = bytes_to_str(raw.bytes);
+    let parsed = json_parse(text);
+    return map{
+        data: parsed,
+        digest: sha256(text)
+    };
+}
+
+fn build_sample_receipt(stages = false) {
+    let rows = [];
+    for pair 13 {
+        let order = if (pair % 2) == 0 { ["baseline", "candidate"] } else { ["candidate", "baseline"] };
+        for variant in order {
+            let value = if variant == "baseline" { 1 } else { 2 };
+            let row = map{
+                pair: pair,
+                variant: variant,
+                warmup: pair < 2,
+                exit: 0,
+                stdout: "escape_benchmark_pass\n",
+                stderr: "",
+                first_error: nil,
+                timed_out: false,
+                owned_group_remaining: false,
+                cpu_s: value,
+                cpu_user_s: value * 0.75,
+                cpu_system_s: value * 0.25,
+                wall_s: value,
+                maxrss_kib: 1000 * value
+            };
+            if stages {
+                row["stage_ms"] = [800, 10, 20];
+            }
+            push(rows, row);
+        }
+    }
+    return map{
+        format: "cycle16.conversion-measurement.v1",
+        group: "escape",
+        passed: true,
+        source_hidden: true,
+        release_hashes_unchanged: true,
+        fixtures_removed: true,
+        fixture_sha256: if stages { STAGE_FIXTURE } else { PRIMARY_FIXTURE },
+        samples_per_variant: 11,
+        warmups_per_variant: 2,
+        limits: map{ group_s: 50, sample_s: 5 },
+        rows: rows
+    };
+}
+
+fn _rm_rf(target) {
+    if not fs_exists(target) { return; }
+    let entries = try fs_listdir(target) catch nil;
+    if entries != nil {
+        for name in entries {
+            _rm_rf(target + "/" + name);
+        }
+    }
+    let _ok = try fs_remove(target) catch false;
+}
+
+fn _parse_cli() {
+    let args = os_args();
+    let receipt_path = "";
+    let stages = false;
+    let after_sep = false;
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if a == "--" {
+            after_sep = true;
+        } elif a == "--stages" {
+            stages = true;
+        } elif a == "--receipt" and i + 1 < len(args) {
+            receipt_path = args[i + 1];
+            i = i + 1;
+        } elif after_sep and not str_starts_with(a, "--") and receipt_path == "" {
+            receipt_path = a;
+        }
+        i = i + 1;
+    }
+    return map{ receipt_path: receipt_path, stages: stages };
+}
+
+fn _is_direct_entry() {
+    for a in os_args() {
+        if a == "selfhost_cost_summary.sapp" or str_ends_with(a, "/selfhost_cost_summary.sapp") {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn _assert_oversized_rejected(big_path) {
+    let big_failed = false;
+    try {
+        let _ignored = read_receipt(big_path);
+    } catch {
+        big_failed = true;
+    }
+    assert(big_failed, "oversized receipt (>1 MiB) rejected");
+}
+
+fn run_cli_or_selfcheck() {
+    let cli = _parse_cli();
+    if cli.receipt_path != "" {
+        let loaded = read_receipt(cli.receipt_path);
+        let res = summarize(loaded.data, cli.stages);
+        res["input_sha256"] = loaded.digest;
+        print json_stringify(res);
+        return res;
+    }
+
+    let scratch = "/tmp/pblang_tooling_s2_cost_summary_" + str(now_ms());
+    fs_mkdirs(scratch);
+    let p_path = scratch + "/primary.json";
+    let s_path = scratch + "/stages.json";
+    let big_path = scratch + "/oversized.json";
+    let err_msg = "";
+    let summary_out = map{};
+    try {
+        fs_write(p_path, json_stringify(build_sample_receipt(false)));
+        fs_write(s_path, json_stringify(build_sample_receipt(true)));
+        fs_write(big_path, str_repeat("x", 1048577));
+
+        let p_loaded = read_receipt(p_path);
+        let p_sum = summarize(p_loaded.data, false);
+        assert(p_sum.measured_invocations == 22, "measured invocations == 22");
+        assert(p_sum.warmup_invocations == 4, "warmup invocations == 4");
+        assert(p_sum.causal_attribution == false, "no causal attribution claim");
+        assert(p_sum.speedup_established == false, "no speedup claim");
+        assert(p_sum.summary["cpu_s"].paired_median_change_percent == 100, "paired median change 100%");
+
+        let s_loaded = read_receipt(s_path);
+        let s_sum = summarize(s_loaded.data, true);
+        assert(s_sum.stages["baseline"].median_wall_ms["imports"] == 800, "stage imports median 800");
+
+        _assert_oversized_rejected(big_path);
+
+        summary_out = map{
+            runner: "tests/tooling/selfhost_cost_summary.sapp",
+            language: "PBLang",
+            passed: true,
+            primary_sha256: p_loaded.digest,
+            stage_sha256: s_loaded.digest
+        };
+    } catch e {
+        err_msg = str(e);
+    }
+    _rm_rf(scratch);
+    if err_msg != "" {
+        throw err_msg;
+    }
+    return summary_out;
+}
+
+if _is_direct_entry() {
+    let cli = _parse_cli();
+    let res = run_cli_or_selfcheck();
+    if cli.receipt_path == "" {
+        print json_stringify(res);
+    }
+}
+
+export PRIMARY_FIXTURE, STAGE_FIXTURE, METRICS, summarize, read_receipt, build_sample_receipt, run_cli_or_selfcheck;

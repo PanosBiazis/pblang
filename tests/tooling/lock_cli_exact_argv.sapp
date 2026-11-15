@@ -1,0 +1,350 @@
+// Exercise lock maintenance CLIs (tools/pblock.sapp and tools/pblock_install.sapp)
+// against disposable Linux project fixtures in pure PBLang.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let SER = import("stdlib:serialization.sapp");
+
+fn _find_libc() {
+    let paths = [
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/usr/lib/libc.so.6",
+        "/lib/libc.so.6"
+    ];
+    let i = 0;
+    while i < len(paths) {
+        if fs_exists(paths[i]) { return paths[i]; }
+        i = i + 1;
+    }
+    throw "lock_cli_exact_argv: libc.so.6 not found";
+}
+
+fn _rm_tree_libc(libc, path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            let child = path + "/" + entries[i];
+            if ffi_call_typed(libc, "unlink", "i32(cstr)", [child]) != 0 {
+                _rm_tree_libc(libc, child);
+            }
+            i = i + 1;
+        }
+    }
+    let _u = ffi_call_typed(libc, "unlink", "i32(cstr)", [path]);
+    let _d = ffi_call_typed(libc, "rmdir", "i32(cstr)", [path]);
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _snapshot_files(base_dir, cur_dir, rel_prefix, acc) {
+    let entries = try fs_listdir(cur_dir) catch nil;
+    if entries == nil { return; }
+    let sorted = array_sort(entries);
+    let i = 0;
+    while i < len(sorted) {
+        let nm = sorted[i];
+        let full = cur_dir + "/" + nm;
+        let rel = if rel_prefix == "" { nm } else { rel_prefix + "/" + nm };
+        let sub = try fs_listdir(full) catch nil;
+        if sub != nil {
+            _snapshot_files(base_dir, full, rel, acc);
+        } else {
+            acc[rel] = sha256(bytes_to_str(fs_read_bytes(full)));
+        }
+        i = i + 1;
+    }
+}
+
+fn _diff_snapshots(before, after) {
+    let seen = map{};
+    let bk = map_keys(before);
+    let i = 0;
+    while i < len(bk) { seen[bk[i]] = true; i = i + 1; }
+    let ak = map_keys(after);
+    let j = 0;
+    while j < len(ak) { seen[ak[j]] = true; j = j + 1; }
+
+    let all_keys = array_sort(map_keys(seen));
+    let changes = [];
+    let k = 0;
+    while k < len(all_keys) {
+        let p = all_keys[k];
+        let bv = if map_has(before, p) { before[p] } else { "" };
+        let av = if map_has(after, p) { after[p] } else { "" };
+        if bv != av {
+            array_push(changes, p);
+        }
+        k = k + 1;
+    }
+    return changes;
+}
+
+fn main() {
+    let raw_args = os_args();
+    let binary_arg = "";
+    let tools_arg = "";
+    let stdlib_arg = "";
+    let report_arg = "";
+    let idx = 0;
+    while idx < len(raw_args) {
+        let a = raw_args[idx];
+        if (a == "--binary" or a == "--runtime") and idx + 1 < len(raw_args) {
+            binary_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--tools-dir" and idx + 1 < len(raw_args) {
+            tools_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--stdlib" and idx + 1 < len(raw_args) {
+            stdlib_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--report" and idx + 1 < len(raw_args) {
+            report_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        }
+        idx = idx + 1;
+    }
+
+    let repo_root = cwd();
+    let exe = if binary_arg != "" { binary_arg } else { repo_root + "/pblang" };
+    let tools_dir = if tools_arg != "" { tools_arg } else { repo_root + "/tools" };
+    let stdlib_dir = if stdlib_arg != "" { stdlib_arg } else { repo_root + "/stdlib" };
+    assert(fs_exists(exe), "lock_cli_exact_argv: binary missing");
+
+    let libc_path = _find_libc();
+    let libc = ffi_load(libc_path);
+
+    let root = "/tmp/pblang_tooling_s1_lock_argv_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(root).ok, "create private root");
+
+    let runner = root + "/runner";
+    fs_mkdirs(runner + "/tools");
+    fs_mkdirs(runner + "/stdlib");
+    fs_write(runner + "/stdlib/probe.sapp", "print 1;\n");
+
+    let tool_names = ["pblock.sapp", "pblock_install.sapp"];
+    let ti = 0;
+    while ti < len(tool_names) {
+        let tnm = tool_names[ti];
+        let tsrc = fs_read(tools_dir + "/" + tnm);
+        let bound_tsrc = str_replace_all(tsrc, "import(\"stdlib:", "import(\"" + stdlib_dir + "/");
+        fs_write(runner + "/tools/" + tnm, bound_tsrc);
+        ti = ti + 1;
+    }
+
+    let hex_b64 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let hex_a64 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let runner_manifest = "[package]\nname=\"lock-cli-runner\"\nversion=\"0.1.0\"\nentry=\"main.sapp\"\n[dependencies]\nstdlib={path=\"stdlib\"}\n";
+    fs_write(runner + "/main.sapp", "print 0;\n");
+    fs_write(runner + "/pblang.toml", runner_manifest);
+    let runner_lock_init = "content_hash_algorithm = \"pblang-package-tree-v2\"\n"
+        + "manifest_sha256 = \"" + sha256(runner_manifest) + "\"\n"
+        + "[dependencies.stdlib]\npath = \"" + runner + "/stdlib\"\nsha256 = \"" + hex_b64 + "\"\n";
+    fs_write(runner + "/pblang.lock", runner_lock_init);
+    let orig_runner_lock = fs_read_bytes(runner + "/pblang.lock");
+
+    let records = [];
+    let prev_sargs = env_get("PBLANG_SCRIPT_ARGS");
+
+    let make_fixture = fn(name, portable) {
+        let project = root + "/" + name;
+        fs_mkdirs(project + "/dep");
+        fs_write(project + "/dep/probe.sapp", "print 7;\n");
+        let manifest = "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nentry=\"main.sapp\"\n[dependencies]\ndep={path=\"dep\"}\n";
+        fs_write(project + "/pblang.toml", manifest);
+        fs_write(project + "/main.sapp", "print 0;\n");
+        let dep_path = if portable { "dep" } else { project + "/dep" };
+        let lock_txt = "content_hash_algorithm = \"pblang-package-tree-v2\"\n"
+            + "manifest_sha256 = " + json_stringify(sha256(manifest)) + "\n"
+            + "[dependencies.dep]\npath = " + json_stringify(dep_path) + "\nsha256 = \"" + hex_a64 + "\"\n";
+        fs_write(project + "/pblang.lock", lock_txt);
+        return project;
+    };
+
+    let run_in_dir = fn(cmd_args, work_dir, sargs_env) {
+        if sargs_env != nil {
+            env_set("PBLANG_SCRIPT_ARGS", sargs_env);
+        } else {
+            env_set("PBLANG_SCRIPT_ARGS", "");
+        }
+        assert(ffi_call_typed(libc, "chdir", "i32(cstr)", [work_dir]) == 0, "chdir to work_dir");
+        let t0 = now_ms();
+        let p = proc_spawn_wait(exe, cmd_args);
+        assert(ffi_call_typed(libc, "chdir", "i32(cstr)", [repo_root]) == 0, "restore chdir");
+        assert(len(p.stdout) + len(p.stderr) <= 65536, "bounded lock CLI output");
+        return map{
+            exit: p.exit_code,
+            stdout: p.stdout,
+            stderr: p.stderr,
+            seconds: (now_ms() - t0) / 1000.0
+        };
+    };
+
+    let check_case = fn(tool, label, args, target, reject, sargs_env, separator, marker) {
+        let before = map{};
+        _snapshot_files(root, root, "", before);
+        let prev_lock_text = if not reject and target != nil { fs_read(target + "/pblang.lock") } else { "" };
+
+        let cmd = ["run", runner + "/tools/" + tool + ".sapp", "--allow-all"];
+        if separator {
+            array_push(cmd, "--");
+            let ai = 0;
+            while ai < len(args) {
+                array_push(cmd, args[ai]);
+                ai = ai + 1;
+            }
+        }
+        let result = run_in_dir(cmd, runner, sargs_env);
+        let after = map{};
+        _snapshot_files(root, root, "", after);
+        let changes = _diff_snapshots(before, after);
+
+        let ok = if reject {
+            result.exit != 0 and len(changes) == 0
+        } else {
+            result.exit == 0
+        };
+
+        if not reject and target != nil {
+            let rel_target = str_slice(target, len(root) + 1, len(target)) + "/pblang.lock";
+            ok = ok and len(changes) == 1 and changes[0] == rel_target;
+            if result.exit == 0 {
+                let parsed = SER.toml_parse(fs_read(target + "/pblang.lock"));
+                let old_parsed = SER.toml_parse(prev_lock_text);
+                let dep_key = if target == runner { "stdlib" } else { "dep" };
+                let wanted = if tool == "pblock" { dep_key } else { target + "/" + dep_key };
+                ok = ok
+                    and parsed.dependencies[dep_key].path == wanted
+                    and parsed.dependencies[dep_key].sha256 == old_parsed.dependencies[dep_key].sha256
+                    and parsed.manifest_sha256 == old_parsed.manifest_sha256
+                    and parsed.content_hash_algorithm == old_parsed.content_hash_algorithm;
+            }
+        }
+        if marker != "" {
+            ok = ok and str_contains(result.stderr, marker);
+        }
+
+        array_push(records, map{
+            tool: tool,
+            case_name: label,
+            passed: ok,
+            changed_paths: changes,
+            exit: result.exit,
+            stdout: result.stdout,
+            stderr: result.stderr
+        });
+        fs_write_bytes(runner + "/pblang.lock", orig_runner_lock);
+        if not ok {
+            print "FAIL_LOCK_ARGV: " + tool + "/" + label + " changes=" + json_stringify(changes) + " stderr=" + result.stderr;
+        }
+        assert(ok, "lock_cli_exact_argv failed: " + tool + "/" + label);
+    };
+
+    let run_suite = fn() {
+        let tools = ["pblock", "pblock_install"];
+        let t_idx = 0;
+        while t_idx < len(tools) {
+            let tool = tools[t_idx];
+            let is_install = tool == "pblock_install";
+            let suffixes = ["ordinary", "trailing ", " leading", "space inside", "--option"];
+            let si = 0;
+            while si < len(suffixes) {
+                let sfx = suffixes[si];
+                let proj = make_fixture(tool + "-" + sfx, is_install);
+                if sfx == "trailing " {
+                    let _decoy_trim = make_fixture(tool + "-trailing", is_install);
+                }
+                check_case(tool, sfx, [proj], proj, false, nil, true, "");
+                si = si + 1;
+            }
+
+            let arity_target = make_fixture(tool + "-arity-target", is_install);
+            check_case(tool, "extra_arg", [arity_target, "extra"], nil, true, nil, true, tool + ":");
+            check_case(tool, "empty_arg", [""], nil, true, nil, true, tool + ":");
+
+            let decoy = make_fixture(tool + "-environment-decoy", is_install);
+            check_case(
+                tool,
+                "environment_injection",
+                [],
+                if is_install { nil } else { runner },
+                is_install,
+                decoy,
+                false,
+                if is_install { tool + ":" } else { "" }
+            );
+
+            let exp_target = make_fixture(tool + "-explicit-target", is_install);
+            check_case(tool, "explicit_arg_over_environment", [exp_target], exp_target, false, decoy, true, "");
+
+            check_case(
+                tool,
+                "no_argument",
+                [],
+                if is_install { nil } else { runner },
+                is_install,
+                nil,
+                false,
+                if is_install { tool + ":" } else { "" }
+            );
+            check_case(
+                tool,
+                "separator_without_argument",
+                [],
+                if is_install { nil } else { runner },
+                is_install,
+                nil,
+                true,
+                if is_install { tool + ":" } else { "" }
+            );
+
+            let ctrls = [
+                map{ ch: "\n", tag: "lf", label: "newline" },
+                map{ ch: "\r", tag: "cr", label: "carriage_return" }
+            ];
+            let ci = 0;
+            while ci < len(ctrls) {
+                let c = ctrls[ci];
+                let cbase = tool + "-control-" + c.tag;
+                let _prefix_decoy = make_fixture(cbase, is_install);
+                let ctarget = make_fixture(cbase + c.ch + "tail", is_install);
+                check_case(tool, "refuse_" + c.label, [ctarget], nil, true, nil, true, tool + ":");
+                ci = ci + 1;
+            }
+            t_idx = t_idx + 1;
+        }
+        return true;
+    };
+
+    let ok = try run_suite() catch false;
+    let _restore_cd = ffi_call_typed(libc, "chdir", "i32(cstr)", [repo_root]);
+    if prev_sargs != nil {
+        env_set("PBLANG_SCRIPT_ARGS", prev_sargs);
+    } else {
+        env_set("PBLANG_SCRIPT_ARGS", "");
+    }
+
+    _rm_tree_libc(libc, root);
+    ffi_close(libc);
+    assert(not fs_exists(root), "lock_cli_exact_argv fixture root cleaned up");
+
+    let report = map{
+        schema: "pblang.lock-cli-argv.v1",
+        passed: if ok { len(records) } else { 0 },
+        total: len(records),
+        failed: if ok { 0 } else { 1 },
+        fixture_removed_after_run: true,
+        cases: records
+    };
+    if report_arg != "" {
+        let pdir = path_dirname(report_arg);
+        if pdir != "" and pdir != "." { fs_mkdirs(pdir); }
+        fs_write(report_arg, json_stringify(report) + "\n");
+    }
+
+    assert(ok and len(records) == 26, "lock_cli_exact_argv failed: ok=" + str(ok) + " count=" + str(len(records)));
+    print "lock_cli_exact_argv_pass: cases=" + str(len(records));
+}
+
+main();

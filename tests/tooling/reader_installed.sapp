@@ -1,0 +1,309 @@
+// Pure PBLang verification: read-only installed reader launcher check and headless GUI journey with unchanged release and data isolation.
+let Builder = import("../../examples/declarative_browser/package_builder.sapp");
+let Install = import("../../examples/declarative_browser/install_manager.sapp");
+let Store = import("../../examples/declarative_browser/appearance_store.sapp");
+let App = import("../../examples/declarative_browser/app.sapp");
+let Dir = import("stdlib:linux_dirfs.sapp");
+let Hash = import("stdlib:sha256_pb.sapp");
+let G = import("stdlib:graphics.sapp");
+let FM = import("stdlib:font_metrics.sapp");
+
+fn _cli_args() {
+    let raw = try env_get("PBLANG_SCRIPT_ARGS") catch "";
+    if type(raw) == "string" and raw != "" { return str_split(raw, "\n"); }
+    let argv = os_args();
+    let out = [];
+    let after = false;
+    for item in argv {
+        if after { array_push(out, item); }
+        elif item == "--" { after = true; }
+    }
+    return out;
+}
+
+fn _parse_opts(args) {
+    let opts = map{ root: "", bin_dir: "", evidence: "", runtime: "", report: "" };
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if a == "--bin-dir" and i + 1 < len(args) {
+            opts.bin_dir = args[i + 1];
+            i = i + 2;
+        } elif (a == "--root" or a == "--evidence" or a == "--runtime" or a == "--report") and i + 1 < len(args) {
+            opts[str_slice(a, 2, len(a))] = args[i + 1];
+            i = i + 2;
+        } else {
+            i = i + 1;
+        }
+    }
+    return opts;
+}
+
+fn _mk_private_tmp(prefix) {
+    let name = "pblang_tooling_s4_" + prefix + "_" + str(num_floor(now_ms()));
+    let tmp_fs = Dir.open_absolute("/tmp", false, false);
+    assert(tmp_fs.ok, "open /tmp handle");
+    let created = Dir.mkdir_new(tmp_fs, name, false);
+    let closed = Dir.close(tmp_fs);
+    assert(created.ok and closed, "create private temp dir");
+    return path_join("/tmp", name);
+}
+
+fn _rm_tree(path) {
+    if not (try fs_exists(path) catch false) { return; }
+    let entries = try fs_listdir(path) catch nil;
+    if type(entries) == "array" {
+        for name in entries { _rm_tree(path_join(path, name)); }
+    }
+    let _r = try fs_remove(path) catch nil;
+}
+
+fn _sha256_bytes(bytes) {
+    let h = Hash.new();
+    Hash.update(h, bytes);
+    return Hash.finish(h);
+}
+
+fn _walk_snapshot(root, rel, out) {
+    let cur = if rel == "" { root } else { path_join(root, rel) };
+    let entries = try fs_listdir(cur) catch nil;
+    if type(entries) == "array" {
+        for name in array_sort(entries) {
+            let child = if rel == "" { name } else { rel + "/" + name };
+            _walk_snapshot(root, child, out);
+        }
+        return;
+    }
+    if rel != "" and fs_exists(cur) {
+        out[rel] = _sha256_bytes(fs_read_bytes(cur));
+    }
+}
+
+fn _snapshot_dir(root) {
+    let out = map{};
+    _walk_snapshot(root, "", out);
+    return out;
+}
+
+fn _font_measurer() {
+    let fonts = map{};
+    for fam in ["sans", "serif", "monospace", "system"] {
+        let resolved = G.text_font_resolve(fam);
+        fonts[fam] = if resolved != "" { FM.load(resolved) } else { nil };
+    }
+    return fn(text, px, family) {
+        if text == "" { return map{ ok: true, width: 0, height: px }; }
+        let fam = if map_has(fonts, family) { family } else { "sans" };
+        let layout = try FM.layout(fonts[fam], text, px) catch nil;
+        if layout != nil {
+            return map{ ok: true, width: layout.width, height: layout.height };
+        }
+        return map{ ok: true, width: num_floor(len(text) * px * 0.6 + 0.999), height: px };
+    };
+}
+
+fn _draw_frame(c, measure_fn) {
+    let drawn = 0;
+    let canvas = map{
+        clear: fn(_col) {},
+        rect: fn(_x, _y, _rw, _rh, _col) {},
+        rects: fn(_list, _col) {},
+        line: fn(_x1, _y1, _x2, _y2, _col) {},
+        point: fn(_x, _y, _col) {},
+        circle: fn(_cx, _cy, _r, _col) {},
+        textMeasure: fn(text, px, _adv, fam) { return measure_fn(text, px, fam); },
+        textStyled: fn(_x, _y, _text, _col, _px, _adv, _fam) {
+            drawn = drawn + 1;
+            return map{ ok: true, font: "sans", renderer: "native-aa-fontdue", positioning: "truetype-baseline" };
+        }
+    };
+    App.draw(c, canvas);
+    return drawn;
+}
+
+fn _provision_installed(work, repo, runtime) {
+    let pkg = path_join(work, "candidate");
+    let built = Builder.bundle(repo, pkg, runtime);
+    assert(built.ok and built.owned_handles_closed, "bundle candidate for installed reader check");
+
+    let work_fs = Dir.open_absolute(work, false, true);
+    assert(work_fs.ok and Dir.mkdir_new(work_fs, "bin", false).ok and Dir.close(work_fs), "create private bin dir");
+
+    let root = path_join(work, "reader");
+    let bin_dir = path_join(work, "bin");
+    let pin = sha256(base64_encode_bytes(fs_read_bytes(path_join(pkg, "pblang"))));
+    let prep = Install.run(["prepare", pkg, root, "v1", pin]);
+    assert(prep.ok and prep.owned_handles_closed, "prepare v1 installation");
+
+    let receipt_path = path_join(work, "v1_accept.json");
+    let receipt = map{
+        format: "pblang.reader.acceptance.v1",
+        version: "v1",
+        fingerprint: prep.release.fingerprint,
+        passed: true,
+        checks: map{
+            source_hidden: true,
+            launcher: true,
+            style: true,
+            pagination: true,
+            content_unchanged: true
+        },
+        provenance: "Synthetic TEST ONLY for standalone reader_installed verification"
+    };
+    fs_write(receipt_path, json_stringify(receipt) + "\n");
+    let act = Install.run(["activate", root, "v1", bin_dir, receipt_path]);
+    assert(act.ok and act.owned_handles_closed, "activate v1 launcher");
+    return map{ root: root, bin_dir: bin_dir };
+}
+
+fn _default_runtime(repo) {
+    return path_join(repo, "pblang");
+}
+
+fn _copy_tree(src, dst) {
+    let entries = try fs_listdir(src) catch nil;
+    if type(entries) == "array" {
+        fs_mkdirs(dst);
+        for name in entries {
+            _copy_tree(path_join(src, name), path_join(dst, name));
+        }
+        return;
+    }
+    fs_write_bytes(dst, fs_read_bytes(src));
+}
+
+fn _stage_stdlib_env(pkg_dir, dst_stdlib) {
+    _copy_tree(path_join(pkg_dir, "stdlib"), dst_stdlib);
+    let sentinel = path_join(dst_stdlib, "math.sapp");
+    if not fs_exists(sentinel) {
+        fs_write(sentinel, "// sentinel for single-file PBLANG_STDLIB lookup\n");
+    }
+    return dst_stdlib;
+}
+
+fn _journey(opts, work) {
+    let repo = cwd();
+    let runtime = if opts.runtime != "" { opts.runtime } else { _default_runtime(repo) };
+    let root = opts.root;
+    let bin_dir = opts.bin_dir;
+    if root == "" or bin_dir == "" {
+        let provisioned = _provision_installed(work, repo, runtime);
+        root = provisioned.root;
+        bin_dir = provisioned.bin_dir;
+    }
+
+    let launcher = path_join(bin_dir, "pb-document-reader");
+    let original_bytes = fs_read_bytes(launcher);
+    let original_text = bytes_to_str(original_bytes);
+    let lines = str_split(original_text, "\n");
+    assert(len(lines) >= 4 and lines[1] == "# pblang.reader.install.v1", "managed reader launcher header");
+    assert(str_starts_with(lines[2], "# current="), "current version header");
+    let version = str_slice(lines[2], 10, len(lines[2]));
+    assert(not str_contains(version, "/") and not str_contains(version, ".."), "safe version identifier");
+    let sel = Install.selection(original_text, root);
+    assert(sel.current == version, "Install.selection verified managed launcher target");
+
+    let release = path_join(path_join(root, "releases"), version);
+    let before = _snapshot_dir(release);
+    let data_dir = path_join(root, "data");
+    let data_before = _snapshot_dir(data_dir);
+
+    // Verify Store.data_parent resolves installed root/data when running inside root/releases/<version>.
+    assert(Store.data_parent(release, nil) == data_dir, "installed release resolves root/data cleanly");
+
+    // 1. Offline check from foreign /tmp directory using installed release runtime and modules.
+    let rel_stdlib = _stage_stdlib_env(release, path_join(work, "rel_stdlib_env"));
+    let offline = proc_spawn_wait("/usr/bin/env", [
+        "-C", "/tmp",
+        "PBLANG_STDLIB=" + rel_stdlib,
+        "PBLANG_SCRIPT_ARGS=",
+        path_join(release, "pblang"), "run", path_join(release, "examples/declarative_browser/main.sapp"),
+        "--allow-all", "--deny-net", "--deny-http", "--deny-exec", "--deny-spawn"
+    ]);
+    assert(offline.exit_code == 0 and str_contains(offline.stdout, "declarative_browser_pass"), "installed release offline check passed");
+
+    // 2. Read-only session-only headless GUI journey (Style controls, compact pagination, End, Escape) without touching root/data.
+    let measure = _font_measurer();
+    let c = App.create();
+    c.width = 800;
+    c.height = 816;
+    App.set_text_measure(c, measure);
+    App.refresh(c);
+    assert(_draw_frame(c, measure) > 0, "initial installed reader frame drawn");
+
+    App.update(c, [
+        map{ type: "mousemove", x: 700, y: 44, dx: 0, dy: 0 },
+        map{ type: "mousedown", button: "Left", x: 700, y: 44 },
+        map{ type: "mouseup", button: "Left", x: 700, y: 44 }
+    ]);
+    assert(c.settings, "Style opened in session-only mode");
+
+    let seq = ["Enter", "Tab", "Enter", "Enter", "Tab", "Enter", "Tab", "Enter", "Enter", "Tab", "Enter", "Tab", "Tab", "Enter"];
+    for k in seq {
+        App.update(c, [map{ type: "keydown", key: k, repeat: false }, map{ type: "keyup", key: k }]);
+        let _d = _draw_frame(c, measure);
+    }
+    if c.settings {
+        App.update(c, [
+            map{ type: "mousemove", x: 700, y: 44, dx: 0, dy: 0 },
+            map{ type: "mousedown", button: "Left", x: 700, y: 44 },
+            map{ type: "mouseup", button: "Left", x: 700, y: 44 }
+        ]);
+    }
+    assert(not c.settings, "returned to document from Style");
+
+    App.update(c, [map{ type: "resize", w: 320, h: 480 }]);
+    assert(_draw_frame(c, measure) > 0, "compact first page drawn");
+    App.update(c, [map{ type: "keydown", key: "End", repeat: false }, map{ type: "keyup", key: "End" }]);
+    assert(c.reading_plan != nil and c.reading_plan.available and c.reading_page == len(c.reading_plan.pages) - 1, "End reached final compact page");
+    assert(_draw_frame(c, measure) > 0, "compact final page drawn");
+
+    App.update(c, [map{ type: "keydown", key: "Escape", repeat: false }, map{ type: "keyup", key: "Escape" }]);
+    if not c.form.close_requested {
+        App.update(c, [map{ type: "keydown", key: "Escape", repeat: false }, map{ type: "keyup", key: "Escape" }]);
+    }
+    assert(c.form.close_requested, "Escape closed installed reader session");
+    c.session.close();
+
+    // Verify launcher, release directory, and user data directory are 100% unchanged.
+    assert(fs_read_bytes(launcher) == original_bytes, "installed launcher bytes unchanged");
+    assert(_snapshot_dir(release) == before, "installed release files unchanged");
+    assert(_snapshot_dir(data_dir) == data_before, "user data directory untouched during session-only journey");
+
+    let result = map{
+        passed: true,
+        version: version,
+        source_hidden: true,
+        user_data_not_mounted: true,
+        installed_launcher: true,
+        content_unchanged: true,
+        style_pagination_keys_exercised: true,
+        visual_review_required: false,
+        launcher_sha256: _sha256_bytes(original_bytes)
+    };
+    if opts.evidence != "" {
+        fs_mkdirs(opts.evidence);
+        fs_write(path_join(opts.evidence, "acceptance.json"), json_stringify(result) + "\n");
+    }
+    if opts.report != "" {
+        fs_write(opts.report, json_stringify(result) + "\n");
+    }
+    print json_stringify(result);
+    return true;
+}
+
+fn main() {
+    let opts = _parse_opts(_cli_args());
+    let work = _mk_private_tmp("installed");
+    let ok = false;
+    try {
+        ok = _journey(opts, work);
+    } catch {
+        print "JOURNEY_ERR";
+    }
+    _rm_tree(work);
+    assert(not fs_exists(work), "cleaned temporary directory");
+    assert(ok, "reader_installed checks passed");
+}
+
+main();

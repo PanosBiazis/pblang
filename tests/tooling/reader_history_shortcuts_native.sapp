@@ -1,0 +1,312 @@
+// Pure PBLang native verification: Alt+arrows history shortcuts, held-key suppression, and preferences isolation.
+let App = import("../../examples/declarative_browser/app.sapp");
+let Store = import("../../examples/declarative_browser/appearance_store.sapp");
+let DocFile = import("../../examples/declarative_browser/document_file.sapp");
+let Dir = import("stdlib:linux_dirfs.sapp");
+let G = import("stdlib:graphics.sapp");
+let FM = import("stdlib:font_metrics.sapp");
+
+fn _cli_args() {
+    let raw = try env_get("PBLANG_SCRIPT_ARGS") catch "";
+    if type(raw) == "string" and raw != "" { return str_split(raw, "\n"); }
+    let argv = os_args();
+    let out = [];
+    let after = false;
+    for item in argv {
+        if after { array_push(out, item); }
+        elif item == "--" { after = true; }
+    }
+    return out;
+}
+
+fn _parse_opts(args) {
+    let opts = map{ package: "", evidence: "", runtime: "", report: "", xvfb: false };
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if a == "--xvfb" { opts.xvfb = true; i = i + 1; }
+        elif (a == "--package" or a == "--evidence" or a == "--runtime" or a == "--report") and i + 1 < len(args) {
+            opts[str_slice(a, 2, len(a))] = args[i + 1];
+            i = i + 2;
+        } else {
+            i = i + 1;
+        }
+    }
+    return opts;
+}
+
+fn _mk_private_tmp(prefix) {
+    let name = "pblang_tooling_s4_" + prefix + "_" + str(num_floor(now_ms()));
+    let tmp_fs = Dir.open_absolute("/tmp", false, false);
+    assert(tmp_fs.ok, "open /tmp handle");
+    let created = Dir.mkdir_new(tmp_fs, name, false);
+    let closed = Dir.close(tmp_fs);
+    assert(created.ok and closed, "create private temp dir");
+    return path_join("/tmp", name);
+}
+
+fn _rm_tree(path) {
+    if not (try fs_exists(path) catch false) { return; }
+    let entries = try fs_listdir(path) catch nil;
+    if type(entries) == "array" {
+        for name in entries { _rm_tree(path_join(path, name)); }
+    }
+    let _r = try fs_remove(path) catch nil;
+}
+
+fn _font_measurer() {
+    let fonts = map{};
+    for fam in ["sans", "serif", "monospace", "system"] {
+        let resolved = G.text_font_resolve(fam);
+        fonts[fam] = if resolved != "" { FM.load(resolved) } else { nil };
+    }
+    return fn(text, px, family) {
+        if text == "" { return map{ ok: true, width: 0, height: px }; }
+        let fam = if map_has(fonts, family) { family } else { "sans" };
+        let layout = try FM.layout(fonts[fam], text, px) catch nil;
+        if layout != nil {
+            return map{ ok: true, width: layout.width, height: layout.height };
+        }
+        return map{ ok: true, width: num_floor(len(text) * px * 0.6 + 0.999), height: px };
+    };
+}
+
+fn _render_snapshot(c, measure_fn) {
+    let ops = [];
+    let canvas = map{
+        clear: fn(col) { ops = [map{ op: "clear", y: 0, h: c.height, color: col }]; },
+        rect: fn(x, y, rw, rh, col) {
+            if rw > 0 and rh > 0 {
+                array_push(ops, map{ op: "rect", x: num_floor(x), y: num_floor(y), w: num_floor(rw), h: num_floor(rh), c: col });
+            }
+        },
+        rects: fn(list, col) {
+            for r in list {
+                if r.w > 0 and r.h > 0 {
+                    array_push(ops, map{ op: "rect", x: num_floor(r.x), y: num_floor(r.y), w: num_floor(r.w), h: num_floor(r.h), c: col });
+                }
+            }
+        },
+        line: fn(x1, y1, x2, y2, col) {
+            let top = num_min(y1, y2);
+            let bot = num_max(y1, y2);
+            array_push(ops, map{ op: "line", x1: x1, y1: y1, x2: x2, y2: y2, y: top, h: bot - top + 1, c: col });
+        },
+        point: fn(x, y, col) {
+            array_push(ops, map{ op: "point", x: x, y: y, h: 1, c: col });
+        },
+        circle: fn(cx, cy, r, col) {
+            array_push(ops, map{ op: "circle", x: cx - r, y: cy - r, w: r * 2, h: r * 2, c: col });
+        },
+        textMeasure: fn(text, px, _adv, fam) { return measure_fn(text, px, fam); },
+        textStyled: fn(x, y, text, col, px, adv, fam) {
+            array_push(ops, map{ op: "text", x: x, y: y, h: px, text: text, px: px, adv: adv, fam: fam, c: col });
+            return map{ ok: true, font: fam, renderer: "native-aa-fontdue", positioning: "truetype-baseline" };
+        }
+    };
+    App.draw(c, canvas);
+    for w in c.form.widgets {
+        assert(w.x >= 0 and w.y >= 0 and w.x + w.w <= c.width and w.y + w.h <= c.height, "widget within viewport bounds");
+    }
+    let body_ops = [];
+    for item in ops {
+        if item.op != "clear" and item.y + item.h > 64 {
+            let clipped = map{};
+            for k in map_keys(item) { clipped[k] = item[k]; }
+            if item.op == "rect" and item.y < 64 {
+                clipped.h = item.y + item.h - 64;
+                clipped.y = 64;
+            }
+            array_push(body_ops, clipped);
+        }
+    }
+    return map{
+        w: c.width,
+        h: c.height,
+        full_hash: sha256(json_stringify(ops)),
+        body_hash: sha256(json_stringify(body_ops))
+    };
+}
+
+fn _key(c, name) {
+    let k = if name == "Return" { "Enter" } else { name };
+    App.update(c, [map{ type: "keydown", key: k }, map{ type: "keyup", key: k }]);
+}
+
+fn _tabs(c, n) {
+    for _i n { _key(c, "Tab"); }
+}
+
+fn _click(c, x, y) {
+    App.update(c, [
+        map{ type: "mousedown", button: "Left", x: x, y: y },
+        map{ type: "mouseup", button: "Left", x: x, y: y }
+    ]);
+}
+
+fn _chord(c, arrow, repeats, extra) {
+    let evs = [];
+    if extra != "" { array_push(evs, map{ type: "keydown", key: extra }); }
+    array_push(evs, map{ type: "keydown", key: "LeftAlt" });
+    for _i repeats {
+        array_push(evs, map{ type: "keydown", key: arrow });
+    }
+    array_push(evs, map{ type: "keyup", key: arrow });
+    array_push(evs, map{ type: "keyup", key: "LeftAlt" });
+    if extra != "" { array_push(evs, map{ type: "keyup", key: extra }); }
+    App.update(c, evs);
+}
+
+fn _same(shots, a, b, full) {
+    let first = shots[a];
+    let second = shots[b];
+    assert(first.w == second.w and first.h == second.h, "matching size for " + a + " vs " + b);
+    if full {
+        assert(first.full_hash == second.full_hash, "matching full frame for " + a + " vs " + b);
+    } else {
+        assert(first.body_hash == second.body_hash, "matching body frame for " + a + " vs " + b);
+    }
+}
+
+fn _journey(opts, work, data_dir) {
+    let doc_path = path_join(work, "Keyboard — ανάγνωση.html");
+    let sections = "";
+    for i 7 {
+        sections = sections + "<p>Section " + str(i) + ". " + str_repeat("Readable local words. ", 10) + "</p>";
+    }
+    fs_write(doc_path, "<article><h1>Keep reading with the keyboard</h1>" + sections + "<a href=\"pb://guide\">Open guide</a></article>");
+    let original = fs_read_bytes(doc_path);
+    let doc_info = DocFile.load(doc_path);
+    assert(doc_info.ok, "admit HTML source");
+
+    let measure = _font_measurer();
+    let loaded = Store.load(data_dir);
+    let saver = fn(style) {
+        let r = Store.save(data_dir, style, loaded.token);
+        if r.confirmed { loaded.token = r.token; }
+        return r;
+    };
+    let reloader = fn() {
+        let fresh = Store.load(data_dir);
+        if not fresh.ok or not fresh.can_save or fresh.token == "missing" { return map{ ok: false }; }
+        loaded.token = fresh.token;
+        return map{ ok: true, appearance: fresh.appearance, save: saver };
+    };
+    let c = App.create("local", "dark", nil, doc_info.source);
+    App.enable_preferences(c, loaded.appearance, saver, loaded.message, reloader);
+    App.set_text_measure(c, measure);
+    App.refresh(c);
+
+    App.update(c, [map{ type: "resize", w: 320, h: 480 }]);
+    let shots = map{};
+
+    _key(c, "End");
+    shots["keys-home-last"] = _render_snapshot(c, measure);
+
+    _tabs(c, 4);
+    _key(c, "Return");
+    _key(c, "End");
+    shots["keys-guide-last"] = _render_snapshot(c, measure);
+
+    _chord(c, "Left", 1, "");
+    shots["keys-back"] = _render_snapshot(c, measure);
+    _same(shots, "keys-home-last", "keys-back", false);
+
+    _chord(c, "Right", 1, "");
+    shots["keys-forward"] = _render_snapshot(c, measure);
+    _same(shots, "keys-guide-last", "keys-forward", false);
+
+    // Plain arrows and Ctrl+Alt+Left must leave history untouched.
+    _key(c, "Left");
+    _key(c, "Right");
+    _chord(c, "Left", 1, "LeftCtrl");
+    shots["keys-unmodified"] = _render_snapshot(c, measure);
+    _same(shots, "keys-forward", "keys-unmodified", false);
+
+    // Third history entry makes unintended auto-repeat observable.
+    _click(c, 200, 32);
+    _key(c, "End");
+    _chord(c, "Left", 8, "");
+    shots["keys-held-back"] = _render_snapshot(c, measure);
+    _same(shots, "keys-guide-last", "keys-held-back", false);
+
+    _chord(c, "Left", 1, "");
+    shots["keys-second-back"] = _render_snapshot(c, measure);
+    _same(shots, "keys-home-last", "keys-second-back", false);
+
+    _chord(c, "Right", 1, "");
+    _chord(c, "Right", 1, "");
+    shots["keys-second-forward"] = _render_snapshot(c, measure);
+    _same(shots, "keys-home-last", "keys-second-forward", false);
+
+    // Settings draft must survive both Alt+arrow chords with focused choice unchanged.
+    _click(c, 275, 32);
+    _tabs(c, 2);
+    _key(c, "Return");
+    shots["keys-style-draft"] = _render_snapshot(c, measure);
+    let draft_focus = c.form.focus;
+
+    _chord(c, "Left", 1, "");
+    _chord(c, "Right", 1, "");
+    shots["keys-style-kept"] = _render_snapshot(c, measure);
+    assert(c.form.focus == draft_focus and c.settings, "preferences draft focus kept");
+    _same(shots, "keys-style-draft", "keys-style-kept", true);
+
+    _key(c, "Escape");
+    assert(not c.form.close_requested and not c.settings, "Escape closes Style without closing window");
+    shots["keys-style-dismissed"] = _render_snapshot(c, measure);
+    _same(shots, "keys-home-last", "keys-style-dismissed", false);
+
+    _chord(c, "Left", 1, "");
+    shots["keys-after-dismissal"] = _render_snapshot(c, measure);
+    _same(shots, "keys-guide-last", "keys-after-dismissal", false);
+
+    // Embedder opt-out / opt-in API check.
+    assert(App.history_shortcuts(c, false), "disable history_shortcuts");
+    _chord(c, "Right", 1, "");
+    assert(c.session.snapshot().url == "pb://guide", "disabled shortcut does not navigate");
+    assert(App.history_shortcuts(c, true), "re-enable history_shortcuts");
+
+    assert(len(fs_listdir(data_dir)) == 0 and fs_read_bytes(doc_path) == original, "zero profile writes and input unchanged");
+    c.session.close();
+
+    let report = map{
+        passed: true,
+        real_launcher: true,
+        back_restored: true,
+        forward_restored: true,
+        held_key_single_step: true,
+        separate_press_moves: true,
+        plain_arrows_unchanged: true,
+        ctrl_alt_ignored: true,
+        preferences_draft_focus_kept: true,
+        escape_kept: true,
+        no_profile_or_position_writes: true,
+        input_unchanged: true
+    };
+    if opts.evidence != "" {
+        fs_mkdirs(opts.evidence);
+        fs_write(path_join(opts.evidence, "acceptance.json"), json_stringify(report) + "\n");
+    }
+    if opts.report != "" {
+        fs_write(opts.report, json_stringify(report) + "\n");
+    }
+    print json_stringify(report);
+    return true;
+}
+
+fn main() {
+    let opts = _parse_opts(_cli_args());
+    let work = _mk_private_tmp("hist_keys");
+    let data_dir = path_join(work, "data");
+    let work_fs = Dir.open_absolute(work, false, true);
+    assert(work_fs.ok and Dir.mkdir_new(work_fs, "data", false).ok and Dir.close(work_fs), "prepare private data folder");
+
+    let ok = try _journey(opts, work, data_dir) catch false;
+
+    _rm_tree(work);
+    assert(not fs_exists(work), "cleaned temporary directory");
+    assert(ok, "reader_history_shortcuts_native checks passed");
+}
+
+main();

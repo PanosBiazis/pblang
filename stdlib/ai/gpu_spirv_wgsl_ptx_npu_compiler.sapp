@@ -1,9 +1,10 @@
 // Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
 // stdlib/ai/gpu_spirv_wgsl_ptx_npu_compiler.sapp — Single-Source @gpu fn Multi-Target Compiler
-// (Vulkan SPIR-V 1.5 Binary + WebGPU WGSL + NVIDIA CUDA PTX 8.0 + Hardware NPU / Quantized SIMD Runtime)
+// (Vulkan SPIR-V 1.5 Binary + Live Vulkan Hardware Shader Loader + Live OpenCL Silicon Runner +
+//  WebGPU WGSL + NVIDIA CUDA PTX 8.0 + Hardware NPU / Quantized SIMD Runtime)
 // 100% Pure PBLang (Zero C, Zero Python, Zero external shader/CUDA toolchains required).
 
-let COMPILER_VERSION = "5.0.0";
+let COMPILER_VERSION = "5.1.0";
 let _MASK32 = 4294967295;
 
 // Khronos SPIR-V 1.5 Binary Specification Constants & Opcodes
@@ -2223,6 +2224,976 @@ fn flash_attention_fp64_reference(q, k, v, seq_len, head_dim, causal = false) {
     return out;
 }
 
+// ── 9. Live Physical Vulkan SPIR-V Shader Loader & Live OpenCL Silicon Runner ─
+
+fn _u32_bits_to_f32(w) {
+    let u = _u32(w);
+    let sign = bit_and(bit_shr(u, 31), 1);
+    let exp_b = bit_and(bit_shr(u, 23), 255);
+    let mant = bit_and(u, 8388607);
+    if exp_b == 0 and mant == 0 { return 0.0; }
+    let val = 0.0;
+    if exp_b == 0 {
+        val = (mant * 1.0) * num_pow(2.0, -149.0);
+    } elif exp_b == 255 {
+        val = 3.402823466e38;
+    } else {
+        val = (1.0 + (mant * 1.0) / 8388608.0) * num_pow(2.0, (exp_b - 127) * 1.0);
+    }
+    return if sign == 1 { 0.0 - val } else { val };
+}
+
+fn _put_u32_le(buf, off, val) {
+    let u = num_floor(val);
+    if u < 0 { u = 4294967296 + u; }
+    bytes_set(buf, off, bit_and(u, 255));
+    bytes_set(buf, off + 1, bit_and(num_floor(u / 256), 255));
+    bytes_set(buf, off + 2, bit_and(num_floor(u / 65536), 255));
+    bytes_set(buf, off + 3, bit_and(num_floor(u / 16777216), 255));
+}
+
+fn _get_u32_le(buf, off) {
+    return bytes_get(buf, off)
+        + bytes_get(buf, off + 1) * 256
+        + bytes_get(buf, off + 2) * 65536
+        + bytes_get(buf, off + 3) * 16777216;
+}
+
+fn _get_i32_le(buf, off) {
+    let u = _get_u32_le(buf, off);
+    if u >= 2147483648 { return u - 4294967296; }
+    return u;
+}
+
+fn _put_u64_le(buf, off, val) {
+    let v = num_floor(val);
+    let hi = num_floor(v / 4294967296.0);
+    let lo = v - hi * 4294967296.0;
+    if lo < 0 {
+        lo = lo + 4294967296.0;
+        hi = hi - 1;
+    }
+    if hi < 0 { hi = hi + 4294967296.0; }
+    _put_u32_le(buf, off, lo);
+    _put_u32_le(buf, off + 4, hi);
+}
+
+fn _get_u64_le(buf, off) {
+    let lo = _get_u32_le(buf, off);
+    let hi = _get_u32_le(buf, off + 4);
+    return hi * 4294967296.0 + lo;
+}
+
+fn _pack_u64_buf(val) {
+    let b = bytes_new(8);
+    _put_u64_le(b, 0, val);
+    return b;
+}
+
+fn _pack_u32_buf(val) {
+    let b = bytes_new(4);
+    _put_u32_le(b, 0, val);
+    return b;
+}
+
+fn _pack_f32_array_buf(vals) {
+    let cnt = len(vals);
+    let b = bytes_new(cnt * 4);
+    let i = 0;
+    while i < cnt {
+        _put_u32_le(b, i * 4, _f32_to_u32_bits(vals[i]));
+        i = i + 1;
+    }
+    return b;
+}
+
+fn _unpack_f32_array_buf(buf, cnt) {
+    let out = [];
+    let i = 0;
+    while i < cnt {
+        array_push(out, _u32_bits_to_f32(_get_u32_le(buf, i * 4)));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _read_cstr_from_bytes(buf, start_off, max_len) {
+    let raw = [];
+    let total = len(buf);
+    let i = 0;
+    while i < max_len and (start_off + i) < total {
+        let b = bytes_get(buf, start_off + i);
+        if b == 0 { break; }
+        array_push(raw, b);
+        i = i + 1;
+    }
+    return bytes_to_str(raw);
+}
+
+fn _crt_lib_candidates() {
+    let os_name = platform();
+    if os_name == "windows" { return ["msvcrt.dll", "ucrtbase.dll"]; }
+    if os_name == "macos" { return ["libSystem.B.dylib"]; }
+    return ["libc.so.6", "libc.so"];
+}
+
+fn _vulkan_lib_candidates() {
+    let os_name = platform();
+    if os_name == "windows" { return ["vulkan-1.dll"]; }
+    if os_name == "macos" { return ["libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib"]; }
+    return ["libvulkan.so.1", "libvulkan.so"];
+}
+
+fn _opencl_lib_candidates() {
+    let os_name = platform();
+    if os_name == "windows" { return ["OpenCL.dll"]; }
+    if os_name == "macos" { return ["/System/Library/Frameworks/OpenCL.framework/OpenCL", "libOpenCL.dylib"]; }
+    return ["libOpenCL.so.1", "libOpenCL.so"];
+}
+
+fn _try_load_gpu_lib(candidates) {
+    let i = 0;
+    while i < len(candidates) {
+        let nm = candidates[i];
+        let h = try ffi_load(nm) catch nil;
+        if type(h) == "number" and h != 0 {
+            return map{ ok: true, handle: h, library: nm };
+        }
+        i = i + 1;
+    }
+    return map{ ok: false, handle: 0, library: "" };
+}
+
+fn _buf_addr(crt_h, buf) {
+    return ffi_call_typed(crt_h, "memcpy", "ptr, ptr, u64 -> u64", [buf, buf, 0]);
+}
+
+fn _vk_create_instance_live(vk_h, crt_h) {
+    // Try Vulkan 1.2 (0x00402000 = 4202496) for native SPIR-V 1.5, with 1.1 / 1.0 fallback
+    let api_versions = [4202496, 4198400, 4194304];
+    let vi = 0;
+    let last_rc = -1;
+    while vi < len(api_versions) {
+        let app_info = bytes_new(48);
+        _put_u32_le(app_info, 24, 1);
+        _put_u32_le(app_info, 40, 1);
+        _put_u32_le(app_info, 44, api_versions[vi]);
+
+        let inst_info = bytes_new(64);
+        _put_u32_le(inst_info, 0, 1);
+        _put_u64_le(inst_info, 24, _buf_addr(crt_h, app_info));
+
+        let inst_out = bytes_new(8);
+        let rc = try ffi_call_typed(vk_h, "vkCreateInstance", "ptr, ptr, ptr -> i32", [inst_info, 0, inst_out]) catch -999;
+        last_rc = rc;
+        if rc == 0 {
+            let inst_ptr = _get_u64_le(inst_out, 0);
+            if inst_ptr != 0 {
+                return map{ ok: true, rc: 0, instance: inst_ptr, requested_api: api_versions[vi] };
+            }
+        }
+        vi = vi + 1;
+    }
+    return map{ ok: false, rc: last_rc, instance: 0, requested_api: 0 };
+}
+
+fn _vk_device_type_rank(dtype) {
+    // VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU(2) > INTEGRATED_GPU(1) > VIRTUAL_GPU(3) > OTHER(0) > CPU(4)
+    if dtype == 2 { return 400; }
+    if dtype == 1 { return 300; }
+    if dtype == 3 { return 200; }
+    if dtype == 4 { return 50; }
+    return 100;
+}
+
+fn _cl_get_device_str(cl_h, dev_ptr, param_id) {
+    let val_buf = bytes_new(256);
+    let sz_buf = bytes_new(8);
+    let rc = try ffi_call_typed(cl_h, "clGetDeviceInfo", "ptr, u32, u64, ptr, ptr -> i32", [dev_ptr, param_id, 255, val_buf, sz_buf]) catch -1;
+    if rc != 0 { return ""; }
+    return _read_cstr_from_bytes(val_buf, 0, 255);
+}
+
+fn probe_live_gpu_drivers() {
+    let crt_load = _try_load_gpu_lib(_crt_lib_candidates());
+    let vk_load = _try_load_gpu_lib(_vulkan_lib_candidates());
+    let vk_available = vk_load.ok;
+    let vk_devices = [];
+    if vk_load.ok and crt_load.ok {
+        let vk_h = vk_load.handle;
+        let inst_r = _vk_create_instance_live(vk_h, crt_load.handle);
+        if inst_r.ok {
+            let inst_ptr = inst_r.instance;
+            let cnt_buf = bytes_new(4);
+            let rc_cnt = try ffi_call_typed(vk_h, "vkEnumeratePhysicalDevices", "ptr, ptr, ptr -> i32", [inst_ptr, cnt_buf, 0]) catch -1;
+            let dev_cnt = if rc_cnt == 0 { _get_i32_le(cnt_buf, 0) } else { 0 };
+            if dev_cnt > 0 and dev_cnt <= 32 {
+                let devs_buf = bytes_new(dev_cnt * 8);
+                let rc_enum = try ffi_call_typed(vk_h, "vkEnumeratePhysicalDevices", "ptr, ptr, ptr -> i32", [inst_ptr, cnt_buf, devs_buf]) catch -1;
+                if rc_enum == 0 {
+                    let di = 0;
+                    while di < dev_cnt {
+                        let pdev = _get_u64_le(devs_buf, di * 8);
+                        if pdev != 0 {
+                            let props = bytes_new(1024);
+                            try ffi_call_typed(vk_h, "vkGetPhysicalDeviceProperties", "ptr, ptr -> void", [pdev, props]) catch nil;
+                            let dname = _read_cstr_from_bytes(props, 20, 256);
+                            array_push(vk_devices, map{
+                                device_name: dname,
+                                api_version: _get_u32_le(props, 0),
+                                driver_version: _get_u32_le(props, 4),
+                                vendor_id: _get_u32_le(props, 8),
+                                device_id: _get_u32_le(props, 12),
+                                device_type: _get_u32_le(props, 16)
+                            });
+                        }
+                        di = di + 1;
+                    }
+                }
+            }
+            try ffi_call_typed(vk_h, "vkDestroyInstance", "ptr, ptr -> void", [inst_ptr, 0]) catch nil;
+        }
+    }
+    if vk_load.ok { try ffi_close(vk_load.handle) catch nil; }
+    if crt_load.ok { try ffi_close(crt_load.handle) catch nil; }
+
+    let cl_load = _try_load_gpu_lib(_opencl_lib_candidates());
+    let cl_available = cl_load.ok;
+    let cl_devices = [];
+    if cl_load.ok {
+        let cl_h = cl_load.handle;
+        let pcnt_buf = bytes_new(4);
+        let prc = try ffi_call_typed(cl_h, "clGetPlatformIDs", "u32, ptr, ptr -> i32", [0, 0, pcnt_buf]) catch -1;
+        let pcnt = if prc == 0 { _get_i32_le(pcnt_buf, 0) } else { 0 };
+        if pcnt > 0 and pcnt <= 16 {
+            let plats_buf = bytes_new(pcnt * 8);
+            let prc2 = try ffi_call_typed(cl_h, "clGetPlatformIDs", "u32, ptr, ptr -> i32", [pcnt, plats_buf, pcnt_buf]) catch -1;
+            if prc2 == 0 {
+                let pi = 0;
+                while pi < pcnt {
+                    let plat = _get_u64_le(plats_buf, pi * 8);
+                    if plat != 0 {
+                        let dcnt_buf = bytes_new(4);
+                        let drc = try ffi_call_typed(cl_h, "clGetDeviceIDs", "ptr, u64, u32, ptr, ptr -> i32", [plat, 4294967295, 0, 0, dcnt_buf]) catch -1;
+                        let dcnt = if drc == 0 { _get_i32_le(dcnt_buf, 0) } else { 0 };
+                        if dcnt > 0 and dcnt <= 32 {
+                            let dlist = bytes_new(dcnt * 8);
+                            let drc2 = try ffi_call_typed(cl_h, "clGetDeviceIDs", "ptr, u64, u32, ptr, ptr -> i32", [plat, 4294967295, dcnt, dlist, dcnt_buf]) catch -1;
+                            if drc2 == 0 {
+                                let dj = 0;
+                                while dj < dcnt {
+                                    let cdev = _get_u64_le(dlist, dj * 8);
+                                    if cdev != 0 {
+                                        array_push(cl_devices, map{
+                                            device_name: _cl_get_device_str(cl_h, cdev, 4139),
+                                            vendor_name: _cl_get_device_str(cl_h, cdev, 4140),
+                                            il_version: str_trim(_cl_get_device_str(cl_h, cdev, 4187))
+                                        });
+                                    }
+                                    dj = dj + 1;
+                                }
+                            }
+                        }
+                    }
+                    pi = pi + 1;
+                }
+            }
+        }
+        try ffi_close(cl_h) catch nil;
+    }
+
+    return map{
+        ok: true,
+        version: COMPILER_VERSION,
+        platform: platform(),
+        vulkan_available: vk_available,
+        vulkan_library: vk_load.library,
+        vulkan_device_count: len(vk_devices),
+        vulkan_devices: vk_devices,
+        opencl_available: cl_available,
+        opencl_library: cl_load.library,
+        opencl_device_count: len(cl_devices),
+        opencl_devices: cl_devices
+    };
+}
+
+fn vulkan_validate_and_load_spirv_live(spirv_bytes) {
+    let spv_arr = spirv_bytes;
+    if is_bytes(spirv_bytes) {
+        let blen = len(spirv_bytes);
+        let tmp = [];
+        let bi = 0;
+        while bi < blen {
+            array_push(tmp, bytes_get(spirv_bytes, bi));
+            bi = bi + 1;
+        }
+        spv_arr = tmp;
+    }
+    let vcheck = validate_spirv_binary(spv_arr);
+    if not vcheck.ok {
+        return map{
+            ok: false,
+            hardware_loaded: false,
+            spirv_valid: false,
+            errors: vcheck.errors,
+            fallback_reason: "spirv_validation_failed"
+        };
+    }
+
+    let vk_load = _try_load_gpu_lib(_vulkan_lib_candidates());
+    if not vk_load.ok {
+        return map{
+            ok: true,
+            hardware_loaded: false,
+            fallback_reason: "vulkan_loader_unavailable",
+            spirv_valid: true,
+            word_count: vcheck.word_count,
+            byte_length: vcheck.byte_length
+        };
+    }
+
+    let crt_load = _try_load_gpu_lib(_crt_lib_candidates());
+    if not crt_load.ok {
+        try ffi_close(vk_load.handle) catch nil;
+        return map{
+            ok: true,
+            hardware_loaded: false,
+            fallback_reason: "crt_loader_unavailable",
+            spirv_valid: true,
+            word_count: vcheck.word_count,
+            byte_length: vcheck.byte_length
+        };
+    }
+
+    let vk_h = vk_load.handle;
+    let crt_h = crt_load.handle;
+    let inst_r = _vk_create_instance_live(vk_h, crt_h);
+    if not inst_r.ok {
+        try ffi_close(vk_h) catch nil;
+        try ffi_close(crt_h) catch nil;
+        return map{
+            ok: true,
+            hardware_loaded: false,
+            vk_result: inst_r.rc,
+            fallback_reason: "vkCreateInstance_unavailable",
+            spirv_valid: true,
+            word_count: vcheck.word_count,
+            byte_length: vcheck.byte_length
+        };
+    }
+
+    let inst_ptr = inst_r.instance;
+    let cnt_buf = bytes_new(4);
+    let rc_cnt = try ffi_call_typed(vk_h, "vkEnumeratePhysicalDevices", "ptr, ptr, ptr -> i32", [inst_ptr, cnt_buf, 0]) catch -1;
+    let dev_cnt = if rc_cnt == 0 { _get_i32_le(cnt_buf, 0) } else { 0 };
+    if dev_cnt <= 0 {
+        try ffi_call_typed(vk_h, "vkDestroyInstance", "ptr, ptr -> void", [inst_ptr, 0]) catch nil;
+        try ffi_close(vk_h) catch nil;
+        try ffi_close(crt_h) catch nil;
+        return map{
+            ok: true,
+            hardware_loaded: false,
+            fallback_reason: "no_vulkan_physical_devices",
+            spirv_valid: true,
+            word_count: vcheck.word_count,
+            byte_length: vcheck.byte_length
+        };
+    }
+
+    let capped_cnt = if dev_cnt > 32 { 32 } else { dev_cnt };
+    _put_u32_le(cnt_buf, 0, capped_cnt);
+    let devs_buf = bytes_new(capped_cnt * 8);
+    let rc_enum = try ffi_call_typed(vk_h, "vkEnumeratePhysicalDevices", "ptr, ptr, ptr -> i32", [inst_ptr, cnt_buf, devs_buf]) catch -1;
+    if rc_enum != 0 {
+        try ffi_call_typed(vk_h, "vkDestroyInstance", "ptr, ptr -> void", [inst_ptr, 0]) catch nil;
+        try ffi_close(vk_h) catch nil;
+        try ffi_close(crt_h) catch nil;
+        return map{
+            ok: true,
+            hardware_loaded: false,
+            vk_result: rc_enum,
+            fallback_reason: "vkEnumeratePhysicalDevices_failed",
+            spirv_valid: true,
+            word_count: vcheck.word_count,
+            byte_length: vcheck.byte_length
+        };
+    }
+
+    let best_pdev = 0;
+    let best_rank = -1;
+    let best_name = "";
+    let best_api = 0;
+    let best_vendor = 0;
+    let best_dev_id = 0;
+    let best_dtype = 0;
+
+    let di = 0;
+    while di < capped_cnt {
+        let pdev = _get_u64_le(devs_buf, di * 8);
+        if pdev != 0 {
+            let props = bytes_new(1024);
+            try ffi_call_typed(vk_h, "vkGetPhysicalDeviceProperties", "ptr, ptr -> void", [pdev, props]) catch nil;
+            let dtype = _get_u32_le(props, 16);
+            let rnk = _vk_device_type_rank(dtype);
+            if rnk > best_rank {
+                best_rank = rnk;
+                best_pdev = pdev;
+                best_api = _get_u32_le(props, 0);
+                best_vendor = _get_u32_le(props, 8);
+                best_dev_id = _get_u32_le(props, 12);
+                best_dtype = dtype;
+                best_name = _read_cstr_from_bytes(props, 20, 256);
+            }
+        }
+        di = di + 1;
+    }
+
+    // Select a compute-capable queue family (VK_QUEUE_COMPUTE_BIT = 0x02)
+    let qcnt_buf = bytes_new(4);
+    try ffi_call_typed(vk_h, "vkGetPhysicalDeviceQueueFamilyProperties", "ptr, ptr, ptr -> void", [best_pdev, qcnt_buf, 0]) catch nil;
+    let qcnt = _get_i32_le(qcnt_buf, 0);
+    let q_fam_idx = 0;
+    if qcnt > 0 and qcnt <= 64 {
+        let qprops = bytes_new(qcnt * 24);
+        try ffi_call_typed(vk_h, "vkGetPhysicalDeviceQueueFamilyProperties", "ptr, ptr, ptr -> void", [best_pdev, qcnt_buf, qprops]) catch nil;
+        let qi = 0;
+        while qi < qcnt {
+            let qflags = _get_u32_le(qprops, qi * 24);
+            if bit_and(qflags, 2) != 0 {
+                q_fam_idx = qi;
+                break;
+            }
+            qi = qi + 1;
+        }
+    }
+
+    let prio_buf = _pack_u32_buf(_f32_to_u32_bits(1.0));
+    let q_info = bytes_new(40);
+    _put_u32_le(q_info, 0, 2);
+    _put_u32_le(q_info, 20, q_fam_idx);
+    _put_u32_le(q_info, 24, 1);
+    _put_u64_le(q_info, 32, _buf_addr(crt_h, prio_buf));
+
+    let dev_info = bytes_new(72);
+    _put_u32_le(dev_info, 0, 3);
+    _put_u32_le(dev_info, 20, 1);
+    _put_u64_le(dev_info, 24, _buf_addr(crt_h, q_info));
+
+    let dev_out = bytes_new(8);
+    let dev_rc = try ffi_call_typed(vk_h, "vkCreateDevice", "ptr, ptr, ptr, ptr -> i32", [best_pdev, dev_info, 0, dev_out]) catch -999;
+    let dev_ptr = if dev_rc == 0 { _get_u64_le(dev_out, 0) } else { 0 };
+    if dev_rc != 0 or dev_ptr == 0 {
+        try ffi_call_typed(vk_h, "vkDestroyInstance", "ptr, ptr -> void", [inst_ptr, 0]) catch nil;
+        try ffi_close(vk_h) catch nil;
+        try ffi_close(crt_h) catch nil;
+        return map{
+            ok: true,
+            hardware_loaded: false,
+            vk_result: dev_rc,
+            device_name: best_name,
+            fallback_reason: "vkCreateDevice_unavailable",
+            spirv_valid: true,
+            word_count: vcheck.word_count,
+            byte_length: vcheck.byte_length
+        };
+    }
+
+    let spv_buf = bytes_new(spv_arr);
+    let sm_info = bytes_new(40);
+    _put_u32_le(sm_info, 0, 16);
+    _put_u64_le(sm_info, 24, len(spv_arr));
+    _put_u64_le(sm_info, 32, _buf_addr(crt_h, spv_buf));
+
+    let sm_out = bytes_new(8);
+    let vk_rc = try ffi_call_typed(vk_h, "vkCreateShaderModule", "ptr, ptr, ptr, ptr -> i32", [dev_ptr, sm_info, 0, sm_out]) catch -999;
+    let sm_handle = if vk_rc == 0 { _get_u64_le(sm_out, 0) } else { 0 };
+
+    if vk_rc == 0 and sm_handle != 0 {
+        try ffi_call_typed(vk_h, "vkDestroyShaderModule", "ptr, u64, ptr -> void", [dev_ptr, sm_handle, 0]) catch nil;
+    }
+    try ffi_call_typed(vk_h, "vkDestroyDevice", "ptr, ptr -> void", [dev_ptr, 0]) catch nil;
+    try ffi_call_typed(vk_h, "vkDestroyInstance", "ptr, ptr -> void", [inst_ptr, 0]) catch nil;
+    try ffi_close(vk_h) catch nil;
+    try ffi_close(crt_h) catch nil;
+
+    return map{
+        ok: vk_rc == 0,
+        hardware_loaded: vk_rc == 0,
+        vk_result: vk_rc,
+        spirv_valid: true,
+        device_name: best_name,
+        vendor_id: best_vendor,
+        device_id: best_dev_id,
+        device_type: best_dtype,
+        api_version: best_api,
+        physical_device_count: capped_cnt,
+        compute_queue_family: q_fam_idx,
+        shader_module_handle: sm_handle,
+        word_count: vcheck.word_count,
+        byte_length: vcheck.byte_length,
+        handles_destroyed: true
+    };
+}
+
+fn _cl_c_type(ty) {
+    if ty == "f32" { return "float"; }
+    if ty == "u32" { return "uint"; }
+    if ty == "i32" { return "int"; }
+    if ty == "bool" { return "int"; }
+    return "uint";
+}
+
+fn _emit_opencl_c_kernel(ir) {
+    let p_parts = [];
+    let pi = 0;
+    while pi < len(ir.params) {
+        let p = ir.params[pi];
+        if p.is_buffer {
+            array_push(p_parts, "__global " + _cl_c_type(p.elem_type) + "* " + p.name);
+        } else {
+            array_push(p_parts, "const " + _cl_c_type(p.elem_type) + " " + p.name);
+        }
+        pi = pi + 1;
+    }
+
+    let cl_e = nil;
+    cl_e = fn(e) {
+        let ek = e.kind;
+        if ek == "lit" {
+            if e.ty == "f32" {
+                let stxt = str(e.val);
+                if not str_contains(stxt, ".") { stxt = stxt + ".0"; }
+                return stxt + "f";
+            }
+            if e.ty == "u32" { return str(num_floor(e.val)) + "u"; }
+            return str(num_floor(e.val));
+        }
+        if ek == "var" { return e.name; }
+        if ek == "index" { return e.buf + "[" + cl_e(e.idx) + "]"; }
+        if ek == "call" {
+            let nm = e.name;
+            if nm == "global_id_x" { return "((uint)get_global_id(0))"; }
+            if nm == "global_id_y" { return "((uint)get_global_id(1))"; }
+            if nm == "global_id_z" { return "((uint)get_global_id(2))"; }
+            if nm == "local_id_x" { return "((uint)get_local_id(0))"; }
+            if nm == "local_id_y" { return "((uint)get_local_id(1))"; }
+            if nm == "local_id_z" { return "((uint)get_local_id(2))"; }
+            if nm == "group_id_x" { return "((uint)get_group_id(0))"; }
+            if nm == "workgroup_size_x" { return str(ir.workgroup_size[0]) + "u"; }
+            if nm == "f32" { return "((float)(" + cl_e(e.args[0]) + "))"; }
+            if nm == "u32" { return "((uint)(" + cl_e(e.args[0]) + "))"; }
+            if nm == "i32" { return "((int)(" + cl_e(e.args[0]) + "))"; }
+            if nm == "abs" { return "fabs((float)(" + cl_e(e.args[0]) + "))"; }
+            if nm == "min" { return "fmin((float)(" + cl_e(e.args[0]) + "), (float)(" + cl_e(e.args[1]) + "))"; }
+            if nm == "max" { return "fmax((float)(" + cl_e(e.args[0]) + "), (float)(" + cl_e(e.args[1]) + "))"; }
+            if nm == "fma" { return "fma((float)(" + cl_e(e.args[0]) + "), (float)(" + cl_e(e.args[1]) + "), (float)(" + cl_e(e.args[2]) + "))"; }
+            if nm == "bit_and" { return "(" + cl_e(e.args[0]) + " & " + cl_e(e.args[1]) + ")"; }
+            if nm == "bit_or" { return "(" + cl_e(e.args[0]) + " | " + cl_e(e.args[1]) + ")"; }
+            if nm == "bit_xor" { return "(" + cl_e(e.args[0]) + " ^ " + cl_e(e.args[1]) + ")"; }
+            if nm == "bit_shl" { return "(" + cl_e(e.args[0]) + " << " + cl_e(e.args[1]) + ")"; }
+            if nm == "bit_shr" { return "(" + cl_e(e.args[0]) + " >> " + cl_e(e.args[1]) + ")"; }
+            let ap = [];
+            let ai = 0;
+            while ai < len(e.args) { array_push(ap, cl_e(e.args[ai])); ai = ai + 1; }
+            return nm + "(" + str_join(ap, ", ") + ")";
+        }
+        if ek == "unary" {
+            let uop = if e.op == "not" { "!" } else { e.op };
+            return "(" + uop + cl_e(e.expr) + ")";
+        }
+        if ek == "bin" {
+            let bop = e.op;
+            if bop == "and" { bop = "&&"; }
+            if bop == "or" { bop = "||"; }
+            return "(" + cl_e(e.left) + " " + bop + " " + cl_e(e.right) + ")";
+        }
+        return "0u";
+    };
+
+    let lines = ["__kernel void " + ir.name + "(" + str_join(p_parts, ", ") + ") {"];
+    let cl_stmts = nil;
+    cl_stmts = fn(stmts, pad) {
+        let si = 0;
+        while si < len(stmts) {
+            let s = stmts[si];
+            if s.kind == "let" {
+                array_push(lines, pad + _cl_c_type(s.ty) + " " + s.name + " = " + cl_e(s.expr) + ";");
+            } elif s.kind == "assign" {
+                array_push(lines, pad + s.name + " = " + cl_e(s.expr) + ";");
+            } elif s.kind == "store_buf" {
+                array_push(lines, pad + s.buf + "[" + cl_e(s.idx) + "] = " + cl_e(s.expr) + ";");
+            } elif s.kind == "barrier" {
+                array_push(lines, pad + "barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);");
+            } elif s.kind == "return" {
+                array_push(lines, pad + "return;");
+            } elif s.kind == "if" {
+                array_push(lines, pad + "if (" + cl_e(s.cond) + ") {");
+                cl_stmts(s.then_body, pad + "    ");
+                if len(s.else_body) > 0 {
+                    array_push(lines, pad + "} else {");
+                    cl_stmts(s.else_body, pad + "    ");
+                }
+                array_push(lines, pad + "}");
+            } elif s.kind == "while" {
+                array_push(lines, pad + "while (" + cl_e(s.cond) + ") {");
+                cl_stmts(s.body, pad + "    ");
+                array_push(lines, pad + "}");
+            }
+            si = si + 1;
+        }
+    };
+    cl_stmts(ir.body, "    ");
+    array_push(lines, "}");
+    return str_join(lines, "\n") + "\n";
+}
+
+fn _build_opencl_spirv12_il_probe() {
+    // Pure-PBLang Khronos SPIR-V 1.2 OpenCL Kernel IL module:
+    // OpCapability Addresses(4), OpCapability Kernel(6), OpMemoryModel Physical64(2) OpenCL(2),
+    // OpEntryPoint Kernel(6) %3 "noop", monotonic SSA IDs %1..%4 (Bound=5)
+    let words = [SPIRV_MAGIC, 66048, SPIRV_GENERATOR_ID, 5, 0];
+    _push_inst(words, OP_CAPABILITY, [4]);
+    _push_inst(words, OP_CAPABILITY, [6]);
+    _push_inst(words, OP_MEMORY_MODEL, [2, 2]);
+    let ep_ops = [6, 3];
+    let nm_w = _encode_spv_string_words("noop");
+    let ni = 0;
+    while ni < len(nm_w) {
+        array_push(ep_ops, nm_w[ni]);
+        ni = ni + 1;
+    }
+    _push_inst(words, OP_ENTRY_POINT, ep_ops);
+    _push_inst(words, OP_TYPE_VOID, [1]);
+    _push_inst(words, OP_TYPE_FUNCTION, [2, 1]);
+    _push_inst(words, OP_FUNCTION, [1, 3, 0, 2]);
+    _push_inst(words, OP_LABEL, [4]);
+    _push_inst(words, OP_RETURN, []);
+    _push_inst(words, OP_FUNCTION_END, []);
+    return bytes_new(emit_vulkan_spirv_bytes(words));
+}
+
+fn opencl_execute_gpu_kernel_live(op_or_kernel, a_f32, b_f32, alpha = 2.0) {
+    let a_in = if is_array(a_f32) { a_f32 } else { [] };
+    let b_in = if is_array(b_f32) { b_f32 } else { [] };
+    if len(b_in) == 0 and len(a_in) > 0 {
+        let zi = 0;
+        let zpad = [];
+        while zi < len(a_in) { array_push(zpad, 0.0); zi = zi + 1; }
+        b_in = zpad;
+    }
+    let n = min_of(len(a_in), len(b_in));
+    let op_raw = str_trim(str(op_or_kernel));
+    let is_custom_gpu = str_contains(op_raw, "fn ") or str_contains(op_raw, "@gpu");
+
+    let custom_compiled = nil;
+    let kern_name = "saxpy_kern";
+    let cl_src = "";
+    let spirv_valid_ok = true;
+
+    if is_custom_gpu {
+        custom_compiled = compile_gpu_kernel(op_raw);
+        spirv_valid_ok = custom_compiled.spirv_validation.ok;
+        kern_name = custom_compiled.name;
+        cl_src = _emit_opencl_c_kernel(custom_compiled.ir);
+    } else {
+        let op_lo = str_lower(op_raw);
+        if op_lo == "mul" {
+            kern_name = "mul_kern";
+            cl_src = "__kernel void mul_kern(__global const float* a, __global const float* b, __global float* out, const float alpha, const uint n) { uint i = (uint)get_global_id(0); if (i < n) { out[i] = a[i] * b[i]; } }\n";
+        } elif op_lo == "add" {
+            kern_name = "add_kern";
+            cl_src = "__kernel void add_kern(__global const float* a, __global const float* b, __global float* out, const float alpha, const uint n) { uint i = (uint)get_global_id(0); if (i < n) { out[i] = a[i] + b[i]; } }\n";
+        } elif op_lo == "sub" {
+            kern_name = "sub_kern";
+            cl_src = "__kernel void sub_kern(__global const float* a, __global const float* b, __global float* out, const float alpha, const uint n) { uint i = (uint)get_global_id(0); if (i < n) { out[i] = a[i] - b[i]; } }\n";
+        } else {
+            kern_name = "saxpy_kern";
+            cl_src = "__kernel void saxpy_kern(__global const float* a, __global const float* b, __global float* out, const float alpha, const uint n) { uint i = (uint)get_global_id(0); if (i < n) { out[i] = fma(alpha, a[i], b[i]); } }\n";
+        }
+    }
+
+    let cpu_fallback = fn(reason) {
+        let out_fb = [];
+        if n > 0 {
+            if is_custom_gpu {
+                let pmap = map{};
+                let bparams = [];
+                let pi = 0;
+                while pi < len(custom_compiled.ir.params) {
+                    let prm = custom_compiled.ir.params[pi];
+                    if prm.is_buffer {
+                        array_push(bparams, prm.name);
+                    } elif prm.elem_type == "f32" {
+                        pmap[prm.name] = alpha;
+                    } else {
+                        pmap[prm.name] = n;
+                    }
+                    pi = pi + 1;
+                }
+                let out_arr = [];
+                let oi = 0;
+                while oi < n { array_push(out_arr, 0.0); oi = oi + 1; }
+                if len(bparams) >= 3 {
+                    pmap[bparams[0]] = a_in;
+                    pmap[bparams[1]] = b_in;
+                    pmap[bparams[len(bparams) - 1]] = out_arr;
+                } elif len(bparams) == 2 {
+                    pmap[bparams[0]] = a_in;
+                    pmap[bparams[1]] = out_arr;
+                }
+                let sim = execute_kernel_universal(op_raw, pmap, map{ total_threads: n });
+                out_fb = if len(bparams) >= 1 { sim.bindings[bparams[len(bparams) - 1]] } else { out_arr };
+            } else {
+                let op_lo = str_lower(op_raw);
+                let idx = 0;
+                while idx < n {
+                    if op_lo == "mul" { array_push(out_fb, a_in[idx] * b_in[idx]); }
+                    elif op_lo == "add" { array_push(out_fb, a_in[idx] + b_in[idx]); }
+                    elif op_lo == "sub" { array_push(out_fb, a_in[idx] - b_in[idx]); }
+                    else { array_push(out_fb, alpha * a_in[idx] + b_in[idx]); }
+                    idx = idx + 1;
+                }
+            }
+        }
+        return map{
+            ok: true,
+            executed_on_hardware: false,
+            backend: "cpu_simd_fallback",
+            fallback_reason: reason,
+            kernel_name: kern_name,
+            spirv_validated: spirv_valid_ok,
+            element_count: n,
+            output: out_fb
+        };
+    };
+
+    if n <= 0 {
+        return map{
+            ok: true,
+            executed_on_hardware: false,
+            backend: "noop_empty",
+            kernel_name: kern_name,
+            spirv_validated: spirv_valid_ok,
+            element_count: 0,
+            output: []
+        };
+    }
+
+    let cl_load = _try_load_gpu_lib(_opencl_lib_candidates());
+    if not cl_load.ok {
+        return cpu_fallback("opencl_loader_unavailable");
+    }
+
+    let crt_load = _try_load_gpu_lib(_crt_lib_candidates());
+    if not crt_load.ok {
+        try ffi_close(cl_load.handle) catch nil;
+        return cpu_fallback("crt_loader_unavailable");
+    }
+
+    let cl_h = cl_load.handle;
+    let crt_h = crt_load.handle;
+    let pcnt_buf = bytes_new(4);
+    let prc = try ffi_call_typed(cl_h, "clGetPlatformIDs", "u32, ptr, ptr -> i32", [0, 0, pcnt_buf]) catch -1;
+    let pcnt = if prc == 0 { _get_i32_le(pcnt_buf, 0) } else { 0 };
+    if pcnt <= 0 {
+        try ffi_close(cl_h) catch nil;
+        try ffi_close(crt_h) catch nil;
+        return cpu_fallback("no_opencl_platforms");
+    }
+
+    let capped_p = if pcnt > 16 { 16 } else { pcnt };
+    let plats_buf = bytes_new(capped_p * 8);
+    try ffi_call_typed(cl_h, "clGetPlatformIDs", "u32, ptr, ptr -> i32", [capped_p, plats_buf, pcnt_buf]) catch -1;
+
+    // Prefer CL_DEVICE_TYPE_GPU (4), then fallback to CL_DEVICE_TYPE_ALL (4294967295)
+    let chosen_dev = 0;
+    let dev_types = [4, 4294967295];
+    let dti = 0;
+    while dti < len(dev_types) and chosen_dev == 0 {
+        let pi = 0;
+        while pi < capped_p and chosen_dev == 0 {
+            let plat = _get_u64_le(plats_buf, pi * 8);
+            if plat != 0 {
+                let d_out = bytes_new(8);
+                let dn_out = bytes_new(4);
+                let drc = try ffi_call_typed(cl_h, "clGetDeviceIDs", "ptr, u64, u32, ptr, ptr -> i32", [plat, dev_types[dti], 1, d_out, dn_out]) catch -1;
+                if drc == 0 {
+                    let dv = _get_u64_le(d_out, 0);
+                    if dv != 0 { chosen_dev = dv; }
+                }
+            }
+            pi = pi + 1;
+        }
+        dti = dti + 1;
+    }
+
+    if chosen_dev == 0 {
+        try ffi_close(cl_h) catch nil;
+        try ffi_close(crt_h) catch nil;
+        return cpu_fallback("no_opencl_devices");
+    }
+
+    let dev_name = _cl_get_device_str(cl_h, chosen_dev, 4139);
+    let vendor_name = _cl_get_device_str(cl_h, chosen_dev, 4140);
+    let drv_ver = _cl_get_device_str(cl_h, chosen_dev, 4141);
+    let il_ver = str_trim(_cl_get_device_str(cl_h, chosen_dev, 4187));
+
+    let dev_arr = _pack_u64_buf(chosen_dev);
+    let err_buf = bytes_new(4);
+    let ctx = try ffi_call_typed(cl_h, "clCreateContext", "ptr, u32, ptr, ptr, ptr, ptr -> ptr", [0, 1, dev_arr, 0, 0, err_buf]) catch 0;
+    let ctx_err = _get_i32_le(err_buf, 0);
+    if ctx == 0 or ctx_err != 0 {
+        try ffi_close(cl_h) catch nil;
+        try ffi_close(crt_h) catch nil;
+        return cpu_fallback("clCreateContext_failed:" + str(ctx_err));
+    }
+
+    // Verify native OpenCL SPIR-V IL ingestion when advertised by driver (e.g., SPIR-V_1.2+)
+    let spirv_il_ok = false;
+    if len(il_ver) > 0 {
+        let il_bytes = _build_opencl_spirv12_il_probe();
+        let il_err_b = bytes_new(4);
+        let il_prog = try ffi_call_typed(cl_h, "clCreateProgramWithIL", "ptr, ptr, u64, ptr -> ptr", [ctx, il_bytes, len(il_bytes), il_err_b]) catch 0;
+        let il_err = _get_i32_le(il_err_b, 0);
+        if il_prog != 0 and il_err == 0 {
+            let il_brc = try ffi_call_typed(cl_h, "clBuildProgram", "ptr, u32, ptr, string, ptr, ptr -> i32", [il_prog, 1, dev_arr, "", 0, 0]) catch -1;
+            if il_brc == 0 { spirv_il_ok = true; }
+            try ffi_call_typed(cl_h, "clReleaseProgram", "ptr -> i32", [il_prog]) catch -1;
+        }
+    }
+
+    // Create OpenCL command queue (OpenCL 2.0+ clCreateCommandQueueWithProperties -> 1.2 fallback)
+    let q_err_b = bytes_new(4);
+    let queue = try ffi_call_typed(cl_h, "clCreateCommandQueueWithProperties", "ptr, ptr, ptr, ptr -> ptr", [ctx, chosen_dev, 0, q_err_b]) catch 0;
+    if queue == 0 or _get_i32_le(q_err_b, 0) != 0 {
+        queue = try ffi_call_typed(cl_h, "clCreateCommandQueue", "ptr, ptr, u64, ptr -> ptr", [ctx, chosen_dev, 0, q_err_b]) catch 0;
+    }
+    if queue == 0 {
+        try ffi_call_typed(cl_h, "clReleaseContext", "ptr -> i32", [ctx]) catch -1;
+        try ffi_close(cl_h) catch nil;
+        try ffi_close(crt_h) catch nil;
+        return cpu_fallback("clCreateCommandQueue_failed");
+    }
+
+    let src_bytes = bytes_from_str(cl_src);
+    let src_ptrs = _pack_u64_buf(_buf_addr(crt_h, src_bytes));
+    let src_lens = _pack_u64_buf(len(cl_src));
+    let p_err_b = bytes_new(4);
+    let prog = try ffi_call_typed(cl_h, "clCreateProgramWithSource", "ptr, u32, ptr, ptr, ptr -> ptr", [ctx, 1, src_ptrs, src_lens, p_err_b]) catch 0;
+    let build_rc = if prog != 0 {
+        try ffi_call_typed(cl_h, "clBuildProgram", "ptr, u32, ptr, string, ptr, ptr -> i32", [prog, 1, dev_arr, "", 0, 0]) catch -1
+    } else { -1 };
+
+    let k_err_b = bytes_new(4);
+    let kern = if build_rc == 0 {
+        try ffi_call_typed(cl_h, "clCreateKernel", "ptr, string, ptr -> ptr", [prog, kern_name, k_err_b]) catch 0
+    } else { 0 };
+
+    if kern == 0 or _get_i32_le(k_err_b, 0) != 0 {
+        if prog != 0 { try ffi_call_typed(cl_h, "clReleaseProgram", "ptr -> i32", [prog]) catch -1; }
+        try ffi_call_typed(cl_h, "clReleaseCommandQueue", "ptr -> i32", [queue]) catch -1;
+        try ffi_call_typed(cl_h, "clReleaseContext", "ptr -> i32", [ctx]) catch -1;
+        try ffi_close(cl_h) catch nil;
+        try ffi_close(crt_h) catch nil;
+        return cpu_fallback("clBuildProgram_or_clCreateKernel_failed:" + str(build_rc));
+    }
+
+    let a_slice = slice(a_in, 0, n);
+    let b_slice = slice(b_in, 0, n);
+    let byte_sz = n * 4;
+    let host_a = _pack_f32_array_buf(a_slice);
+    let host_b = _pack_f32_array_buf(b_slice);
+    let host_out = bytes_new(byte_sz);
+
+    // CL_MEM_READ_ONLY = 4, CL_MEM_WRITE_ONLY = 2
+    let m_err_b = bytes_new(4);
+    let mem_a = ffi_call_typed(cl_h, "clCreateBuffer", "ptr, u64, u64, ptr, ptr -> ptr", [ctx, 4, byte_sz, 0, m_err_b]);
+    let mem_b = ffi_call_typed(cl_h, "clCreateBuffer", "ptr, u64, u64, ptr, ptr -> ptr", [ctx, 4, byte_sz, 0, m_err_b]);
+    let mem_out = ffi_call_typed(cl_h, "clCreateBuffer", "ptr, u64, u64, ptr, ptr -> ptr", [ctx, 2, byte_sz, 0, m_err_b]);
+
+    ffi_call_typed(cl_h, "clEnqueueWriteBuffer", "ptr, ptr, u32, u64, u64, ptr, u32, ptr, ptr -> i32", [queue, mem_a, 1, 0, byte_sz, host_a, 0, 0, 0]);
+    ffi_call_typed(cl_h, "clEnqueueWriteBuffer", "ptr, ptr, u32, u64, u64, ptr, u32, ptr, ptr -> i32", [queue, mem_b, 1, 0, byte_sz, host_b, 0, 0, 0]);
+
+    let arg_mem_a = _pack_u64_buf(mem_a);
+    let arg_mem_b = _pack_u64_buf(mem_b);
+    let arg_mem_out = _pack_u64_buf(mem_out);
+    let arg_alpha = _pack_u32_buf(_f32_to_u32_bits(alpha));
+    let arg_n = _pack_u32_buf(n);
+
+    if is_custom_gpu {
+        let ir_params = custom_compiled.ir.params;
+        let buf_indices = [];
+        let pi = 0;
+        while pi < len(ir_params) {
+            if ir_params[pi].is_buffer { array_push(buf_indices, pi); }
+            pi = pi + 1;
+        }
+        let pj = 0;
+        let seen_buf = 0;
+        while pj < len(ir_params) {
+            let prm = ir_params[pj];
+            if prm.is_buffer {
+                let mptr = arg_mem_out;
+                if len(buf_indices) >= 3 {
+                    if seen_buf == 0 { mptr = arg_mem_a; }
+                    elif seen_buf == 1 { mptr = arg_mem_b; }
+                    else { mptr = arg_mem_out; }
+                } elif len(buf_indices) == 2 {
+                    if seen_buf == 0 { mptr = arg_mem_a; }
+                    else { mptr = arg_mem_out; }
+                }
+                ffi_call_typed(cl_h, "clSetKernelArg", "ptr, u32, u64, ptr -> i32", [kern, pj, 8, mptr]);
+                seen_buf = seen_buf + 1;
+            } elif prm.elem_type == "f32" {
+                ffi_call_typed(cl_h, "clSetKernelArg", "ptr, u32, u64, ptr -> i32", [kern, pj, 4, arg_alpha]);
+            } else {
+                ffi_call_typed(cl_h, "clSetKernelArg", "ptr, u32, u64, ptr -> i32", [kern, pj, 4, arg_n]);
+            }
+            pj = pj + 1;
+        }
+    } else {
+        ffi_call_typed(cl_h, "clSetKernelArg", "ptr, u32, u64, ptr -> i32", [kern, 0, 8, arg_mem_a]);
+        ffi_call_typed(cl_h, "clSetKernelArg", "ptr, u32, u64, ptr -> i32", [kern, 1, 8, arg_mem_b]);
+        ffi_call_typed(cl_h, "clSetKernelArg", "ptr, u32, u64, ptr -> i32", [kern, 2, 8, arg_mem_out]);
+        ffi_call_typed(cl_h, "clSetKernelArg", "ptr, u32, u64, ptr -> i32", [kern, 3, 4, arg_alpha]);
+        ffi_call_typed(cl_h, "clSetKernelArg", "ptr, u32, u64, ptr -> i32", [kern, 4, 4, arg_n]);
+    }
+
+    let gws_buf = _pack_u64_buf(n);
+    let nd_rc = ffi_call_typed(cl_h, "clEnqueueNDRangeKernel", "ptr, ptr, u32, ptr, ptr, ptr, u32, ptr, ptr -> i32", [queue, kern, 1, 0, gws_buf, 0, 0, 0, 0]);
+    ffi_call_typed(cl_h, "clFinish", "ptr -> i32", [queue]);
+    let rd_rc = ffi_call_typed(cl_h, "clEnqueueReadBuffer", "ptr, ptr, u32, u64, u64, ptr, u32, ptr, ptr -> i32", [queue, mem_out, 1, 0, byte_sz, host_out, 0, 0, 0]);
+
+    let out_vals = _unpack_f32_array_buf(host_out, n);
+
+    // Zero-leak deterministic OpenCL resource release
+    try ffi_call_typed(cl_h, "clReleaseMemObject", "ptr -> i32", [mem_out]) catch -1;
+    try ffi_call_typed(cl_h, "clReleaseMemObject", "ptr -> i32", [mem_b]) catch -1;
+    try ffi_call_typed(cl_h, "clReleaseMemObject", "ptr -> i32", [mem_a]) catch -1;
+    try ffi_call_typed(cl_h, "clReleaseKernel", "ptr -> i32", [kern]) catch -1;
+    try ffi_call_typed(cl_h, "clReleaseProgram", "ptr -> i32", [prog]) catch -1;
+    try ffi_call_typed(cl_h, "clReleaseCommandQueue", "ptr -> i32", [queue]) catch -1;
+    try ffi_call_typed(cl_h, "clReleaseContext", "ptr -> i32", [ctx]) catch -1;
+    try ffi_close(cl_h) catch nil;
+    try ffi_close(crt_h) catch nil;
+
+    return map{
+        ok: nd_rc == 0 and rd_rc == 0,
+        executed_on_hardware: nd_rc == 0 and rd_rc == 0,
+        backend: "OpenCL",
+        kernel_name: kern_name,
+        device_name: dev_name,
+        vendor_name: vendor_name,
+        driver_version: drv_ver,
+        il_version: il_ver,
+        spirv_il_accepted: spirv_il_ok,
+        spirv_validated: spirv_valid_ok,
+        element_count: n,
+        output: out_vals,
+        handles_released: true
+    };
+}
+
 export COMPILER_VERSION, SPIRV_MAGIC, SPIRV_VERSION_1_5;
 export tokenize_gpu_kernel, parse_gpu_kernel_ir, compile_gpu_kernel, standard_gpu_kernel_library;
 export emit_vulkan_spirv_words, emit_vulkan_spirv_bytes, validate_spirv_binary;
@@ -2230,3 +3201,4 @@ export emit_webgpu_wgsl, emit_cuda_ptx;
 export probe_npu_and_gpu_devices, execute_kernel_universal;
 export quantize_fp8_e4m3, dequantize_fp8_e4m3, quantize_int4_grouped, dequantize_int4_grouped;
 export flash_attention3_tiled_online_softmax, flash_attention_fp64_reference;
+export probe_live_gpu_drivers, vulkan_validate_and_load_spirv_live, opencl_execute_gpu_kernel_live;

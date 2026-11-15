@@ -1,0 +1,256 @@
+// Pure-PBLang adversarial filesystem checks for the reader appearance profile store.
+let Store = import("../../examples/declarative_browser/appearance_store.sapp");
+let Dir = import("stdlib:linux_dirfs.sapp");
+
+fn _parse_cli() {
+    let raw = os_args();
+    let out = map{runtime: nil, evidence: nil, report: nil};
+    let after = false;
+    let i = 0;
+    while i < len(raw) {
+        let arg = raw[i];
+        if not after {
+            if arg == "--" { after = true; }
+        } elif (arg == "--runtime" or arg == "--evidence" or arg == "--report") and i + 1 < len(raw) {
+            let val = raw[i + 1];
+            if arg == "--runtime" { out.runtime = val; }
+            elif arg == "--evidence" { out.evidence = val; }
+            elif arg == "--report" { out.report = val; }
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _resolve_runtime(explicit, repo) {
+    if explicit != nil and explicit != "" { return explicit; }
+    if fs_exists(repo + "/pblang") { return repo + "/pblang"; }
+    if fs_exists(repo + "/target/release/pblang") { return repo + "/target/release/pblang"; }
+    return "./pblang";
+}
+
+fn _mkdir_private(parent, name) {
+    let fs = Dir.open_absolute(parent, false, false);
+    assert(fs.ok, "open parent");
+    let created = Dir.mkdir_new(fs, name, false);
+    let closed = Dir.close(fs);
+    assert(created.ok and closed, "mkdir private");
+    return parent + "/" + name;
+}
+
+fn _rm_tree(path) {
+    let removed = false;
+    try { fs_remove(path); removed = true; } catch {}
+    if removed { return true; }
+    let kids = try fs_listdir(path) catch nil;
+    if type(kids) == "array" {
+        for kid in kids { let _child = _rm_tree(path + "/" + kid); }
+    }
+    let ok = false;
+    try { fs_remove(path); ok = true; } catch {}
+    return ok;
+}
+
+fn _libc_handle() {
+    let paths = [
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib64/libc.so.6"
+    ];
+    for p in paths {
+        if fs_exists(p) { return ffi_load(p); }
+    }
+    throw "trusted libc unavailable";
+}
+
+fn _probe_call(runtime, op_args, deny_exec, calls_log) {
+    let prev_args = try env_get("PBLANG_SCRIPT_ARGS") catch nil;
+    env_set("PBLANG_SCRIPT_ARGS", str_join(op_args, "\n"));
+    let argv = ["run", "tests/fixtures/reader_appearance_store_probe.sapp", "--allow-all", "--deny-spawn", "--deny-net", "--deny-http"];
+    if deny_exec { array_push(argv, "--deny-exec"); }
+    array_push(argv, "--");
+    for a in op_args { array_push(argv, a); }
+    let proc = proc_spawn_wait(runtime, argv);
+    if prev_args == nil { env_set("PBLANG_SCRIPT_ARGS", ""); }
+    else { env_set("PBLANG_SCRIPT_ARGS", prev_args); }
+    assert(proc.exit_code == 0, "probe failed: " + proc.stderr);
+    let val = json_parse(str_trim(proc.stdout));
+    array_push(calls_log, map{action: op_args[0], result: val});
+    return val;
+}
+
+fn _record(results, name, passed) {
+    array_push(results, map{name: name, passed: passed});
+    assert(passed, name);
+}
+
+fn _write_mode_0600(libc, path, bytes) {
+    try { fs_remove(path); } catch {}
+    fs_write_bytes(path, bytes);
+    let rc = ffi_call_typed(libc, "chmod", "string,i32->i32", [path, 384]);
+    assert(rc == 0, "chmod 0600");
+}
+
+fn _run(scratch, repo, runtime) {
+    let results = [];
+    let calls_log = [];
+    let data = _mkdir_private(scratch, "data");
+    let folder = data + "/reader-style";
+    let current = folder + "/appearance-v1.json";
+    let libc = _libc_handle();
+
+    let denied = _probe_call(runtime, ["load", data], true, calls_log);
+    _record(results, "exec denial gives read only session fallback", not denied.can_save and not fs_exists(folder));
+
+    let initial = _probe_call(runtime, ["load", data], false, calls_log);
+    let default_style = initial.appearance;
+    let style = map{};
+    for k in map_keys(default_style) { style[k] = default_style[k]; }
+    style.font_family = "serif";
+    style.body_size = 20;
+    style.font_scale = 1.5;
+    style.line_height = 1.75;
+
+    _record(results, "missing load is read only", initial.ok and initial.can_save and not fs_exists(folder));
+
+    let saved = _probe_call(runtime, ["save", data, json_stringify(style), initial.token], false, calls_log);
+    _record(results, "explicit save succeeds with spawn and network denied", saved.ok and saved.confirmed and saved.owned_handles_closed);
+
+    let first_bytes = fs_read_bytes(current);
+    let loaded = Store.load(data);
+    _record(results, "restart loads saved appearance", loaded.ok and loaded.appearance == style);
+
+    let data_fs = Dir.open_absolute(data, false, true);
+    let folder_meta = Dir.metadata(data_fs, "reader-style");
+    let _c1 = Dir.close(data_fs);
+    let style_fs = Dir.open_absolute(folder, false, true);
+    let file_meta = Dir.metadata(style_fs, "appearance-v1.json");
+    let _c2 = Dir.close(style_fs);
+    _record(results, "private file and directory",
+        file_meta.ok and bit_and(file_meta.mode, 511) == 384 and folder_meta.ok and bit_and(folder_meta.mode, 511) == 448);
+
+    _record(results, "independent revision token", loaded.token == sha256(base64_encode_bytes(first_bytes)));
+
+    let has_prev = false;
+    let same = Store.save(data, style, loaded.token);
+    for entry in fs_listdir(folder) { if str_starts_with(entry, "previous-") { has_prev = true; } }
+    _record(results, "same save is no op", same.ok and not same.attempted and not has_prev);
+
+    let stale = Store.save(data, default_style, "missing");
+    _record(results, "stale window refuses overwrite", not stale.ok and stale.reload and fs_read_bytes(current) == first_bytes);
+
+    // Hold exclusive flock on style.lock in parent process while child probe attempts save.
+    let lock_fs = Dir.open_absolute(folder, false, true);
+    let held_lock = Dir.acquire_lock(lock_fs, "style.lock", 0, 10, true);
+    assert(held_lock.ok, "acquired style.lock for contention test");
+    let busy = _probe_call(runtime, ["save", data, json_stringify(default_style), loaded.token], false, calls_log);
+    let _rel = Dir.release_lock(lock_fs, held_lock);
+    let _cls = Dir.close(lock_fs);
+    _record(results, "concurrent save refused", not busy.ok and not busy.attempted and fs_read_bytes(current) == first_bytes);
+
+    let reset = Store.save(data, default_style, loaded.token);
+    _record(results, "reset defaults publishes", reset.ok and Store.load(data).appearance == default_style);
+    _record(results, "previous profile retained", fs_read_bytes(folder + "/previous-" + loaded.token + ".json") == first_bytes);
+
+    let broken_bytes = str_to_bytes("{broken");
+    _write_mode_0600(libc, current, broken_bytes);
+    let bad = Store.load(data);
+    _record(results, "invalid profile defaults without rewriting",
+        not bad.ok and bad.can_save and bad.appearance == default_style and fs_read_bytes(current) == broken_bytes);
+
+    let repaired = Store.save(data, style, bad.token);
+    _record(results, "explicit repair preserves invalid bytes",
+        repaired.ok and fs_read_bytes(folder + "/previous-" + bad.token + ".json") == broken_bytes);
+
+    _write_mode_0600(libc, current, [255]);
+    let invalid = Store.load(data);
+    _record(results, "invalid UTF8 defaults", not invalid.ok and invalid.appearance == default_style);
+
+    let utf8_repair = Store.save(data, default_style, invalid.token);
+    _record(results, "invalid UTF8 backup preserved",
+        utf8_repair.ok and fs_read_bytes(folder + "/previous-" + invalid.token + ".json") == [255]);
+
+    let stable_bytes = fs_read_bytes(current);
+    let big_bytes = [];
+    for _i 4097 { array_push(big_bytes, 120); }
+    _write_mode_0600(libc, current, big_bytes);
+    let large = Store.load(data);
+    _record(results, "oversized profile unavailable unchanged", not large.can_save and len(fs_read_bytes(current)) == 4097);
+
+    let refusal = Store.save(data, style, utf8_repair.token);
+    _record(results, "oversized profile never replaced",
+        not refusal.ok and not refusal.attempted and len(fs_read_bytes(current)) == 4097);
+
+    // Symlink, hardlink, and non-private mode checks.
+    let outside = scratch + "/outside";
+    _write_mode_0600(libc, outside, stable_bytes);
+    fs_remove(current);
+    assert(ffi_call_typed(libc, "symlink", "string,string->i32", [outside, current]) == 0, "create symlink");
+    let sym_load = Store.load(data);
+    let sym_save = Store.save(data, style, "missing");
+    _record(results, "symlink target preserved",
+        not sym_load.can_save and not sym_save.ok and fs_read_bytes(outside) == stable_bytes);
+
+    fs_remove(current);
+    assert(ffi_call_typed(libc, "link", "string,string->i32", [outside, current]) == 0, "create hardlink");
+    let hard_load = Store.load(data);
+    _record(results, "hardlinked profile refused", not hard_load.can_save and fs_read_bytes(outside) == stable_bytes);
+
+    fs_remove(current);
+    _write_mode_0600(libc, current, stable_bytes);
+    assert(ffi_call_typed(libc, "chmod", "string,i32->i32", [current, 420]) == 0, "chmod 0644");
+    _record(results, "non private profile refused", not Store.load(data).can_save);
+    assert(ffi_call_typed(libc, "chmod", "string,i32->i32", [current, 384]) == 0, "restore chmod 0600");
+
+    // Foreign unmanaged folder check.
+    let foreign = _mkdir_private(scratch, "foreign");
+    let foreign_style = _mkdir_private(foreign, "reader-style");
+    fs_write(foreign_style + "/sentinel", "keep");
+    _record(results, "foreign folder refused",
+        not Store.load(foreign).can_save and not Store.save(foreign, style, "missing").ok
+        and fs_listdir(foreign_style) == ["sentinel"]);
+
+    // Backup limit check (16 previous-* backups).
+    for i 16 {
+        _write_mode_0600(libc, folder + "/previous-fixture-" + str(i) + ".json", str_to_bytes("retained"));
+    }
+    let before_limit = fs_read_bytes(current);
+    let limit = Store.save(data, style, Store.load(data).token);
+    _record(results, "backup limit preserves current",
+        not limit.ok and not limit.attempted and fs_read_bytes(current) == before_limit);
+
+    _record(results, "application directory cannot be data", Store.data_parent(repo, repo + "/inside") == nil);
+    _record(results, "explicit private parent is selected", Store.data_parent(repo, data) == data);
+
+    ffi_close(libc);
+    return map{results: results, calls: calls_log};
+}
+
+fn main() {
+    let cli = _parse_cli();
+    let repo = cwd();
+    let runtime = _resolve_runtime(cli.runtime, repo);
+    let scratch = _mkdir_private("/tmp", "pblang_tooling_s3_app_store_" + str(num_floor(now_ms())));
+    let outcome = try _run(scratch, repo, runtime) catch nil;
+    let ok = outcome != nil;
+
+    if ok and cli.evidence != nil {
+        fs_mkdirs(cli.evidence);
+        fs_write(cli.evidence + "/acceptance.json", json_stringify(outcome.results) + "\n");
+        let lines = [];
+        for entry in outcome.calls { array_push(lines, json_stringify(entry)); }
+        fs_write(cli.evidence + "/calls.jsonl", str_join(lines, "\n") + "\n");
+    }
+    if ok and cli.report != nil {
+        fs_mkdirs(path_dirname(cli.report));
+        fs_write(cli.report, json_stringify(outcome.results) + "\n");
+    }
+    let _cleaned = _rm_tree(scratch);
+    assert(not fs_exists(scratch), "disposable scratch cleaned");
+    assert(ok, "reader_appearance_store verification failed");
+    print json_stringify(map{passed: true, checks: len(outcome.results)});
+}
+
+main();

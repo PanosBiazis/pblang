@@ -1,0 +1,239 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+//
+// bench/loop_bench.sapp — Pure-PBLang Tight Rolling-Hash Loop Benchmark
+//
+// Replaces bench/loop_bench.sh. Measures register-allocated tight integer loop
+// `h = (h * 31 + i) & 65535` across pblang tiers and optional installed toolchains.
+
+let CG = import("stdlib:native/codegen_x64.sapp");
+
+fn _collect_args() {
+    let raw_env = env_get("PBLANG_SCRIPT_ARGS");
+    if raw_env != nil and raw_env != "" {
+        let parts = str_split(raw_env, "\n");
+        let env_out = [];
+        let k = 0;
+        while k < len(parts) {
+            if parts[k] != "" { array_push(env_out, parts[k]); }
+            k = k + 1;
+        }
+        return env_out;
+    }
+    let argv = try os_args() catch [];
+    if not is_array(argv) { return []; }
+    let n = len(argv);
+    let i = 0;
+    let found = false;
+    while i < n {
+        let a = str(argv[i]);
+        i = i + 1;
+        if str_ends_with(a, ".sapp") or str_ends_with(a, ".pbck") { found = true; break; }
+    }
+    if not found { return []; }
+    while i < n {
+        let a2 = str(argv[i]);
+        if a2 == "--" { i = i + 1; break; }
+        if not str_starts_with(a2, "-") { break; }
+        i = i + 1;
+    }
+    let out = [];
+    while i < n {
+        array_push(out, str(argv[i]));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _parse_uint(s: string, fallback: int) {
+    if len(s) == 0 { return fallback; }
+    let acc = 0;
+    let i = 0;
+    while i < len(s) {
+        let c = strcharcodeat(s, i);
+        if c < 48 or c > 57 { return fallback; }
+        acc = acc * 10 + (c - 48);
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn _find_pb(root: string) {
+    let env_b = env_get("PB");
+    if env_b != nil and env_b != "" and fs_exists(env_b) { return env_b; }
+    if fs_exists(root + "/target/release/pblang") { return root + "/target/release/pblang"; }
+    if fs_exists(root + "/pblang") { return root + "/pblang"; }
+    return "pblang";
+}
+
+fn _have(tool: string) {
+    let r = try proc_spawn_wait("which", [tool]) catch map{ exit_code: 1 };
+    return r.exit_code == 0;
+}
+
+fn _pad_right(s: string, w: int) {
+    let o = s;
+    while len(o) < w { o = o + " "; }
+    return o;
+}
+
+fn _pad_left(s: string, w: int) {
+    let o = s;
+    while len(o) < w { o = " " + o; }
+    return o;
+}
+
+fn _row(target: string, t_ms: string, res: string, notes: string) {
+    println(_pad_right(target, 26) + " " + _pad_left(t_ms, 11) + " " + _pad_left(res, 16) + " " + _pad_left(notes, 12));
+}
+
+fn _skip(target: string, pkg: string) {
+    _row(target, "n/a", "not installed", pkg);
+}
+
+fn _fsize(p: string) {
+    if not fs_exists(p) { return "-"; }
+    return str(len(fs_read_bytes(p)));
+}
+
+let args = _collect_args();
+let n_val = if len(args) > 0 { _parse_uint(args[0], 100000000) } else { 100000000 };
+let k_runs = if len(args) > 1 { _parse_uint(args[1], 3) } else { 3 };
+let tmo_raw = env_get("TMO");
+let tmo_sec = if tmo_raw != nil and tmo_raw != "" { _parse_uint(tmo_raw, 75) } else { 75 };
+let has_timeout = _have("timeout");
+
+let root = cwd();
+let pb = _find_pb(root);
+let asm_src = root + "/bench/loop_asm.S";
+let work = "/tmp/pb_loop_bench_" + str(num_floor(now_ms()));
+fs_mkdirs(work);
+
+let bestof = fn(cmd_bin: string, cmd_args: any) {
+    let best = 99999999;
+    let last_out = "";
+    let i = 0;
+    while i < k_runs {
+        let t0 = now_ms();
+        let r = if has_timeout {
+            let ta = [str(tmo_sec), cmd_bin];
+            let j = 0;
+            while j < len(cmd_args) { array_push(ta, cmd_args[j]); j = j + 1; }
+            proc_spawn_wait("timeout", ta)
+        } else {
+            proc_spawn_wait(cmd_bin, cmd_args)
+        };
+        let dt = num_floor(now_ms() - t0);
+        if r.exit_code == 124 {
+            return map{ rep: ">" + str(tmo_sec) + "s", res: "(timeout)" };
+        }
+        if dt < best { best = dt; }
+        last_out = str_trim(str(r.stdout));
+        i = i + 1;
+    }
+    return map{ rep: str(best), res: last_out };
+};
+
+let arch = str_trim(str((try proc_spawn_wait("uname", ["-m"]) catch map{ stdout: "x86_64" }).stdout));
+let cores = str_trim(str((try proc_spawn_wait("nproc", []) catch map{ stdout: "1" }).stdout));
+let utc = str_trim(str((try proc_spawn_wait("date", ["-u", "+%FT%TZ"]) catch map{ stdout: "" }).stdout));
+
+println("=== Loop benchmark — h=(h*31+i)&0xFFFF over " + str(n_val) + " iters, best-of-" + str(k_runs) + " — " + utc + " ===");
+println("    (host: " + arch + " " + cores + " cores; time_ms includes process startup; register-allocation stress test)");
+_row("target", "time_ms", "result", "size/notes");
+_row("--------------------------", "-----------", "----------------", "------------");
+
+let loop_src = "let h = 0; let i = 0;\nwhile i < " + str(n_val) + " { h = (h * 31 + i) & 65535; i = i + 1; }\nprint h;\n";
+let loop_cg = work + "/loop_cg";
+let cg_ok = false;
+try {
+    fs_write_bytes(loop_cg, CG.compile_fns(loop_src));
+    proc_spawn_wait("chmod", ["755", loop_cg]);
+    cg_ok = true;
+} catch _e {
+    cg_ok = false;
+}
+if cg_ok and fs_exists(loop_cg) {
+    let b = bestof(loop_cg, []);
+    _row("pblang (native codegen-x64)", b.rep, b.res, _fsize(loop_cg));
+} else {
+    _row("pblang (native codegen-x64)", "err", "compile failed", "-");
+}
+
+let loopr_sapp = work + "/loopr.sapp";
+fs_write(loopr_sapp, "let h = 0; let i = 0;\nwhile i < " + str(n_val) + " { h = (h * 31 + i) & 65535; i = i + 1; }\nprint str(h);\n");
+let loop_pbc = work + "/loop_pbc";
+if proc_spawn_wait(pb, ["compile", loopr_sapp, "--out", loop_pbc]).exit_code == 0 and fs_exists(loop_pbc) {
+    let bc = bestof(loop_pbc, []);
+    _row("pblang (native C99)", bc.rep, bc.res, _fsize(loop_pbc));
+}
+
+let bi = bestof(pb, ["run", loopr_sapp]);
+_row("pblang (interpreter)", bi.rep, bi.res, "-");
+
+if _have("as") and _have("ld") and fs_exists(asm_src) {
+    let patched = regex_replace_all(fs_read(asm_src), "\\bNVAL\\b", str(n_val));
+    let s_file = work + "/loop_asm.S";
+    let o_file = work + "/loop_asm.o";
+    let a_bin = work + "/loop_asm";
+    fs_write(s_file, patched);
+    if proc_spawn_wait("as", ["--64", s_file, "-o", o_file]).exit_code == 0 and proc_spawn_wait("ld", [o_file, "-o", a_bin]).exit_code == 0 {
+        let ba = bestof(a_bin, []);
+        _row("Assembly (hand-written)", ba.rep, ba.res, _fsize(a_bin));
+    } else {
+        _row("Assembly (hand-written)", "err", "assemble failed", "-");
+    }
+} else {
+    _skip("Assembly (hand-written)", "binutils");
+}
+
+let c_file = work + "/loop.c";
+fs_write(c_file, "#include <stdio.h>\nint main(){long h=0;for(long i=0;i<" + str(n_val) + "L;i++)h=(h*31+i)&65535;printf(\"%ld\\n\",h);return 0;}\n");
+if _have("gcc") {
+    let c2 = work + "/loop_c2";
+    if proc_spawn_wait("gcc", ["-O2", "-o", c2, c_file]).exit_code == 0 {
+        let bc2 = bestof(c2, []);
+        _row("C (gcc -O2)", bc2.rep, bc2.res, _fsize(c2));
+    }
+    let c0 = work + "/loop_c0";
+    if proc_spawn_wait("gcc", ["-O0", "-o", c0, c_file]).exit_code == 0 {
+        let bc0 = bestof(c0, []);
+        _row("C (gcc -O0)", bc0.rep, bc0.res, _fsize(c0));
+    }
+} else { _skip("C (gcc)", "gcc"); }
+
+if _have("clang") {
+    let cl = work + "/loop_clang";
+    if proc_spawn_wait("clang", ["-O2", "-o", cl, c_file]).exit_code == 0 {
+        let bcl = bestof(cl, []);
+        _row("C (clang -O2)", bcl.rep, bcl.res, _fsize(cl));
+    }
+} else { _skip("C (clang)", "clang"); }
+
+if _have("rustc") {
+    let rs_file = work + "/loop.rs";
+    let rs_bin = work + "/loop_rs";
+    fs_write(rs_file, "fn main(){let mut h:i64=0;for i in 0.." + str(n_val) + "i64{h=(h*31+i)&65535;}println!(\"{}\",h);}\n");
+    if proc_spawn_wait("rustc", ["-O", "-o", rs_bin, rs_file]).exit_code == 0 {
+        let brs = bestof(rs_bin, []);
+        _row("Rust (rustc -O)", brs.rep, brs.res, _fsize(rs_bin));
+    } else { _skip("Rust (rustc)", "rustc"); }
+} else { _skip("Rust (rustc)", "rustup"); }
+
+if _have("node") {
+    let js_file = work + "/loop.js";
+    fs_write(js_file, "let h=0;for(let i=0;i<" + str(n_val) + ";i++)h=(h*31+i)&65535;console.log(h);\n");
+    let bn = bestof("node", [js_file]);
+    _row("JavaScript (Node/V8)", bn.rep, bn.res, "-");
+} else { _skip("JavaScript (Node)", "nodejs"); }
+
+let names = try fs_listdir(work) catch [];
+let ci = 0;
+while ci < len(names) {
+    try fs_remove(work + "/" + names[ci]) catch nil;
+    ci = ci + 1;
+}
+try fs_remove(work) catch nil;
+
+println("");
+println("Notes: workload has NO function calls — it isolates loop/register-allocation quality (vs lang_shootout.sapp's");
+println("       recursive fib, which stresses call/return). pblang keeps h and i in registers across the loop body.");

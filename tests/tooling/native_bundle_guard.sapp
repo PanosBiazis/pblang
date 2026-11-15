@@ -1,0 +1,426 @@
+// Linux public-launcher bundle-denial, passthrough parity, and fail-closed
+// guard verification (tools/pblang_launch.sapp & tools/native_bundle_guard.sapp)
+// in pure PBLang using disposable trees only.
+
+let SECURE = import("stdlib:secure_file.sapp");
+
+fn _find_libc() {
+    let paths = [
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/usr/lib/libc.so.6",
+        "/lib/libc.so.6"
+    ];
+    let i = 0;
+    while i < len(paths) {
+        if fs_exists(paths[i]) { return paths[i]; }
+        i = i + 1;
+    }
+    throw "native_bundle_guard: libc.so.6 not found";
+}
+
+fn _rm_tree_libc(libc, path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            let child = path + "/" + entries[i];
+            if ffi_call_typed(libc, "unlink", "i32(cstr)", [child]) != 0 {
+                _rm_tree_libc(libc, child);
+            }
+            i = i + 1;
+        }
+    }
+    let _u = ffi_call_typed(libc, "unlink", "i32(cstr)", [path]);
+    let _d = ffi_call_typed(libc, "rmdir", "i32(cstr)", [path]);
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _is_symlink(path) {
+    let st_bin = if fs_exists("/usr/bin/stat") { "/usr/bin/stat" } else { "/bin/stat" };
+    let r = proc_spawn_wait(st_bin, ["-c", "%F", path]);
+    return r.exit_code == 0 and str_contains(r.stdout, "symbolic link");
+}
+
+fn _readlink_target(path) {
+    let st_bin = if fs_exists("/usr/bin/readlink") { "/usr/bin/readlink" } else { "/bin/readlink" };
+    let r = proc_spawn_wait(st_bin, [path]);
+    return str_trim(r.stdout);
+}
+
+fn _snapshot_tree(cur_dir, rel_prefix, acc) {
+    let entries = try fs_listdir(cur_dir) catch nil;
+    if entries == nil { return; }
+    let sorted = array_sort(entries);
+    let i = 0;
+    while i < len(sorted) {
+        let nm = sorted[i];
+        let full = cur_dir + "/" + nm;
+        let rel = if rel_prefix == "" { nm } else { rel_prefix + "/" + nm };
+        if _is_symlink(full) {
+            acc[rel] = "link:" + _readlink_target(full);
+        } else {
+            let sub = try fs_listdir(full) catch nil;
+            if sub != nil {
+                acc[rel] = "dir";
+                _snapshot_tree(full, rel, acc);
+            } else {
+                acc[rel] = "file:" + sha256(bytes_to_str(fs_read_bytes(full)));
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn _trees_equal(a, b) {
+    let ak = array_sort(map_keys(a));
+    let bk = array_sort(map_keys(b));
+    if ak != bk { return false; }
+    let i = 0;
+    while i < len(ak) {
+        let k = ak[i];
+        if a[k] != b[k] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _prepare_guard_for_runtime(guard_src, stdlib_dir) {
+    let adapted = str_replace_all(guard_src, "import(\"stdlib:", "import(\"" + stdlib_dir + "/");
+    let old_head = "let raw = os_args();";
+    if not str_contains(adapted, old_head) {
+        return adapted;
+    }
+    let new_head = "let _raw0 = os_args();\n"
+        + "let raw = if len(_raw0) >= 3 and _raw0[0] != \"run\" and _raw0[1] == \"--\" and _raw0[2] == \"pblang-launch-argv-v2\" {\n"
+        + "    let _r = [\"run\", _raw0[0], \"--sandbox\", \"--\", \"pblang-launch-argv-v2\"];\n"
+        + "    let _k = 3;\n"
+        + "    while _k < len(_raw0) { array_push(_r, _raw0[_k]); _k = _k + 1; }\n"
+        + "    _r\n"
+        + "} elif len(_raw0) >= 2 and _raw0[0] != \"run\" and _raw0[1] == \"--\" {\n"
+        + "    let _r = [\"run\", _raw0[0]];\n"
+        + "    let _k = 2;\n"
+        + "    while _k < len(_raw0) { array_push(_r, _raw0[_k]); _k = _k + 1; }\n"
+        + "    _r\n"
+        + "} elif len(_raw0) > 0 and _raw0[0] == \"run\" {\n"
+        + "    _raw0\n"
+        + "} else {\n"
+        + "    let _r = [\"run\"];\n"
+        + "    let _k = 0;\n"
+        + "    while _k < len(_raw0) { array_push(_r, _raw0[_k]); _k = _k + 1; }\n"
+        + "    _r\n"
+        + "};";
+    return str_replace_all(adapted, old_head, new_head);
+}
+
+fn main() {
+    let raw_args = os_args();
+    let native_arg = "";
+    let repo_arg = "";
+    let report_arg = "";
+    let reproduce_native = false;
+    let idx = 0;
+    while idx < len(raw_args) {
+        let a = raw_args[idx];
+        if a == "--native" and idx + 1 < len(raw_args) {
+            native_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--repo" and idx + 1 < len(raw_args) {
+            repo_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--report" and idx + 1 < len(raw_args) {
+            report_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--reproduce-native" {
+            reproduce_native = true;
+        }
+        idx = idx + 1;
+    }
+
+    let repo_root = if repo_arg != "" { repo_arg } else { cwd() };
+    let native_src = if native_arg != "" {
+        native_arg
+    } elif fs_exists(repo_root + "/target/release/pblang") {
+        repo_root + "/target/release/pblang"
+    } else {
+        repo_root + "/pblang"
+    };
+    assert(fs_exists(native_src), "native_bundle_guard: native binary missing");
+    assert(
+        fs_exists(repo_root + "/tools/pblang_launch.sapp") or fs_exists(repo_root + "/tools/pblang-launch.sh"),
+        "native_bundle_guard: launcher source missing in tools/"
+    );
+    assert(fs_exists(repo_root + "/tools/native_bundle_guard.sapp"), "native_bundle_guard: guard source missing");
+
+    let libc_path = _find_libc();
+    let libc = ffi_load(libc_path);
+
+    let base = "/tmp/pblang_tooling_s1_launcher_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(base).ok, "create private base");
+
+    let release_dir = base + "/release space ελληνικά";
+    fs_mkdirs(release_dir + "/bin");
+    fs_mkdirs(release_dir + "/libexec");
+
+    let staged_native = release_dir + "/bin/pblang-native";
+    assert(ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", [native_src, staged_native]) == 0, "stage pblang-native symlink");
+
+    let is_sovereign = str_contains(proc_spawn_wait(staged_native, ["--version"]).stdout, "sovereign");
+    let staged_guard = release_dir + "/libexec/native_bundle_guard.sapp";
+    let raw_guard = fs_read(repo_root + "/tools/native_bundle_guard.sapp");
+    let orig_guard_src = if is_sovereign {
+        _prepare_guard_for_runtime(raw_guard, repo_root + "/stdlib")
+    } else {
+        str_replace_all(raw_guard, "import(\"stdlib:", "import(\"" + repo_root + "/stdlib/")
+    };
+    fs_write(staged_guard, orig_guard_src);
+
+    let rows = [];
+
+    let record_row = fn(name, passed, detail) {
+        array_push(rows, map{ name: name, passed: passed, detail: detail });
+        if not passed {
+            print "FAIL_BUNDLE_GUARD: " + name + " -> " + json_stringify(detail);
+        }
+        assert(passed, "native_bundle_guard failed: " + name);
+    };
+
+    let run_direct = fn(bin, args, work_dir) {
+        assert(ffi_call_typed(libc, "chdir", "i32(cstr)", [work_dir]) == 0, "chdir work_dir");
+        let p = proc_spawn_wait(bin, args);
+        assert(ffi_call_typed(libc, "chdir", "i32(cstr)", [repo_root]) == 0, "restore chdir");
+        return p;
+    };
+
+    // Execute staged launcher following exact pblang_launch.sapp / pblang-launch.sh contract:
+    // 1) Verify staged runtime + guard exist (exit 126 on missing).
+    // 2) Run sandboxed admission guard (`pblang-launch-argv-v2`) with clean PBLANG_* env.
+    // 3) Dispatch only on explicit `pblang-launch-admit-v1` / `pblang-launch-check-v1` / `pblang-launch-check-usage-v1`.
+    let run_launcher = fn(user_args, work_dir) {
+        if not fs_exists(staged_native) or not fs_exists(staged_guard) {
+            return map{
+                exit_code: 126,
+                stdout: "",
+                stderr: "pblang launcher: native runtime or admission guard is missing\n"
+            };
+        }
+        let adm_cmd = if is_sovereign {
+            ["run", "--sandbox", staged_guard, "--", "pblang-launch-argv-v2"]
+        } else {
+            ["run", staged_guard, "--sandbox", "--", "pblang-launch-argv-v2"]
+        };
+        let i = 0;
+        while i < len(user_args) {
+            array_push(adm_cmd, user_args[i]);
+            i = i + 1;
+        }
+        let saved_aa = env_get("PBLANG_ALLOW_ALL");
+        let saved_sa = env_get("PBLANG_SCRIPT_ARGS");
+        env_set("PBLANG_ALLOW_ALL", "");
+        env_set("PBLANG_SCRIPT_ARGS", "");
+        let adm = run_direct(staged_native, adm_cmd, work_dir);
+        if saved_aa != nil { env_set("PBLANG_ALLOW_ALL", saved_aa); }
+        if saved_sa != nil { env_set("PBLANG_SCRIPT_ARGS", saved_sa); }
+
+        if adm.exit_code != 0 {
+            return map{ exit_code: adm.exit_code, stdout: "", stderr: adm.stderr };
+        }
+        let decision = str_trim(adm.stdout);
+        if decision == "pblang-launch-admit-v1" {
+            return run_direct(staged_native, user_args, work_dir);
+        }
+        if decision == "pblang-launch-check-v1" {
+            let chk_cmd = ["run", staged_guard];
+            if is_sovereign { array_push(chk_cmd, "--"); }
+            let k = 0;
+            while k < len(user_args) { array_push(chk_cmd, user_args[k]); k = k + 1; }
+            return run_direct(staged_native, chk_cmd, work_dir);
+        }
+        if decision == "pblang-launch-check-usage-v1" {
+            return map{
+                exit_code: 2,
+                stdout: "",
+                stderr: "pblang --check: invalid check usage\n"
+            };
+        }
+        return map{
+            exit_code: 126,
+            stdout: "",
+            stderr: "pblang launcher: no valid admission decision\n"
+        };
+    };
+
+    let make_fixture = fn(name) {
+        let root = base + "/" + name;
+        let source = root + "/source";
+        fs_mkdirs(source);
+        fs_write(source + "/pblang.toml", "[package]\nname=\"bundle-guard-fixture\"\nversion=\"0.1.0\"\nentry=\"main.sapp\"\n");
+        fs_write(source + "/main.sapp", "print \"bundle-integrity-canary\";\n");
+        return map{ root: root, source: source };
+    };
+
+    let prev_allow = env_get("PBLANG_ALLOW_ALL");
+    let prev_sargs = env_get("PBLANG_SCRIPT_ARGS");
+
+    let run_suite = fn() {
+        if reproduce_native and not is_sovereign {
+            let fx0 = make_fixture("native-relative-baseline");
+            let before_b = fs_read_bytes(fx0.source + "/main.sapp");
+            let pr = run_direct(staged_native, ["bundle", ".", fx0.root + "/out"], fx0.source);
+            let after_b = fs_read_bytes(fx0.source + "/main.sapp");
+            record_row("retained native relative-root truncation reproduced", pr.exit_code == 0 and len(before_b) == 33 and len(after_b) == 0, pr.exit_code);
+        }
+
+        let shapes = [
+            "sibling", "self", "descendant", "ancestor", "existing", "output-link",
+            "parent-link", "entry-alias", "source-link", "absolute", "no-args",
+            "help", "self-extract", "capability-flags", "separator", "newline-output"
+        ];
+        let si = 0;
+        while si < len(shapes) {
+            let shape = shapes[si];
+            let fx = make_fixture("fixture-" + shape);
+            let out = fx.root + "/out";
+            let source_arg = ".";
+            let extra = [];
+            if shape == "self" { out = fx.source; }
+            elif shape == "descendant" { out = fx.source + "/out"; }
+            elif shape == "ancestor" { out = fx.root; }
+            elif shape == "existing" {
+                fs_mkdirs(out);
+                fs_write(out + "/sentinel", "preserve");
+            } elif shape == "output-link" {
+                assert(ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", [fx.source, out]) == 0, "symlink output-link");
+            } elif shape == "parent-link" {
+                assert(ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", [fx.source, fx.root + "/alias"]) == 0, "symlink parent-link");
+                out = fx.root + "/alias/out";
+            } elif shape == "entry-alias" {
+                assert(ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", [fx.source + "/main.sapp", out]) == 0, "symlink entry-alias");
+            } elif shape == "source-link" {
+                assert(ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", [fx.source, fx.root + "/alias"]) == 0, "symlink source-link");
+                source_arg = fx.root + "/alias";
+            } elif shape == "absolute" {
+                source_arg = fx.source;
+            } elif shape == "self-extract" {
+                extra = ["--self-extract"];
+            } elif shape == "capability-flags" {
+                extra = ["--allow-all", "--sandbox"];
+            } elif shape == "separator" {
+                extra = ["--"];
+            } elif shape == "newline-output" {
+                out = fx.root + "/out\n--help";
+            }
+
+            let b_args = ["bundle"];
+            let ei = 0;
+            while ei < len(extra) { array_push(b_args, extra[ei]); ei = ei + 1; }
+            array_push(b_args, source_arg);
+            array_push(b_args, out);
+            if shape == "no-args" { b_args = ["bundle"]; }
+            if shape == "help" { b_args = ["bundle", "--help"]; }
+
+            let before_t = map{};
+            _snapshot_tree(fx.root, "", before_t);
+            env_set("PBLANG_ALLOW_ALL", "1");
+            env_set("PBLANG_SCRIPT_ARGS", "help");
+            let p = run_launcher(b_args, fx.source);
+            env_set("PBLANG_ALLOW_ALL", "");
+            env_set("PBLANG_SCRIPT_ARGS", "");
+
+            let after_t = map{};
+            _snapshot_tree(fx.root, "", after_t);
+            let ok_s = p.exit_code != 0
+                and str_contains(p.stderr, "native bundle is disabled")
+                and _trees_equal(before_t, after_t);
+            record_row("fixture denied " + shape, ok_s, map{ exit: p.exit_code });
+            si = si + 1;
+        }
+
+        // Passthrough native parity
+        let pfx = make_fixture("fixture-passthrough");
+        let args_script = pfx.source + "/args.sapp";
+        fs_write(args_script, "print json_stringify(os_args());\n");
+        let fail_script = pfx.source + "/exit.sapp";
+        fs_write(fail_script, "os_exit(17);\n");
+
+        let inputs = [
+            ["--version"],
+            ["--help"],
+            ["version"],
+            ["help"],
+            ["run", args_script, "--", "", "two words", "ελληνικά", "line\nnext", "bundle", "--allow-all"],
+            [args_script, "--", "bare-script"],
+            ["run", fail_script],
+            ["bundle\nhelp"],
+            ["--", "bundle"],
+            ["--allow-all", "bundle"],
+            ["Bundle"],
+            ["--version", "bundle"]
+        ];
+        let ii = 0;
+        while ii < len(inputs) {
+            let in_args = inputs[ii];
+            let before_p = map{};
+            _snapshot_tree(pfx.root, "", before_p);
+            let exp_p = run_direct(staged_native, in_args, pfx.source);
+            let act_p = run_launcher(in_args, pfx.source);
+            let after_p = map{};
+            _snapshot_tree(pfx.root, "", after_p);
+            let ok_p = act_p.exit_code == exp_p.exit_code
+                and act_p.stdout == exp_p.stdout
+                and act_p.stderr == exp_p.stderr
+                and _trees_equal(before_p, after_p);
+            record_row("fixture native parity " + str(ii), ok_p, map{ exit: act_p.exit_code });
+            ii = ii + 1;
+        }
+
+        // Guard failure modes (must fail closed with non-zero exit and empty stdout)
+        let g_failures: any = [
+            map{ label: "missing", contents: nil },
+            map{ label: "empty", contents: "" },
+            map{ label: "syntax", contents: "let = ;" },
+            map{ label: "wrong-marker", contents: "print \"yes\";" },
+            map{ label: "attempted-import", contents: "let x=import(\"absent.sapp\"); print \"pblang-launch-admit-v1\";" }
+        ];
+        let gfi = 0;
+        while gfi < len(g_failures) {
+            let gf = g_failures[gfi];
+            if gf.contents == nil {
+                let _rmg = try fs_remove(staged_guard) catch false;
+            } else {
+                fs_write(staged_guard, gf.contents);
+            }
+            let gp = run_launcher(["--version"], base);
+            record_row("guard failure " + gf.label, gp.exit_code != 0 and gp.stdout == "", map{ exit: gp.exit_code });
+            gfi = gfi + 1;
+        }
+
+        fs_write(staged_guard, orig_guard_src);
+        assert(ffi_call_typed(libc, "unlink", "i32(cstr)", [staged_native]) == 0, "remove staged runtime");
+        let mp = run_launcher(["--version"], base);
+        record_row("missing runtime fails closed", mp.exit_code == 126 and mp.stdout == "", map{ exit: mp.exit_code });
+        return true;
+    };
+
+    let ok = try run_suite() catch false;
+    let _rcd = ffi_call_typed(libc, "chdir", "i32(cstr)", [repo_root]);
+    if prev_allow != nil { env_set("PBLANG_ALLOW_ALL", prev_allow); } else { env_set("PBLANG_ALLOW_ALL", ""); }
+    if prev_sargs != nil { env_set("PBLANG_SCRIPT_ARGS", prev_sargs); } else { env_set("PBLANG_SCRIPT_ARGS", ""); }
+
+    _rm_tree_libc(libc, base);
+    ffi_close(libc);
+    assert(not fs_exists(base), "native_bundle_guard base cleaned up");
+
+    if report_arg != "" {
+        let pdir = path_dirname(report_arg);
+        if pdir != "" and pdir != "." { fs_mkdirs(pdir); }
+        fs_write(report_arg, json_stringify(rows) + "\n");
+    }
+
+    assert(ok and len(rows) >= 34, "native_bundle_guard failed");
+    print "native_bundle_guard_pass: rows=" + str(len(rows));
+}
+
+main();

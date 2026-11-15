@@ -1,0 +1,387 @@
+// Real installed compiler and checker journeys with no source checkout visible
+// (Linux bwrap namespace isolation) in pure PBLang.
+// Exercises stdlib/compiler/native_bundle.sapp, tools/pbc.sapp, tools/pbcheck.sapp,
+// and tools/pblock_install.sapp across manifestless and locked-decoy caller roots.
+
+let SECURE = import("stdlib:secure_file.sapp");
+
+fn _find_libc() {
+    let paths = [
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/usr/lib/libc.so.6",
+        "/lib/libc.so.6"
+    ];
+    let i = 0;
+    while i < len(paths) {
+        if fs_exists(paths[i]) { return paths[i]; }
+        i = i + 1;
+    }
+    throw "pbc_portability: libc.so.6 not found";
+}
+
+fn _rm_tree_libc(libc, path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            let child = path + "/" + entries[i];
+            if ffi_call_typed(libc, "unlink", "i32(cstr)", [child]) != 0 {
+                _rm_tree_libc(libc, child);
+            }
+            i = i + 1;
+        }
+    }
+    let _u = ffi_call_typed(libc, "unlink", "i32(cstr)", [path]);
+    let _d = ffi_call_typed(libc, "rmdir", "i32(cstr)", [path]);
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _copy_tree(src, dst) {
+    fs_mkdirs(dst);
+    let entries = fs_listdir(src);
+    let i = 0;
+    while i < len(entries) {
+        let nm = entries[i];
+        let s = src + "/" + nm;
+        let d = dst + "/" + nm;
+        let sub = try fs_listdir(s) catch nil;
+        if sub != nil {
+            _copy_tree(s, d);
+        } else {
+            fs_write_bytes(d, fs_read_bytes(s));
+        }
+        i = i + 1;
+    }
+}
+
+fn _concat_arr(a, b) {
+    let out = [];
+    let i = 0;
+    while i < len(a) { array_push(out, a[i]); i = i + 1; }
+    let j = 0;
+    while j < len(b) { array_push(out, b[j]); j = j + 1; }
+    return out;
+}
+
+fn main() {
+    let raw_args = os_args();
+    let binary_arg = "";
+    let report_arg = "";
+    let idx = 0;
+    while idx < len(raw_args) {
+        let a = raw_args[idx];
+        if (a == "--binary" or a == "--runtime") and idx + 1 < len(raw_args) {
+            binary_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--report" and idx + 1 < len(raw_args) {
+            report_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        }
+        idx = idx + 1;
+    }
+
+    let repo = cwd();
+    let binary = if binary_arg != "" {
+        binary_arg
+    } elif fs_exists(repo + "/target/release/pblang") {
+        repo + "/target/release/pblang"
+    } else {
+        repo + "/pblang"
+    };
+    assert(fs_exists(binary), "pbc_portability: binary not found");
+
+    let libc_path = _find_libc();
+    let libc = ffi_load(libc_path);
+    let bwrap_bin = if fs_exists("/usr/bin/bwrap") {
+        "/usr/bin/bwrap"
+    } elif fs_exists("/bin/bwrap") {
+        "/bin/bwrap"
+    } else {
+        ""
+    };
+
+    let base = "/tmp/pblang_tooling_s1_pbc_port_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(base).ok, "create private base");
+
+    let records = [];
+    let run_step = fn(label, cmd_bin, cmd_args, work_dir, expected_exit, expected_output) {
+        let t0 = now_ms();
+        let _c1 = ffi_call_typed(libc, "chdir", "i32(cstr)", [work_dir]);
+        let res = proc_spawn_wait(cmd_bin, cmd_args);
+        let _c2 = ffi_call_typed(libc, "chdir", "i32(cstr)", [repo]);
+        let elapsed_ms = num_floor(now_ms() - t0);
+
+        let exit_ok = if expected_exit == nil {
+            res.exit_code != 0
+        } else {
+            res.exit_code == expected_exit
+        };
+        let out_ok = if expected_output == nil {
+            true
+        } else {
+            str_trim(res.stdout) == expected_output
+        };
+        let combined = res.stdout + res.stderr;
+        let ok = exit_ok
+            and out_ok
+            and (not str_contains(combined, "DECOY_EXECUTED"))
+            and (not str_contains(combined, "SOURCE_EXECUTED"));
+
+        let rec = map{
+            case: label,
+            passed: ok,
+            exit: res.exit_code,
+            ms: elapsed_ms,
+            stdout: res.stdout,
+            stderr: res.stderr
+        };
+        array_push(records, rec);
+        if report_arg != "" {
+            fs_write(report_arg, json_stringify(records) + "\n");
+        }
+        if not ok {
+            print "FAIL_PBC_PORTABILITY: " + label + " -> " + json_stringify(rec);
+            _rm_tree_libc(libc, base);
+        }
+        assert(ok, "pbc_portability check failed: " + label);
+        return res;
+    };
+
+    // Build installed payload in isolated temp folder
+    let installed = base + "/installed";
+    fs_mkdirs(installed + "/bin");
+    fs_mkdirs(installed + "/tools");
+    let exe = installed + "/bin/pblang";
+    fs_write_bytes(exe, fs_read_bytes(binary));
+    let _chm_exe = ffi_call_typed(libc, "chmod", "i32(cstr,i32)", [exe, 493]);
+    _copy_tree(repo + "/stdlib", installed + "/stdlib");
+
+    let tool_names = ["pbc.sapp", "pbcheck.sapp", "pblock_install.sapp"];
+    let ti = 0;
+    while ti < len(tool_names) {
+        let tnm = tool_names[ti];
+        fs_write(installed + "/tools/" + tnm, fs_read(repo + "/tools/" + tnm));
+        ti = ti + 1;
+    }
+
+    let manifest = "[package]\nname=\"portability\"\nversion=\"0.1.0\"\nentry=\"main.sapp\"\n[dependencies]\nstdlib={path=\"stdlib\"}\n";
+    fs_write(installed + "/pblang.toml", manifest);
+    fs_write(installed + "/main.sapp", "print 0;");
+    fs_write(installed + "/guarded-library.sapp",
+        "let B=import(\"stdlib:compiler/native_bundle.sapp\");"
+        + "let source=\"fn init(){print 1;}fn work(){print 2;}fn cleanup(){print 3;}\";"
+        + "fs_write_bytes(\"direct.pbck\",B.compile_bundle_with_lifecycle(source,fn(p){return nil;},\"init\",\"work\",\"cleanup\"));");
+
+    let _r_build = run_step("installed build", exe, ["build"], installed, 0, nil);
+    let _r_lock = run_step("installed absolute lock", exe, ["run", "tools/pblock_install.sapp", "--allow-all", "--", "."], installed, 0, nil);
+
+    let modes = ["manifestless", "locked-decoy"];
+    let mi = 0;
+    while mi < len(modes) {
+        let mode = modes[mi];
+        let caller = base + "/" + mode;
+        fs_mkdirs(caller);
+
+        if mode == "locked-decoy" {
+            fs_mkdirs(caller + "/stdlib/compiler");
+            fs_write(caller + "/pblang.toml", manifest);
+            fs_write(caller + "/main.sapp", "print 0;");
+            let decoys = [
+                "compiler/native_pbck.sapp",
+                "compiler/native_bundle.sapp",
+                "compiler/source_analysis.sapp",
+                "controlled_modularity_file.sapp",
+                "codegen_wasm.sapp",
+                "codegen_arm64_ast.sapp"
+            ];
+            let di = 0;
+            while di < len(decoys) {
+                fs_write(caller + "/stdlib/" + decoys[di], "print \"DECOY_EXECUTED\";");
+                di = di + 1;
+            }
+            let _db = run_step("decoy build", exe, ["build"], caller, 0, nil);
+        }
+
+        let make_sandbox_args = fn(inner_bin, inner_args) {
+            let sb = [
+                "--unshare-all", "--die-with-parent",
+                "--ro-bind", "/usr", "/usr",
+                "--ro-bind", "/bin", "/bin",
+                "--ro-bind", "/lib", "/lib",
+                "--ro-bind", "/lib64", "/lib64"
+            ];
+            if fs_exists("/etc/alternatives") {
+                sb = _concat_arr(sb, ["--ro-bind", "/etc/alternatives", "/etc/alternatives"]);
+            }
+            if fs_exists("/etc/ld.so.cache") {
+                sb = _concat_arr(sb, ["--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache"]);
+            }
+            sb = _concat_arr(sb, [
+                "--proc", "/proc",
+                "--dev", "/dev",
+                "--tmpfs", "/tmp",
+                "--ro-bind", installed, installed,
+                "--bind", caller, caller,
+                "--chdir", caller,
+                "--unsetenv", "PBLANG_PATH",
+                inner_bin
+            ]);
+            return _concat_arr(sb, inner_args);
+        };
+
+        let child_exec = fn(label, target_bin, args, exp_exit, exp_out) {
+            if bwrap_bin != "" {
+                return run_step(mode + " " + label, bwrap_bin, make_sandbox_args(target_bin, args), caller, exp_exit, exp_out);
+            }
+            return run_step(mode + " " + label, target_bin, args, caller, exp_exit, exp_out);
+        };
+
+        let child = fn(label, args, exp_exit, exp_out) {
+            return child_exec(label, exe, args, exp_exit, exp_out);
+        };
+
+        // Prove source checkout is hidden inside sandbox using pure PBLang
+        if bwrap_bin != "" {
+            fs_write(caller + "/probe_hidden.sapp", "print fs_exists(" + json_stringify(repo) + ");");
+            let _ph = child("source unavailable", ["run", "probe_hidden.sapp", "--allow-all"], 0, "false");
+            fs_remove(caller + "/probe_hidden.sapp");
+        }
+
+        let compile_src = fn(name, src_code, flags, exp_exit) {
+            fs_write(caller + "/" + name, src_code);
+            let cargs = _concat_arr(["run", installed + "/tools/pbc.sapp", "--allow-all", "--", name], flags);
+            return child("compile " + name, cargs, exp_exit, nil);
+        };
+
+        let _gl1 = child("direct guarded library", ["run", installed + "/guarded-library.sapp", "--allow-all"], 0, nil);
+        let _gl2 = child("direct guarded library artifact", ["run", "direct.pbck", "--sandbox"], 0, "1\n2\n3");
+
+        let _df1 = compile_src("defaults with space.sapp", "fn f(x=7){return x;}print [f(),f(nil),f(false)];", ["--target", "pbck"], 0);
+        let _df2 = child("default output and explicit nil", ["run", "defaults with space.pbck", "--sandbox"], 0, "[7, nil, false]");
+
+        let _lim1 = child("compile without FFI exec network", [
+            "run", installed + "/tools/pbc.sapp", "--allow-all",
+            "--deny-ffi", "--deny-exec", "--deny-net", "--deny-http", "--deny-spawn", "--",
+            "defaults with space.sapp", "--target", "pbck", "--out", "limited.pbck"
+        ], 0, nil);
+        let _lim2 = child("limited compiler artifact", ["run", "limited.pbck", "--sandbox"], 0, "[7, nil, false]");
+
+        fs_write(caller + "/dep.sapp", "let value=31;export value;");
+        let prog_base = "let d=import(\"dep.sapp\");fn init(){print \"INIT\";}fn work(){print d.value;}fn cleanup(){print \"CLEAN\";}";
+        let guarded_modes = ["plain", "cleanup", "lifecycle"];
+        let gi = 0;
+        while gi < len(guarded_modes) {
+            let gm = guarded_modes[gi];
+            let g_src = prog_base + (if gm == "plain" { "work();" } else { "" });
+            let g_flags = ["--target", "pbck", "--bundle", "--out", gm + ".pbck"];
+            if gm != "plain" {
+                g_flags = _concat_arr(g_flags, ["--entry", "work", "--cleanup", "cleanup"]);
+            }
+            if gm == "lifecycle" {
+                g_flags = _concat_arr(g_flags, ["--initialize", "init"]);
+            }
+            let _gc = compile_src(gm + ".sapp", g_src, g_flags, 0);
+            let exp_g = if gm == "plain" {
+                "31"
+            } elif gm == "cleanup" {
+                "31\nCLEAN"
+            } else {
+                "INIT\n31\nCLEAN"
+            };
+            let _gx = child("execute " + gm, ["run", gm + ".pbck", "--sandbox"], 0, exp_g);
+            gi = gi + 1;
+        }
+
+        let _sl1 = compile_src(
+            "single-lifecycle.sapp",
+            "fn init(){print \"INIT\";}fn work(){print 7;}fn cleanup(){print \"CLEAN\";}",
+            ["--target", "pbck", "--out", "single.pbck", "--initialize", "init", "--entry", "work", "--cleanup", "cleanup"],
+            0
+        );
+        let _sl2 = child("execute single lifecycle", ["run", "single.pbck", "--sandbox"], 0, "INIT\n7\nCLEAN");
+
+        fs_write(caller + "/contract.json", json_stringify(map{
+            format: "pblang.controlled-modularity.v1",
+            modules: [map{ id: "app", version: "1.0.0", interfaces: map{}, capabilities: [], dependencies: [] }]
+        }));
+        let _ct1 = compile_src("contract.sapp", "print 7;", ["--target", "pbck", "--module-contract", "contract.json", "--module-root", "app"], 0);
+        let _ct2 = child("execute admitted contract", ["run", "contract.pbck", "--sandbox"], 0, "7");
+
+        let bin_targets = ["x64", "arm64", "wasm"];
+        let bti = 0;
+        while bti < len(bin_targets) {
+            let tg = bin_targets[bti];
+            let _bc = compile_src(tg + ".sapp", "print 7;", ["--target", tg, "--no-ip-seal", "--no-capture-shield", "--out", tg + ".bin"], 0);
+            let data = fs_read_bytes(caller + "/" + tg + ".bin");
+            assert(len(data) >= 8, tg + ".bin non-empty");
+            if tg == "wasm" {
+                assert([data[0], data[1], data[2], data[3]] == [0, 97, 115, 109], "wasm magic \\0asm");
+                assert([data[4], data[5], data[6], data[7]] == [1, 0, 0, 0], "wasm version 1");
+                let w_str = bytes_to_str(data);
+                assert(str_contains(w_str, "main") and str_contains(w_str, "print"), "wasm exports main and imports print");
+            } else {
+                assert([data[0], data[1], data[2], data[3]] == [127, 69, 76, 70], tg + " ELF magic");
+            }
+            if tg == "arm64" {
+                assert(len(data) >= 20 and (data[18] + data[19] * 256) == 183, "arm64 e_machine == 183");
+            }
+            if tg == "x64" {
+                let _cx64 = ffi_call_typed(libc, "chmod", "i32(cstr,i32)", [caller + "/x64.bin", 448]);
+                let _rx64 = child_exec("native x64 execution", caller + "/x64.bin", [], 0, "7");
+            }
+            bti = bti + 1;
+        }
+
+        // Rejected compiles must preserve existing output untouched
+        fs_write(caller + "/preserved.pbck", "unchanged");
+        let rejections = [
+            map{ src: "print missing_name;", flags: [] },
+            map{ src: "print 7;", flags: ["--safe"] },
+            map{ src: "print 7;", flags: ["--module-contract", "contract.json", "--module-root", "missing"] }
+        ];
+        let ri = 0;
+        while ri < len(rejections) {
+            let rj = rejections[ri];
+            let rflags = _concat_arr(["--target", "pbck", "--out", "preserved.pbck"], rj.flags);
+            let _rc = compile_src("rejected.sapp", rj.src, rflags, nil);
+            assert(fs_read(caller + "/preserved.pbck") == "unchanged", "preserved.pbck must remain unchanged");
+            ri = ri + 1;
+        }
+
+        // Sandboxed capability enforcement on compiled PBCK
+        let _cap = compile_src("capability.sapp", "fs_read(\"NOT_READ\");", ["--target", "pbck"], 0);
+        let denied = child("artifact retains denied fs", ["run", "capability.pbck", "--sandbox"], nil, nil);
+        assert(str_contains(denied.stderr, "fs access denied"), "capability.pbck must deny fs under --sandbox");
+
+        // Checker parity & non-execution
+        let chk_cases = [
+            map{ name: "good.sapp", src: "print \"SOURCE_EXECUTED\";", exp: 0 },
+            map{ name: "bad.sapp", src: "print missing_name;", exp: nil },
+            map{ name: "broken.sapp", src: "let x = ;", exp: nil }
+        ];
+        let ci = 0;
+        while ci < len(chk_cases) {
+            let cc = chk_cases[ci];
+            fs_write(caller + "/" + cc.name, cc.src);
+            let _pc1 = child("public check " + cc.name, ["check", cc.name], cc.exp, nil);
+            let _pc2 = child("PBLang checker " + cc.name, ["run", installed + "/tools/pbcheck.sapp", "--", cc.name], cc.exp, nil);
+            ci = ci + 1;
+        }
+
+        mi = mi + 1;
+    }
+
+    // Known legacy --check --via-pblang behavior on raw native binary recorded separately
+    fs_write(installed + "/bad.sapp", "print missing_name;");
+    let legacy = run_step("legacy via-pblang failure prints success exit", exe, ["--check", "--via-pblang", "bad.sapp"], installed, 0, nil);
+    assert(str_contains(legacy.stdout, "self-hosted check failed"), "legacy via-pblang message");
+
+    _rm_tree_libc(libc, base);
+    assert(not fs_exists(base), "pbc_portability: temporary base directory must be cleaned up");
+    print "pbc_portability_pass: cases=" + str(len(records));
+}
+
+main();

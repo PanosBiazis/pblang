@@ -1,0 +1,316 @@
+// Pure PBLang qualification runner for secure_file read_optional_text ownership,
+// POSIX and modeled Windows routing, proven absence vs truncated listings,
+// exception redaction, close verification, and Linux FD leak checks.
+let SECURE = import("stdlib:secure_file.sapp");
+let LINUX_DIRFS = import("stdlib:linux_dirfs.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _replace_once(source, needle, replacement) {
+    let parts = str_split(source, needle);
+    assert(len(parts) == 2, "expected exactly one occurrence of needle");
+    return parts[0] + replacement + parts[1];
+}
+
+fn _rm_rf(target) {
+    if not fs_exists(target) { return; }
+    let entries = try fs_listdir(target) catch nil;
+    if type(entries) == "array" {
+        for entry in entries {
+            _rm_rf(target + "/" + entry);
+        }
+    }
+    let _removed = try fs_remove(target) catch nil;
+}
+
+let raw_args = os_args();
+let baseline_path = "";
+let report_path = "";
+let idx = 0;
+while idx < len(raw_args) {
+    if raw_args[idx] == "--baseline-source" and idx + 1 < len(raw_args) {
+        baseline_path = raw_args[idx + 1];
+    } elif raw_args[idx] == "--report" and idx + 1 < len(raw_args) {
+        report_path = raw_args[idx + 1];
+    }
+    idx = idx + 1;
+}
+
+let repo_root = cwd();
+let stdlib_root = repo_root + "/stdlib/";
+let candidate_raw = fs_read(stdlib_root + "secure_file.sapp");
+let semantic_raw = fs_read(repo_root + "/tests/semantics/secure_file_optional_cleanup_test.sapp");
+let baseline_raw = "";
+if baseline_path != "" {
+    baseline_raw = fs_read(baseline_path);
+} else {
+    baseline_raw = _replace_once(
+        candidate_raw,
+        "let result = try _read_optional_owned(parent, max_bytes)\n        catch _error(\"secure optional read backend failed\");\n    let closed = try _close(parent.fs) catch false;\n    if type(closed) != \"bool\" or not closed {\n        return map{ ok: false, error: \"secure optional parent cleanup could not be verified\",\n            cleanup_uncertain: true, parent_close_confirmed: false };\n    }",
+        "let result = _read_optional_owned(parent, max_bytes);\n    let _ignored_closed = _close(parent.fs);"
+    );
+}
+
+let scratch = "/tmp/pblang_tooling_s2_optional_cleanup_" + str(num_floor(now_ms()));
+assert(SECURE.create_private_temporary_directory_new(scratch).ok, "private temporary qualification directory created");
+assert(SECURE.create_private_directory_new(scratch + "/work").ok, "private work subdirectory created");
+
+let backend_src = "let state = map{};\n"
+    + "fn configure(list_mode, read_mode, close_mode) {\n"
+    + "    state.list_mode = list_mode; state.read_mode = read_mode; state.close_mode = close_mode;\n"
+    + "    state.opens = 0; state.lists = 0; state.reads = 0; state.closes = 0; state.admit = true;\n"
+    + "}\n"
+    + "fn open(path, create = false, protect = false) {\n"
+    + "    let _p = path; let _c = create; let _pr = protect;\n"
+    + "    state.opens = state.opens + 1; return map{ ok: state.admit };\n"
+    + "}\n"
+    + "fn open_absolute(path, create = false, protect = false) { return open(path, create, protect); }\n"
+    + "fn close(fs) {\n"
+    + "    let _f = fs;\n"
+    + "    state.closes = state.closes + 1; let m = state.close_mode;\n"
+    + "    if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if m == \"nil\" { return nil; }\n"
+    + "    if m == \"number\" { return 1; }\n"
+    + "    if m == \"map\" { return map{ ok: true }; }\n"
+    + "    return m == \"success\";\n"
+    + "}\n"
+    + "fn list(fs, path, maximum) {\n"
+    + "    let _f = fs; let _p = path; let _mx = maximum;\n"
+    + "    state.lists = state.lists + 1; let m = state.list_mode;\n"
+    + "    if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if m == \"nil\" { return nil; }\n"
+    + "    if m == \"failure\" { return map{ ok: false, error: \"synthetic failure\" }; }\n"
+    + "    if m == \"bad_ok\" { return map{ ok: 1, entries: [], truncated: false }; }\n"
+    + "    if m == \"bad_entries\" { return map{ ok: true, entries: map{}, truncated: false }; }\n"
+    + "    if m == \"bad_entry\" { return map{ ok: true, entries: [map{}], truncated: false }; }\n"
+    + "    if m == \"oversize_entries\" {\n"
+    + "        let entries = []; for _i 4097 { array_push(entries, \"x\"); }\n"
+    + "        return map{ ok: true, entries: entries, truncated: false };\n"
+    + "    }\n"
+    + "    if m == \"absent\" { return map{ ok: true, entries: [], truncated: false }; }\n"
+    + "    if m == \"truncated_absent\" { return map{ ok: true, entries: [], truncated: true }; }\n"
+    + "    if m == \"missing_truncated_absent\" { return map{ ok: true, entries: [] }; }\n"
+    + "    if m == \"bad_truncated_absent\" { return map{ ok: true, entries: [], truncated: 0 }; }\n"
+    + "    if m == \"missing_truncated_present\" { return map{ ok: true, entries: [\"input\"] }; }\n"
+    + "    return map{ ok: true, entries: [\"input\"], truncated: m == \"truncated_present\" };\n"
+    + "}\n"
+    + "fn read_bytes(fs, name, maximum) {\n"
+    + "    let _f = fs; let _n = name; let _mx = maximum;\n"
+    + "    state.reads = state.reads + 1; let m = state.read_mode;\n"
+    + "    if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if m == \"nil\" { return nil; }\n"
+    + "    if m == \"failure\" { return map{ ok: false, error: \"synthetic failure\", marker: 7 }; }\n"
+    + "    if m == \"missing\" { return map{ ok: false, error: \"synthetic failure\", marker: 7, missing: true }; }\n"
+    + "    if m == \"bad_missing\" { return map{ ok: false, error: \"synthetic failure\", marker: 7, missing: \"true\" }; }\n"
+    + "    if m == \"bad_ok\" { return map{ ok: 1, bytes: [65], size: 1 }; }\n"
+    + "    if m == \"missing_bytes\" { return map{ ok: true, size: 1 }; }\n"
+    + "    if m == \"missing_size\" { return map{ ok: true, bytes: [65] }; }\n"
+    + "    if m == \"empty\" { return map{ ok: true, bytes: [], size: 0 }; }\n"
+    + "    if m == \"invalid_utf8\" { return map{ ok: true, bytes: [256], size: 1 }; }\n"
+    + "    if m == \"over_cap\" { return map{ ok: true, bytes: [65, 65, 65, 65, 65, 65, 65, 65, 65], size: 9 }; }\n"
+    + "    let bytes = if m == \"bad_bytes\" { \"α\" } else { [206, 177] };\n"
+    + "    let size = 2;\n"
+    + "    if m == \"bad_size\" { size = \"2\"; }\n"
+    + "    if m == \"fraction\" { size = 2.5; }\n"
+    + "    if m == \"negative\" { size = 0 - 1; }\n"
+    + "    if m == \"nan\" { size = num_sqrt(0 - 1); }\n"
+    + "    if m == \"infinity\" { size = num_exp(1000); }\n"
+    + "    if m == \"mismatch\" { size = 1; }\n"
+    + "    return map{ ok: true, bytes: bytes, size: size };\n"
+    + "}\n"
+    + "export state, configure, open, open_absolute, close, list, read_bytes;\n";
+
+fs_write(scratch + "/backend.sapp", backend_src);
+fs_write(scratch + "/semantic.sapp", semantic_raw);
+
+let cand_bound = str_replace_all(candidate_raw, "\"stdlib:", "\"" + stdlib_root);
+let base_bound = str_replace_all(baseline_raw, "\"stdlib:", "\"" + stdlib_root);
+
+let cand_posix = _replace_once(
+    cand_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/cand_posix.sapp", cand_posix);
+
+let win_start = str_index_of(cand_posix, "fn _read_optional_owned(");
+let win_stop = str_index_of(cand_posix, "\nfn read_optional_text(");
+assert(win_start >= 0 and win_stop > win_start, "found _read_optional_owned section");
+let win_part = str_replace_all(
+    str_replace_all(str_slice(cand_posix, win_start, win_stop), "platform() != \"windows\"", "false"),
+    "platform() == \"windows\"",
+    "true"
+);
+let cand_win = str_slice(cand_posix, 0, win_start) + win_part + str_slice(cand_posix, win_stop, len(cand_posix));
+fs_write(scratch + "/cand_win.sapp", cand_win);
+
+let base_model = _replace_once(
+    base_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/base_model.sapp", base_model);
+
+let cand_list_throw = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.list(fs, path, max_entries); }",
+    "if platform() == \"linux\" { throw \"synthetic-private-value\"; }"
+);
+fs_write(scratch + "/cand_list_throw.sapp", cand_list_throw);
+
+let cand_read_throw = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.read_bytes(fs, name, max_bytes); }",
+    "if platform() == \"linux\" { throw \"synthetic-private-value\"; }"
+);
+fs_write(scratch + "/cand_read_throw.sapp", cand_read_throw);
+
+let cand_close_false = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); return false; }"
+);
+fs_write(scratch + "/cand_close_false.sapp", cand_close_false);
+
+let cand_close_throw = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); throw \"synthetic-private-value\"; }"
+);
+fs_write(scratch + "/cand_close_throw.sapp", cand_close_throw);
+
+let cand_trunc_list = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.list(fs, path, max_entries); }",
+    "if platform() == \"linux\" { return map{ ok: true, entries: [\"input\"], truncated: true }; }"
+);
+fs_write(scratch + "/cand_trunc_list.sapp", cand_trunc_list);
+
+let B = import(scratch + "/backend.sapp");
+let SEM = import(scratch + "/semantic.sapp");
+let S_POSIX = import(scratch + "/cand_posix.sapp");
+let S_WIN = import(scratch + "/cand_win.sapp");
+let S_BASE = import(scratch + "/base_model.sapp");
+let S_LIST_THROW = import(scratch + "/cand_list_throw.sapp");
+let S_READ_THROW = import(scratch + "/cand_read_throw.sapp");
+let S_CLOSE_FALSE = import(scratch + "/cand_close_false.sapp");
+let S_CLOSE_THROW = import(scratch + "/cand_close_throw.sapp");
+let S_TRUNC_LIST = import(scratch + "/cand_trunc_list.sapp");
+
+let rows = [];
+
+// Group 1: Modeled POSIX routing (198 matrix cases + 6 admission cases)
+let posix_res = SEM.run(S_POSIX, B, false);
+assert(posix_res.ok and posix_res.matrix_cases == 198 and posix_res.admission_cases == 6 and not posix_res.windows_model,
+    "modeled POSIX routing passed");
+array_push(rows, map{ label: "modeled_posix_routing", passed: true, result: posix_res });
+
+// Group 2: Modeled Windows routing (114 matrix cases + 6 admission cases)
+let win_res = SEM.run(S_WIN, B, true);
+assert(win_res.ok and win_res.matrix_cases == 114 and win_res.admission_cases == 6 and win_res.windows_model,
+    "modeled Windows routing passed");
+array_push(rows, map{ label: "modeled_windows_routing", passed: true, result: win_res });
+
+// Group 3: Baseline rejected by ownership contract
+let base_rejected = true;
+try { SEM.run(S_BASE, B, false); base_rejected = false; } catch {}
+assert(base_rejected, "baseline source rejected by ownership contract");
+array_push(rows, map{ label: "baseline_rejected_by_ownership_contract", passed: true, rejected: base_rejected });
+
+// Group 4: Real Linux normal, missing, empty, over-cap, and non-regular-file refusal with FD delta 0
+let in_file = scratch + "/work/input";
+let empty_file = scratch + "/work/empty";
+let nested_dir = scratch + "/work/subdir";
+let missing_file = scratch + "/work/missing";
+fs_write(in_file, "A€Z");
+fs_write(empty_file, "");
+fs_mkdirs(nested_dir);
+
+let fd_before_normal = len(fs_listdir("/proc/self/fd"));
+let normal_checks = 0;
+for _i 4 {
+    let r = SECURE.read_optional_text(in_file, 5, true);
+    assert(r.ok and not r.missing and r.text == "A€Z" and r.size == 5, "exact UTF-8 optional read");
+    assert(not SECURE.read_optional_text(in_file, 4, true).ok, "over byte limit rejected");
+    let emp = SECURE.read_optional_text(empty_file, 0, true);
+    assert(emp.ok and not emp.missing and emp.text == "" and emp.size == 0, "empty file optional read");
+    let miss = SECURE.read_optional_text(missing_file, 0, true);
+    assert(miss.ok and miss.missing, "proven missing optional read");
+    assert(not SECURE.read_optional_text(nested_dir, 4, true).ok, "directory target rejected");
+    normal_checks = normal_checks + 5;
+}
+let fd_delta_normal = len(fs_listdir("/proc/self/fd")) - fd_before_normal;
+assert(normal_checks == 20 and fd_delta_normal == 0, "zero fd delta on real normal optional reads");
+array_push(rows, map{ label: "real_normal_and_missing_control", passed: true, checks: normal_checks, fd_delta: fd_delta_normal });
+
+// Group 5: Real Linux parent list/read exceptions leave 0 leaked FDs
+let fd_before_exc = len(fs_listdir("/proc/self/fd"));
+let denied_count = 0;
+let exc_count = 0;
+for _i 4 {
+    let rl = nil;
+    try { rl = S_LIST_THROW.read_optional_text(in_file, 8, false); } catch { exc_count = exc_count + 1; }
+    if rl != nil {
+        assert(not rl.ok and not map_has(rl, "text") and not map_has(rl, "bytes"), "list exception redacted");
+        denied_count = denied_count + 1;
+    }
+    let rr = nil;
+    try { rr = S_READ_THROW.read_optional_text(in_file, 8, false); } catch { exc_count = exc_count + 1; }
+    if rr != nil {
+        assert(not rr.ok and not map_has(rr, "text") and not map_has(rr, "bytes"), "read exception redacted");
+        denied_count = denied_count + 1;
+    }
+}
+let fd_delta_exc = len(fs_listdir("/proc/self/fd")) - fd_before_exc;
+assert(exc_count == 0 and denied_count == 8 and fd_delta_exc == 0, "zero fd leak on list/read backend exceptions");
+array_push(rows, map{ label: "real_parent_list_and_read_exceptions", passed: true, denied: denied_count, fd_delta: fd_delta_exc });
+
+// Group 6: Real close followed by false / throw reports cleanup_uncertain with FD delta 0
+let fd_before_close = len(fs_listdir("/proc/self/fd"));
+let close_checks = 0;
+for _i 4 {
+    for p in [in_file, missing_file] {
+        let rf = S_CLOSE_FALSE.read_optional_text(p, 8, false);
+        assert(not rf.ok and rf.cleanup_uncertain and not rf.parent_close_confirmed and len(map_keys(rf)) == 4,
+            "close false uncertainty");
+        let rt = S_CLOSE_THROW.read_optional_text(p, 8, false);
+        assert(not rt.ok and rt.cleanup_uncertain and not rt.parent_close_confirmed and len(map_keys(rt)) == 4,
+            "close throw uncertainty");
+        close_checks = close_checks + 2;
+    }
+}
+let fd_delta_close = len(fs_listdir("/proc/self/fd")) - fd_before_close;
+assert(close_checks == 16 and fd_delta_close == 0, "zero fd delta on close uncertainty projection");
+array_push(rows, map{ label: "real_close_uncertainty_projection", passed: true, checks: close_checks, fd_delta: fd_delta_close });
+
+// Group 7: Real LinuxDirFS truncation + candidate truncated-listing absence refusal
+let fd_before_trunc = len(fs_listdir("/proc/self/fd"));
+let dir_handle = LINUX_DIRFS.open_absolute(scratch + "/work", false, false);
+assert(dir_handle.ok, "open work dir");
+let capped = LINUX_DIRFS.list(dir_handle, "root", 2);
+assert(capped.ok and capped.truncated and len(capped.entries) == 2, "real LinuxDirFS truncation at cap 2");
+assert(LINUX_DIRFS.close(dir_handle), "close work dir");
+let found_in_trunc = S_TRUNC_LIST.read_optional_text(in_file, 8, false);
+assert(found_in_trunc.ok and not found_in_trunc.missing and found_in_trunc.text == "A€Z", "listed entry still readable when truncated");
+let unverified_absent = S_TRUNC_LIST.read_optional_text(missing_file, 8, false);
+assert(not unverified_absent.ok and unverified_absent.error == "secure optional file absence cannot be verified",
+    "unlisted entry under truncated listing refuses false missing claim");
+let fd_delta_trunc = len(fs_listdir("/proc/self/fd")) - fd_before_trunc;
+assert(fd_delta_trunc == 0, "zero fd delta on truncated listing verification");
+array_push(rows, map{ label: "truncated_listing_absence_guard", passed: true, fd_delta: fd_delta_trunc });
+
+let report = map{
+    passed: true,
+    runner: "tests/tooling/secure_file_optional_cleanup_check.sapp",
+    language: "PBLang",
+    source_sha256: SHA256.sha256_hex(candidate_raw),
+    baseline_sha256: SHA256.sha256_hex(baseline_raw),
+    semantic_sha256: SHA256.sha256_hex(semantic_raw),
+    groups_passed: len(rows),
+    rows: rows
+};
+if report_path != "" {
+    fs_write(report_path, json_stringify(report) + "\n");
+}
+_rm_rf(scratch);
+assert(not fs_exists(scratch), "scratch cleaned up");
+print json_stringify(report);

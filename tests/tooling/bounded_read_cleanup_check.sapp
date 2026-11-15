@@ -1,0 +1,359 @@
+// Whole-module bounded-read cleanup differential qualification in pure PBLang.
+// Models disposable synthetic native-effect boundaries over copied production
+// modules without production fault hooks, extra grants, or source execution.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _rm_rf(path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            _rm_rf(path + "/" + entries[i]);
+            i = i + 1;
+        }
+    }
+    let _removed = try fs_remove(path) catch false;
+}
+
+fn _body_replace(text, name, body) {
+    let needle = "fn " + name + "(";
+    let start = str_index_of(text, needle);
+    assert(start >= 0, "missing function for body_replace: " + name);
+    let n = len(text);
+    let pos = start;
+    let opening = -1;
+    while pos < n {
+        if str_slice(text, pos, pos + 1) == "{" {
+            opening = pos;
+            break;
+        }
+        pos = pos + 1;
+    }
+    assert(opening >= 0, "missing opening brace for: " + name);
+    let depth = 1;
+    let quoted = false;
+    let escaped = false;
+    let idx = opening + 1;
+    while idx < n {
+        let ch = str_slice(text, idx, idx + 1);
+        if quoted {
+            if escaped { escaped = false; }
+            elif ch == "\\" { escaped = true; }
+            elif ch == "\"" { quoted = false; }
+        } elif ch == "\"" {
+            quoted = true;
+        } elif ch == "{" {
+            depth = depth + 1;
+        } elif ch == "}" {
+            depth = depth - 1;
+            if depth == 0 {
+                return str_slice(text, 0, opening + 1) + "\n" + body + "\n" + str_slice(text, idx, n);
+            }
+        }
+        idx = idx + 1;
+    }
+    throw "unterminated function body: " + name;
+}
+
+fn _replace_once(text, old_part, new_part) {
+    let parts = str_split(text, old_part);
+    assert(len(parts) == 2, "expected single occurrence of: " + old_part);
+    return parts[0] + new_part + parts[1];
+}
+
+fn _resolve_runtime(explicit_runtime, repo_root) {
+    if explicit_runtime != "" {
+        if fs_exists(explicit_runtime + "/bin/pblang") { return explicit_runtime + "/bin/pblang"; }
+        return explicit_runtime;
+    }
+    if fs_exists(repo_root + "/pblang") { return repo_root + "/pblang"; }
+    if fs_exists(repo_root + "/target/release/pblang") { return repo_root + "/target/release/pblang"; }
+    throw "bounded_read_cleanup_check: runtime binary not found";
+}
+
+let MODEL_SRC = "let state=map{};\n"
+    + "fn configure(mode) {state.mode=mode;state.closes=[];state.calls=[];state.parents=0;state.opens=0;state.reads=0;state.copied=0;}\n"
+    + "fn root() {return map{ok:true,closed:false,root_fd:1,libc:1,child_fds:map{},lock_fds:map{}};}\n"
+    + "fn parent(fs) {if fs.closed {return map{ok:false,error:\"directory root is closed\"};}state.parents=state.parents+1;if state.mode==\"parent-reject\" {return map{ok:false,error:\"parent rejected\"};}return map{ok:true,fd:10,name:\"synthetic\"};}\n"
+    + "fn open() {state.opens=state.opens+1;if state.mode==\"open-throw\" {throw \"modeled open exception\";}if str_contains(state.mode,\"open-fail\") {return -1;}return 20;}\n"
+    + "fn nan_zero(v) {return v;}\n"
+    + "fn nan_value(v) {return 0.0/v;}\n"
+    + "fn call(symbol,values) {\n"
+    + " array_push(state.calls,symbol);\n"
+    + " if symbol==\"close\" {\n"
+    + "  let fd=values[0];array_push(state.closes,fd);\n"
+    + "  let tag=\"root\";if fd==10 {tag=\"parent\";} elif fd==20 {tag=\"source\";} elif fd==30 {tag=\"snapshot\";}\n"
+    + "  if str_contains(state.mode,tag+\"-throw\") {throw \"synthetic cleanup exception\";}\n"
+    + "  if str_contains(state.mode,tag+\"-fail\") {return -1;}return 0;\n"
+    + " }\n"
+    + " if symbol==\"flock\" {return 0;}\n"
+    + " if symbol==\"memfd_create\" {if str_contains(state.mode,\"create-fail\") {return -1;}return 30;}\n"
+    + " if symbol==\"sendfile\" {\n"
+    + "  let remaining=values[3];if state.mode==\"copy-throw\" {throw \"modeled copy exception\";}\n"
+    + "  if str_contains(state.mode,\"copy-fail\") {return -1;}\n"
+    + "  if state.mode==\"count-over\" {state.copied=4;return remaining+1;}\n"
+    + "  if state.mode==\"count-frac\" {if state.copied==0 {state.copied=4;return 0.5;}return 0;}\n"
+    + "  if state.mode==\"count-nan\" {state.copied=4;return nan_value(0);}\n"
+    + "  if state.mode==\"count-inf\" {state.copied=4;return 1.0/nan_zero(0);}\n"
+    + "  let total=4;if state.mode==\"empty\" {total=0;} elif state.mode==\"overflow\" {total=5;}\n"
+    + "  let n=total-state.copied;if n>remaining {n=remaining;}\n"
+    + "  if state.mode==\"short-copy\" and n>1 {n=1;}\n"
+    + "  state.copied=state.copied+n;return n;\n"
+    + " }\n"
+    + " if symbol==\"lseek\" {\n"
+    + "  if values[2]==2 {\n"
+    + "   if state.mode==\"size-throw\" {throw \"modeled size exception\";}\n"
+    + "   if str_contains(state.mode,\"size-fail\") {return -1;}\n"
+    + "   if state.mode==\"size-frac\" {return 1.5;}\n"
+    + "   if state.mode==\"size-nan\" {return nan_value(0);}\n"
+    + "   return state.copied;\n"
+    + "  }\n"
+    + "  if str_contains(state.mode,\"rewind-fail\") {return -1;}\n"
+    + "  if state.mode==\"rewind-positive\" {return 1;}return 0;\n"
+    + " }\n"
+    + " throw \"unexpected modeled symbol\";\n"
+    + "}\n"
+    + "fn read() {\n"
+    + " state.reads=state.reads+1;\n"
+    + " if str_contains(state.mode,\"read-throw\") {throw \"synthetic byte read exception\";}\n"
+    + " if state.mode==\"read-type\" {return \"wrong type\";}\n"
+    + " if state.mode==\"read-size\" {return [65];}\n"
+    + " if state.mode==\"empty\" {return [];}\n"
+    + " return [65,0,206,177];\n"
+    + "}\n"
+    + "fn library_close() {if state.mode==\"library-throw\" {throw \"modeled library cleanup exception\";}return state.mode!=\"library-fail\";}\n"
+    + "export state,configure,root,parent,open,call,read,library_close;\n";
+
+fn _qualify_variant(variant_name, source_root, candidate_root, runtime_bin, scratch_base) {
+    let stdlib_prefix = source_root + "/stdlib/";
+    let raw = fs_read(source_root + "/stdlib/linux_dirfs.sapp");
+    let original = raw;
+    let core_path = source_root + "/stdlib/linux_dirfs_read_core.sapp";
+    let shared = fs_exists(core_path);
+    let effect = "";
+    let core_sha: any = nil;
+
+    let work = scratch_base + "/" + variant_name;
+    fs_mkdirs(work);
+
+    if shared {
+        let core_raw = fs_read(core_path);
+        core_sha = SHA256.sha256_hex(core_raw);
+        effect = core_raw;
+        effect = _body_replace(effect, "_parent", "return B.parent(fs);");
+        effect = _body_replace(effect, "_openat", "return B.open();");
+        effect = _body_replace(effect, "_call", "return B.call(symbol,args);");
+        effect = _body_replace(effect, "open_with_policy", "return B.root();");
+        effect = _body_replace(effect, "open_absolute_with_policy", "return B.root();");
+        effect = _replace_once(effect, "ffi_close(libc); true", "B.library_close()");
+    } else {
+        effect = raw;
+        effect = _body_replace(effect, "_parent", "return B.parent(fs);");
+        effect = _body_replace(effect, "_openat", "return B.open();");
+        effect = _body_replace(effect, "_call", "return B.call(symbol,args);");
+        effect = _body_replace(effect, "_close_library", "return B.library_close();");
+        effect = _body_replace(effect, "open", "return B.root();");
+        effect = _body_replace(effect, "open_absolute", "return B.root();");
+    }
+
+    effect = "let B=import(\"" + work + "/model.sapp\");\n" + effect;
+    let fn_marker = if str_contains(effect, "fn _bounded_read_owned(") {
+        "fn _bounded_read_owned("
+    } else {
+        "fn _read_bytes_relative("
+    };
+    let start = str_index_of(effect, fn_marker);
+    assert(start >= 0, "missing bounded read target function");
+    let tail_after_start = str_slice(effect, start + 1, len(effect));
+    let next_fn_rel = str_index_of(tail_after_start, "\nfn ");
+    assert(next_fn_rel >= 0, "missing subsequent function boundary");
+    let end = start + 1 + next_fn_rel;
+    let part = str_slice(effect, start, end);
+    let replaced_part = _replace_once(part, "try fs_read_bytes(_fd_path(snapshot)) catch nil", "try B.read() catch nil");
+    effect = str_slice(effect, 0, start) + replaced_part + str_slice(effect, end, len(effect));
+    effect = str_replace_all(effect, "import(\"stdlib:", "import(\"" + stdlib_prefix);
+    effect = effect + "\nfn _test_reset(poisoned=false) {_mount_admission_cleanup_poisoned=poisoned;}\nexport _test_reset;\n";
+
+    let reader = fs_read(source_root + "/stdlib/compiler/bounded_source.sapp");
+    if shared {
+        raw = _replace_once(raw, "import(\"stdlib:linux_dirfs_read_core.sapp\")", "import(\"" + work + "/core.sapp\")");
+        raw = str_replace_all(raw, "import(\"stdlib:", "import(\"" + stdlib_prefix);
+        raw = raw + "\nlet _test_reset=READ_CORE._test_reset;\nfn _test_poison_full() {return _mount_cleanup_error(\"modeled full-owner ambiguity\");}\nexport _test_reset,_test_poison_full;\n";
+        reader = _replace_once(reader, "import(\"stdlib:linux_dirfs_read_core.sapp\")", "import(\"" + work + "/core.sapp\")");
+        reader = str_replace_all(reader, "import(\"stdlib:", "import(\"" + stdlib_prefix);
+    } else {
+        raw = effect;
+        reader = _replace_once(reader, "import(\"stdlib:linux_dirfs.sapp\")", "import(\"" + work + "/dirfs.sapp\")");
+        reader = str_replace_all(reader, "import(\"stdlib:", "import(\"" + stdlib_prefix);
+    }
+
+    let semantic = str_replace_all(
+        fs_read(candidate_root + "/tests/semantics/bounded_read_cleanup_test.sapp"),
+        "import(\"stdlib:",
+        "import(\"" + candidate_root + "/stdlib/"
+    );
+    let is_baseline_lit = if variant_name == "baseline" { "true" } else { "false" };
+    let main_src = "let D=import(\"" + work + "/dirfs.sapp\");"
+        + "let B=import(\"" + work + "/model.sapp\");"
+        + "let R=import(\"" + work + "/reader.sapp\");"
+        + "let T=import(\"" + work + "/semantic.sapp\");"
+        + "print json_stringify(T.run(D,B,R," + is_baseline_lit + "));\n";
+
+    let files = map{
+        "dirfs.sapp": raw,
+        "model.sapp": MODEL_SRC,
+        "reader.sapp": reader,
+        "semantic.sapp": semantic,
+        "main.sapp": main_src
+    };
+
+    if shared {
+        files["core.sapp"] = effect;
+        let shared_sem = str_replace_all(
+            fs_read(candidate_root + "/tests/semantics/bounded_read_shared_core_test.sapp"),
+            "import(\"stdlib:",
+            "import(\"" + candidate_root + "/stdlib/"
+        );
+        files["shared.sapp"] = shared_sem;
+        files["main.sapp"] = "let D=import(\"" + work + "/dirfs.sapp\");"
+            + "let C=import(\"" + work + "/core.sapp\");"
+            + "let B=import(\"" + work + "/model.sapp\");"
+            + "let R=import(\"" + work + "/reader.sapp\");"
+            + "let T=import(\"" + work + "/semantic.sapp\");"
+            + "let S=import(\"" + work + "/shared.sapp\");"
+            + "let r=T.run(D,B,R," + is_baseline_lit + ");"
+            + "r.shared=S.run(D,C,B,R);"
+            + "print json_stringify(r);\n";
+    }
+
+    let fixture_hashes = map{};
+    let keys = map_keys(files);
+    let k = 0;
+    while k < len(keys) {
+        let fname = keys[k];
+        let content = files[fname];
+        fs_write(work + "/" + fname, content);
+        fixture_hashes[fname] = SHA256.sha256_hex(content);
+        k = k + 1;
+    }
+
+    let denies = [
+        "run",
+        "--deny-net", "--deny-http", "--deny-env", "--deny-spawn",
+        "--deny-gfx", "--deny-sqlite", "--deny-ffi", "--deny-exec",
+        work + "/main.sapp"
+    ];
+    let t0 = now_ms();
+    let proc = proc_spawn_wait(runtime_bin, denies);
+    let elapsed_ms = now_ms() - t0;
+
+    let replacement_char = bytes_to_str([239, 191, 189]);
+    let clean_proc = proc.exit_code == 0 and proc.stderr == "" and not str_contains(proc.stdout, replacement_char);
+    let parsed: any = nil;
+    let passed = false;
+    if clean_proc {
+        parsed = try json_parse(str_trim(proc.stdout)) catch nil;
+        let expected_rows = if variant_name == "baseline" { 36 } else { 40 };
+        if type(parsed) == "map" {
+            passed = (try parsed.checks catch 0) > 0 and len(try parsed.rows catch []) == expected_rows;
+            if shared {
+                passed = passed and (try parsed.shared.checks catch 0) > 0;
+            }
+        }
+    }
+
+    return map{
+        name: variant_name,
+        passed: passed,
+        exit: proc.exit_code,
+        stderr: proc.stderr,
+        elapsed_ms: elapsed_ms,
+        shared_core: shared,
+        source_sha256: SHA256.sha256_hex(original),
+        core_source_sha256: core_sha,
+        fixture_sha256: fixture_hashes,
+        result: parsed
+    };
+}
+
+fn main() {
+    let raw_args = os_args();
+    let runtime_arg = "";
+    let baseline_arg = "";
+    let report_arg = "";
+    let candidate_only = false;
+    let i = 0;
+    while i < len(raw_args) {
+        let arg = raw_args[i];
+        if arg == "--runtime" and i + 1 < len(raw_args) {
+            runtime_arg = raw_args[i + 1];
+            i = i + 1;
+        } elif arg == "--baseline" and i + 1 < len(raw_args) {
+            baseline_arg = raw_args[i + 1];
+            i = i + 1;
+        } elif arg == "--report" and i + 1 < len(raw_args) {
+            report_arg = raw_args[i + 1];
+            i = i + 1;
+        } elif arg == "--candidate-only" {
+            candidate_only = true;
+        }
+        i = i + 1;
+    }
+
+    if baseline_arg == "" {
+        candidate_only = true;
+    }
+
+    let repo_root = cwd();
+    let runtime_bin = _resolve_runtime(runtime_arg, repo_root);
+    let scratch = "/tmp/pblang_tooling_s1_bounded_read_cleanup_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(scratch).ok, "create private scratch directory");
+
+    let rows = [];
+    let ok_all = true;
+    let run_err = "";
+
+    let run_variants = fn() {
+        if not candidate_only and baseline_arg != "" {
+            let base_row = _qualify_variant("baseline", baseline_arg, repo_root, runtime_bin, scratch);
+            array_push(rows, base_row);
+            if not base_row.passed { ok_all = false; }
+        }
+        let cand_row = _qualify_variant("candidate", repo_root, repo_root, runtime_bin, scratch);
+        array_push(rows, cand_row);
+        if not cand_row.passed { ok_all = false; }
+        return true;
+    };
+    if not (try run_variants() catch false) {
+        ok_all = false;
+        run_err = "qualification exception";
+    }
+
+    _rm_rf(scratch);
+    assert(not fs_exists(scratch), "disposable scratch cleaned up");
+
+    let report = map{
+        passed: ok_all and len(rows) > 0,
+        historical_comparison: not candidate_only,
+        real_kernel_close_fault: false,
+        source_hidden: true,
+        network_isolated: true,
+        error: run_err,
+        effect_substitutions: ["_parent", "_openat", "_call", "_close_library", "open", "open_absolute", "snapshot fs_read_bytes"],
+        unchanged_effect_logic: ["_close_fd", "close", "bounded_source.read_source"],
+        rows: rows
+    };
+
+    if report_arg != "" {
+        let parent_dir = path_dirname(report_arg);
+        if parent_dir != "" and parent_dir != "." { fs_mkdirs(parent_dir); }
+        fs_write(report_arg, json_stringify(report) + "\n");
+    }
+
+    assert(report.passed, "bounded_read_cleanup_check failed");
+    print "bounded_read_cleanup_check_pass: variants=" + str(len(rows)) + " checks=" + str(rows[len(rows) - 1].result.checks);
+}
+
+main();

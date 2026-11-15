@@ -1,0 +1,126 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+//
+// bench/selfhost_parity.sapp — Pure-PBLang Native vs Interpreter Front-End Parity Suite
+//
+// Replaces bench/selfhost_parity.sh. Compiles `tokenizer.sapp` + `parser.sapp` directly
+// to native x86-64 ELF64 via `codegen_x64.sapp` and verifies byte-identical output
+// against the reference interpreter across all 14 parity cases.
+
+let CG = import("stdlib:native/codegen_x64.sapp");
+
+fn _find_pb(root: string) {
+    let env_b = env_get("PB");
+    if env_b != nil and env_b != "" and fs_exists(env_b) { return env_b; }
+    if fs_exists(root + "/pblang") { return root + "/pblang"; }
+    if fs_exists(root + "/target/release/pblang") { return root + "/target/release/pblang"; }
+    return "pblang";
+}
+
+fn _strip_parser_for_native(par_raw: string) {
+    let cut_idx = str_index_of(par_raw, "\nfn print_ast");
+    let body = if cut_idx >= 0 { str_slice(par_raw, 0, cut_idx) } else { par_raw };
+    let lines = str_split(str_replace_all(body, "\r\n", "\n"), "\n");
+    let out = [];
+    let skip_push = false;
+    let i = 0;
+    while i < len(lines) {
+        let ln = lines[i];
+        let tr = str_trim(ln);
+        if str_starts_with(tr, "fn push(arr, value)") {
+            if not str_contains(tr, "}") {
+                skip_push = true;
+            }
+        } elif skip_push {
+            if str_contains(tr, "}") {
+                skip_push = false;
+            }
+        } else {
+            array_push(out, ln);
+        }
+        i = i + 1;
+    }
+    return str_join(out, "\n") + "\n";
+}
+
+let root = cwd();
+let pb = _find_pb(root);
+let tok_path = root + "/stdlib/compiler/tokenizer.sapp";
+let par_path = root + "/stdlib/compiler/parser.sapp";
+let tok_src = fs_read(tok_path);
+let par_stripped = _strip_parser_for_native(fs_read(par_path));
+
+let work = "/tmp/pb_selfhost_parity_" + str(num_floor(now_ms()));
+fs_mkdirs(work);
+let interp_drv = work + "/i.sapp";
+let nat_bin = work + "/n.bin";
+
+let ser_src = "fn ser(n){ if n.kind==\"binary\"{return \"(\"+ser(n.left)+n.op+ser(n.right)+\")\";} if n.kind==\"unary\"{return \"(\"+n.op+ser(n.operand)+\")\";} if n.kind==\"call\"{let s=ser(n.func)+\"(\"; let i=0; while i<len(n.args){ if i>0{s=s+\",\";} s=s+ser(n.args[i]); i=i+1;} return s+\")\";} if n.kind==\"ident\"{return n.name;} if n.kind==\"number\"{return n.value;} if n.kind==\"index\"{return ser(n.obj)+\"[\"+ser(n.index)+\"]\";} if n.kind==\"member\"{return ser(n.obj)+\".\"+n.name;} return \"?\"+n.kind; }";
+
+let passed = 0;
+let failed = 0;
+
+let check_case = fn(label: string, body: string) {
+    let i_code = "let tk=import(\"" + tok_path + "\"); let pr=import(\"" + par_path + "\");\n"
+        + "fn tokenize(s){ return tk.tokenize(s); }\n"
+        + "fn parse(t){ return pr.parse(t); }\n"
+        + ser_src + "\n" + body + "\n";
+    fs_write(interp_drv, i_code);
+    let ir = proc_spawn_wait(pb, ["run", interp_drv, "--allow-all"]);
+    let iexp = str_trim(str(ir.stdout));
+
+    let full_nat_src = tok_src + "\n" + par_stripped + "\n" + ser_src + "\n" + body + "\n";
+    let elf_bytes = nil;
+    let comp_err = "";
+    try {
+        elf_bytes = CG.compile_fns(full_nat_src);
+    } catch e {
+        comp_err = str(e);
+    }
+    if comp_err != "" or elf_bytes == nil {
+        println("FAIL [" + label + "]: native compile error: " + comp_err);
+        failed = failed + 1;
+        return;
+    }
+    fs_write_bytes(nat_bin, elf_bytes);
+    try proc_spawn_wait("chmod", ["755", nat_bin]) catch nil;
+    let nr = proc_spawn_wait(nat_bin, []);
+    let ngot = str_trim(str(nr.stdout));
+    if iexp == ngot and iexp != "" {
+        passed = passed + 1;
+    } else {
+        println("FAIL [" + label + "]: interp='" + iexp + "' native='" + ngot + "'");
+        failed = failed + 1;
+    }
+};
+
+let tok_cases = ["fn add(a, b)", "let x = 42", "if x >= 10 and y != 0", "return foo.bar[i]", "while i < n"];
+let ti = 0;
+while ti < len(tok_cases) {
+    let s = tok_cases[ti];
+    check_case("tokenize '" + s + "'", "let ts=tokenize(\"" + s + "\"); let s=\"\"; let i=0; while i<len(ts){s=s+ts[i].kind+\":\"+ts[i].text+\"|\"; i=i+1;} print s;");
+    ti = ti + 1;
+}
+
+let stmt_cases = ["let x = 42;", "fn sq(n){ return n*n; }", "if x>10 { return 1; } while x>0 { x=x-1; }", "let a = [1,2,3]; let m = map{k: 1};"];
+let si = 0;
+while si < len(stmt_cases) {
+    let s = stmt_cases[si];
+    check_case("parse-stmts '" + s + "'", "let r=parse(tokenize(\"" + s + "\")); let s=\"errors:\"+str(len(r.errors))+\" n:\"+str(len(r.stmts)); let i=0; while i<len(r.stmts){s=s+\" [\"+r.stmts[i].kind+\"]\"; i=i+1;} print s;");
+    si = si + 1;
+}
+
+let expr_cases = ["a + b * c - d", "f(x, y + 1)", "a.b.c[i]", "1 + 2 * 3 == 7", "not a and b or c"];
+let ei = 0;
+while ei < len(expr_cases) {
+    let s = expr_cases[ei];
+    check_case("parse-expr '" + s + "'", "let r=parse(tokenize(\"" + s + ";\")); print ser(r.stmts[0].expr);");
+    ei = ei + 1;
+}
+
+try fs_remove(interp_drv) catch nil;
+try fs_remove(nat_bin) catch nil;
+try fs_remove(work) catch nil;
+
+let suffix = if failed > 0 { " (" + str(failed) + " FAILED)" } else { "" };
+println("selfhost_parity: " + str(passed) + "/" + str(passed + failed) + " passed" + suffix);
+if failed > 0 { os_exit(1); }

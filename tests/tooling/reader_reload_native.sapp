@@ -1,0 +1,269 @@
+// Pure PBLang native verification: explicit reload after an external Store.save writer, corrupt/missing profile safety, and churn recovery.
+let App = import("../../examples/declarative_browser/app.sapp");
+let Store = import("../../examples/declarative_browser/appearance_store.sapp");
+let Profile = import("../../examples/declarative_browser/appearance_profile.sapp");
+let Dir = import("stdlib:linux_dirfs.sapp");
+let G = import("stdlib:graphics.sapp");
+let FM = import("stdlib:font_metrics.sapp");
+
+fn _cli_args() {
+    let raw = try env_get("PBLANG_SCRIPT_ARGS") catch "";
+    if type(raw) == "string" and raw != "" { return str_split(raw, "\n"); }
+    let argv = os_args();
+    let out = [];
+    let after = false;
+    for item in argv {
+        if after { array_push(out, item); }
+        elif item == "--" { after = true; }
+    }
+    return out;
+}
+
+fn _parse_opts(args) {
+    let opts = map{ package: "", evidence: "", runtime: "", report: "", xvfb: false };
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if a == "--xvfb" { opts.xvfb = true; i = i + 1; }
+        elif (a == "--package" or a == "--evidence" or a == "--runtime" or a == "--report") and i + 1 < len(args) {
+            opts[str_slice(a, 2, len(a))] = args[i + 1];
+            i = i + 2;
+        } else {
+            i = i + 1;
+        }
+    }
+    return opts;
+}
+
+fn _mk_private_tmp(prefix) {
+    let name = "pblang_tooling_s4_" + prefix + "_" + str(num_floor(now_ms()));
+    let tmp_fs = Dir.open_absolute("/tmp", false, false);
+    assert(tmp_fs.ok, "open /tmp handle");
+    let created = Dir.mkdir_new(tmp_fs, name, false);
+    let closed = Dir.close(tmp_fs);
+    assert(created.ok and closed, "create private temp dir");
+    return path_join("/tmp", name);
+}
+
+fn _rm_tree(path) {
+    if not (try fs_exists(path) catch false) { return; }
+    let entries = try fs_listdir(path) catch nil;
+    if type(entries) == "array" {
+        for name in entries { _rm_tree(path_join(path, name)); }
+    }
+    let _r = try fs_remove(path) catch nil;
+}
+
+fn _font_measurer() {
+    let fonts = map{};
+    for fam in ["sans", "serif", "monospace", "system"] {
+        let resolved = G.text_font_resolve(fam);
+        fonts[fam] = if resolved != "" { FM.load(resolved) } else { nil };
+    }
+    return fn(text, px, family) {
+        if text == "" { return map{ ok: true, width: 0, height: px }; }
+        let fam = if map_has(fonts, family) { family } else { "sans" };
+        let layout = try FM.layout(fonts[fam], text, px) catch nil;
+        if layout != nil {
+            return map{ ok: true, width: layout.width, height: layout.height };
+        }
+        return map{ ok: true, width: num_floor(len(text) * px * 0.6 + 0.999), height: px };
+    };
+}
+
+fn _click(c, x, y) {
+    App.update(c, [
+        map{ type: "mousedown", button: "Left", x: x, y: y },
+        map{ type: "mouseup", button: "Left", x: x, y: y }
+    ]);
+}
+
+fn _key(c, name) {
+    let k = if name == "Return" { "Enter" } else { name };
+    App.update(c, [map{ type: "keydown", key: k }, map{ type: "keyup", key: k }]);
+}
+
+fn _choose(c) { _click(c, 400, 182); }
+fn _save_btn(c) { _click(c, 400, 546); }
+fn _reload_btn(c) { _click(c, 400, 650); }
+
+fn _start(with_profile, data_dir, measure_fn) {
+    let loaded = map{ can_save: false, appearance: nil, message: "Session only: --with-profile to save", token: nil };
+    let saver:any = nil;
+    let reloader:any = nil;
+    if with_profile {
+        loaded = Store.load(data_dir);
+        saver = fn(style) {
+            let r = Store.save(data_dir, style, loaded.token);
+            if r.confirmed { loaded.token = r.token; }
+            return r;
+        };
+        reloader = fn() {
+            let fresh = Store.load(data_dir);
+            if not fresh.ok or not fresh.can_save or fresh.token == "missing" { return map{ ok: false }; }
+            loaded.token = fresh.token;
+            return map{ ok: true, appearance: fresh.appearance, save: saver };
+        };
+    }
+    let active_saver:any = if loaded.can_save { saver } else { nil };
+    let c = App.create("local", "dark");
+    App.enable_preferences(c, loaded.appearance, active_saver, loaded.message, reloader);
+    App.set_text_measure(c, measure_fn);
+    App.refresh(c);
+    _click(c, 700, 44);
+    return c;
+}
+
+fn _external_write(data_dir, profile_path, family) {
+    let loaded = Store.load(data_dir);
+    let style = loaded.appearance;
+    style.font_family = family;
+    let r = Store.save(data_dir, style, loaded.token);
+    assert(r.ok and r.owned_handles_closed, "external Store.save succeeded");
+    return fs_read_bytes(profile_path);
+}
+
+fn _stored_files(style_dir) {
+    let out = map{};
+    for name in array_sort(fs_listdir(style_dir)) {
+        let p = path_join(style_dir, name);
+        out[name] = fs_read_bytes(p);
+    }
+    return out;
+}
+
+fn _write_private_bytes(style_dir, file_name, bytes) {
+    let fs = Dir.open_absolute(style_dir, false, true);
+    assert(fs.ok, "open style_dir handle");
+    let w = Dir.write_atomic(fs, file_name, bytes, false);
+    let closed = Dir.close(fs);
+    assert(w.ok and closed, "write private file bytes");
+}
+
+fn _current_profile(profile_path) {
+    let parsed = Profile.decode(fs_read(profile_path));
+    assert(parsed.ok, "valid saved profile");
+    return parsed.appearance;
+}
+
+fn _journey(opts, data_dir) {
+    let style_dir = path_join(data_dir, "reader-style");
+    let profile_path = path_join(style_dir, "appearance-v1.json");
+    let measure = _font_measurer();
+
+    let c = _start(true, data_dir, measure);
+    _choose(c);
+    _save_btn(c);
+    assert(_current_profile(profile_path).font_family == "serif", "initial Save wrote serif");
+
+    let changed = _external_write(data_dir, profile_path, "monospace");
+    _choose(c);
+    _choose(c);
+    _save_btn(c);
+    assert(fs_read_bytes(profile_path) == changed, "stale GUI must not overwrite external profile");
+    assert(c.preferences.save == nil, "conflicting Save disabled until explicit Reload");
+
+    let before = _stored_files(style_dir);
+    _reload_btn(c);
+    assert(_stored_files(style_dir) == before, "Reload is strictly read-only");
+    assert(c.appearance.font_family == "monospace" and c.preferences.save != nil, "Reload restored external style and renewed saver");
+
+    _choose(c);
+    _save_btn(c);
+    assert(_current_profile(profile_path).font_family == "system", "Reload renewed revision and draft");
+
+    let valid = fs_read_bytes(profile_path);
+    _choose(c);
+
+    let corrupt_cases = [
+        map{ name: "invalid", bytes: str_to_bytes("{broken") },
+        map{ name: "utf8", bytes: [255] },
+        map{ name: "oversize", bytes: str_to_bytes(str_repeat("x", 4097)) }
+    ];
+    for item in corrupt_cases {
+        _write_private_bytes(style_dir, "appearance-v1.json", item.bytes);
+        let snap = _stored_files(style_dir);
+        for _i 3 { _reload_btn(c); }
+        _save_btn(c);
+        assert(_stored_files(style_dir) == snap, "failed reload or disabled Save preserved " + item.name + " bytes");
+    }
+
+    fs_remove(profile_path);
+    let snap_missing = _stored_files(style_dir);
+    _reload_btn(c);
+    _save_btn(c);
+    assert(_stored_files(style_dir) == snap_missing and not fs_exists(profile_path), "missing profile preserved without writes");
+
+    // Restore valid external bytes, then run 3 rounds of genuine store revision churn.
+    _write_private_bytes(style_dir, "appearance-v1.json", valid);
+    for family in ["serif", "monospace", "system"] {
+        let _ext = _external_write(data_dir, profile_path, family);
+        let snap = _stored_files(style_dir);
+        _reload_btn(c);
+        assert(_stored_files(style_dir) == snap and c.appearance.font_family == family, "churn reload read-only for " + family);
+
+        let ext_sans = _external_write(data_dir, profile_path, "sans");
+        _save_btn(c);
+        assert(fs_read_bytes(profile_path) == ext_sans, "concurrent external sans preserved on stale Save");
+
+        _reload_btn(c);
+        _choose(c);
+        _save_btn(c);
+        assert(_current_profile(profile_path).font_family == "serif", "recovered Save after churn round");
+    }
+
+    assert(not c.form.close_requested, "recovery stayed in same GUI session");
+    let saved = fs_read_bytes(profile_path);
+
+    App.update(c, [map{ type: "resize", w: 320, h: 240 }]);
+    _key(c, "End");
+    assert(c.form.focus == "style_reload", "compact End focused style_reload");
+    _key(c, "Return");
+    assert(fs_read_bytes(profile_path) == saved, "compact keyboard Reload wrote no files");
+    c.session.close();
+
+    let c2 = _start(true, data_dir, measure);
+    assert(fs_read_bytes(profile_path) == saved, "restart with profile preserved saved bytes");
+    c2.session.close();
+
+    let c3 = _start(false, data_dir, measure);
+    assert(fs_read_bytes(profile_path) == saved, "default session-only launch preserved saved bytes");
+    c3.session.close();
+
+    let report = map{
+        passed: true,
+        same_gui_pid: true,
+        external_writer: "PBLang Store.save",
+        conflict_reload_save: true,
+        reload_read_only: true,
+        invalid_utf8_oversize_missing_preserved: true,
+        repeated_invalid_reads: 9,
+        churn_rounds: 3,
+        default_no_exec_no_profile_writes: true
+    };
+    if opts.evidence != "" {
+        fs_mkdirs(opts.evidence);
+        fs_write(path_join(opts.evidence, "acceptance.json"), json_stringify(report) + "\n");
+    }
+    if opts.report != "" {
+        fs_write(opts.report, json_stringify(report) + "\n");
+    }
+    print json_stringify(report);
+    return true;
+}
+
+fn main() {
+    let opts = _parse_opts(_cli_args());
+    let work = _mk_private_tmp("reload");
+    let data_dir = path_join(work, "data");
+    let work_fs = Dir.open_absolute(work, false, true);
+    assert(work_fs.ok and Dir.mkdir_new(work_fs, "data", false).ok and Dir.close(work_fs), "prepare private data folder");
+
+    let ok = try _journey(opts, data_dir) catch false;
+
+    _rm_tree(work);
+    assert(not fs_exists(work), "cleaned temporary directory");
+    assert(ok, "reader_reload_native checks passed");
+}
+
+main();

@@ -1,0 +1,429 @@
+// Pure PBLang arithmetic, builtin admission, bounded initialization, and
+// secondary cleanup-fault parity verifier across all six self-hosted VM routes
+// (plain, optimized, pbcs x unbounded, bounded).
+
+let F = import("stdlib:compiler/selfhost_frontend.sapp");
+let V = import("stdlib:compiler/vm.sapp");
+let O = import("stdlib:compiler/optimizer.sapp");
+let P = import("stdlib:selfhost_pbck.sapp");
+
+fn _rm_rf(target) {
+    if not fs_exists(target) { return; }
+    let entries = try fs_listdir(target) catch nil;
+    if entries != nil {
+        for name in entries {
+            _rm_rf(target + "/" + name);
+        }
+    }
+    let _ok = try fs_remove(target) catch false;
+}
+
+fn _parse_cli() {
+    let args = os_args();
+    let runtime = cwd() + "/pblang";
+    let report = "";
+    let suite = "";
+    let group = "standalone";
+    let start_idx = 0;
+    let count = 0 - 1;
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if (a == "--candidate" or a == "--runtime" or a == "--reference") and i + 1 < len(args) {
+            let val = args[i + 1];
+            if fs_exists(val + "/bin/pblang") {
+                runtime = val + "/bin/pblang";
+            } elif fs_exists(val + "/pblang") {
+                runtime = val + "/pblang";
+            } elif fs_exists(val) {
+                runtime = val;
+            }
+            i = i + 1;
+        } elif a == "--report" and i + 1 < len(args) {
+            report = args[i + 1];
+            i = i + 1;
+        } elif a == "--suite" and i + 1 < len(args) {
+            suite = args[i + 1];
+            i = i + 1;
+        } elif a == "--start" and i + 1 < len(args) {
+            start_idx = num_floor(parse_number(args[i + 1]));
+            i = i + 1;
+        } elif a == "--count" and i + 1 < len(args) {
+            count = num_floor(parse_number(args[i + 1]));
+            i = i + 1;
+        } elif a == "--initialization" { group = "initialization"; }
+        elif a == "--calls" { group = "calls"; }
+        elif a == "--numeric" { group = "numeric"; }
+        elif a == "--strings" { group = "strings"; }
+        elif a == "--exact-math" { group = "exact-math"; }
+        elif a == "--constructors" { group = "constructors"; }
+        elif a == "--bitwise" { group = "bitwise"; }
+        elif a == "--conversions" { group = "conversions"; }
+        elif a == "--slices" { group = "slices"; }
+        elif a == "--map-fallback" { group = "map-fallback"; }
+        elif a == "--equality" { group = "equality"; }
+        i = i + 1;
+    }
+    return map{
+        runtime: runtime,
+        report: report,
+        suite: suite,
+        group: group,
+        start: start_idx,
+        count: count
+    };
+}
+
+fn _extract_host_error(stderr) {
+    let s = str_trim(stderr);
+    if str_starts_with(s, "Runtime error: ") {
+        s = str_slice(s, 15, len(s));
+        let idx = str_index_of(s, " (at ");
+        if idx >= 0 {
+            s = str_slice(s, 0, idx);
+        }
+        return s;
+    }
+    let lines = str_split(s, "\n");
+    for line in lines {
+        let idx = str_index_of(line, "]: ");
+        if str_starts_with(line, "error[") and idx >= 0 {
+            return str_slice(line, idx + 3, len(line));
+        }
+    }
+    return s;
+}
+
+fn _run_host(runtime, script_path) {
+    let res = proc_spawn_wait(runtime, [
+        "run", script_path,
+        "--deny-net", "--deny-http", "--deny-exec",
+        "--deny-ffi", "--deny-spawn", "--deny-gfx", "--deny-sqlite"
+    ]);
+    return map{
+        exit: res.exit_code,
+        stdout: res.stdout,
+        error: if res.exit_code == 0 { nil } else { _extract_host_error(res.stderr) }
+    };
+}
+
+fn _format_vm_output(items) {
+    if len(items) == 0 { return ""; }
+    let lines = [];
+    for item in items {
+        push(lines, str(item));
+    }
+    return str_join(lines, "\n") + "\n";
+}
+
+fn _run_vm_core(code, ctx, bounded) {
+    let res = if bounded {
+        V.run_seeded_bounded(code, map{}, nil, ctx)
+    } else {
+        V.run_seeded(code, map{}, ctx)
+    };
+    V.close_execution(ctx);
+    return _format_vm_output(res.output);
+}
+
+fn _run_vm_route(source, mode, bounded) {
+    let compiled = F.frontend_compile(source);
+    assert(compiled.ok, "compile failed: " + source);
+    let code = compiled.chunk;
+    if mode == "optimized" {
+        code = O.optimize_safe(code).chunk;
+    } elif mode == "pbcs" {
+        code = P.deserialize_chunk(P.serialize_chunk(code));
+    }
+    let ctx = V.execution_context(true);
+    let _seed = V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk, map{}, ctx);
+    let ok = true;
+    let out_str = "";
+    let err_str = "";
+    try {
+        out_str = _run_vm_core(code, ctx, bounded);
+    } catch e {
+        ok = false;
+        err_str = str(e);
+    }
+    return map{
+        exit: if ok { 0 } else { 1 },
+        stdout: out_str,
+        error: if ok { nil } else { err_str }
+    };
+}
+
+fn _run_secondary_close_fault(source) {
+    let ctx = V.execution_context(true);
+    let _seed = V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk, map{}, ctx);
+    ctx.memory.reclaimed = map{};
+    let ok = true;
+    let err_str = "";
+    try {
+        let _r = V.run_seeded(F.frontend_compile(source).chunk, map{}, ctx);
+    } catch e {
+        ok = false;
+        err_str = str(e);
+    }
+    return map{
+        exit: if ok { 0 } else { 1 },
+        error: if ok { nil } else { err_str }
+    };
+}
+
+fn _eval_init_route(route, empty_chunk, options_val, ctx) {
+    if route == "seeded" {
+        let _ms = V.run_seeded_bounded(empty_chunk, map{}, options_val, ctx).runtime.max_steps;
+    } elif route == "owned-entry" {
+        let _ms = V.run_bounded(empty_chunk, options_val).runtime.max_steps;
+    } else {
+        let _ms = V.runtime_limits(options_val).max_steps;
+    }
+    V.close_execution(ctx);
+}
+
+fn _check_init_case(label, options_val, valid, rows) {
+    let empty_chunk = map{ constants: [], instructions: [] };
+    let routes = ["seeded", "owned-entry", "inspection"];
+    for route in routes {
+        let ctx = V.execution_context(true);
+        let setup = map{
+            constants: [map{ __bi: "memory_alloc" }, 7],
+            instructions: [map{ op: 0, operand: 0 }, map{ op: 0, operand: 1 }, map{ op: 18, operand: 1 }]
+        };
+        let _s = V.run_seeded(setup, map{}, ctx);
+        let ok = true;
+        let err_str = "";
+        try {
+            _eval_init_route(route, empty_chunk, options_val, ctx);
+        } catch e {
+            ok = false;
+            err_str = str(e);
+        }
+        assert(ok == valid, "initialization validity mismatch on " + label + "/" + route + ": err=" + err_str);
+        if not valid {
+            assert(err_str != "", "invalid initialization must produce error on " + label + "/" + route);
+        }
+        push(rows, map{ label: label + "/" + route, passed: true });
+    }
+
+    if not valid {
+        let ctx1 = V.execution_context(true);
+        let err_primary = "";
+        try {
+            let _r1 = V.run_seeded_bounded(empty_chunk, map{}, options_val, ctx1);
+        } catch e1 {
+            err_primary = str(e1);
+        }
+
+        let ctx2 = V.execution_context(true);
+        let setup2 = map{
+            constants: [map{ __bi: "memory_alloc" }, 7],
+            instructions: [map{ op: 0, operand: 0 }, map{ op: 0, operand: 1 }, map{ op: 18, operand: 1 }]
+        };
+        let _s2 = V.run_seeded(setup2, map{}, ctx2);
+        ctx2.memory.reclaimed = map{};
+        let err_secondary = "";
+        try {
+            let _r2 = V.run_seeded_bounded(empty_chunk, map{}, options_val, ctx2);
+        } catch e2 {
+            err_secondary = str(e2);
+        }
+        assert(err_primary != "" and err_secondary == err_primary, "secondary close fault preserved primary init diagnostic on " + label);
+        push(rows, map{ label: label + "/secondary-close-fault", passed: true });
+    }
+}
+
+fn _run_initialization_checks(rows) {
+    _check_init_case("option-shape", 7, false, rows);
+    let limit_keys = ["max_steps", "max_frames", "max_stack", "max_locals", "max_output", "max_value_items"];
+    for key in limit_keys {
+        let m_zero = map{};
+        m_zero[key] = 0;
+        _check_init_case(key + "/0", m_zero, false, rows);
+
+        let m_nan = map{};
+        m_nan[key] = num_sqrt(0 - 1);
+        _check_init_case(key + "/nan", m_nan, false, rows);
+    }
+    _check_init_case("defaults", nil, true, rows);
+    _check_init_case("valid-limits", map{ max_steps: 8, max_frames: 1 }, true, rows);
+}
+
+fn _arithmetic_cases() {
+    let cases = [];
+    let ops = ["+", "-", "*", "/", "%", ">", ">=", "<", "<="];
+    for op in ops {
+        push(cases, ["arith " + op, "fn f(a,b){return a" + op + "b;}f(nil,2);", false, true]);
+    }
+    push(cases, ["exact division error", "fn f(a,b){return a/b;}f(bigint(\"1\"),bigint(\"0\"));", false, true]);
+    push(cases, [
+        "valid arithmetic",
+        "fn f(a,b){print a+b;print a-b;print a*b;print a/b;print a%b;print a>b;print a>=b;print a<b;print a<=b;}f(7,2);print \"α\"+\"β\";print bigint(\"4\")+bigint(\"2\");print rational(3,1)/rational(2,1);",
+        true,
+        true
+    ]);
+    push(cases, [
+        "handled arithmetic",
+        "fn f(a,b){return a-b;}memory_alloc(7);print try f(nil,2) catch memory_get(1);",
+        true,
+        false
+    ]);
+    return cases;
+}
+
+fn _extended_group_cases(group) {
+    let cases = [];
+    if group == "calls" or group == "standalone" {
+        push(cases, ["call-number", "let f=3;f();", false, false]);
+        push(cases, ["call-nil", "let f=nil;f();", false, false]);
+        push(cases, ["call-caught", "let f=3;print try f() catch 7;", true, false]);
+    }
+    if group == "numeric" or group == "standalone" {
+        push(cases, ["num_sqrt-nil", "fn call(f,x){return f(x);}call(num_sqrt,nil);", false, false]);
+        push(cases, ["num_min-nil", "fn call(f,a,b){return f(a,b);}call(num_min,nil,2);", false, false]);
+        push(cases, ["valid-numeric", "print num_floor(3.9);print num_ceil(-3.9);print num_abs(-4);print num_sqrt(9);print num_min(3,4);print num_max(3,4);", true, true]);
+    }
+    if group == "strings" or group == "standalone" {
+        push(cases, ["str_upper-nil", "fn call(f,x){return f(x);}call(str_upper,nil);", false, false]);
+        push(cases, ["str_contains-nil", "fn call(f,a,b){return f(a,b);}call(str_contains,nil,\"x\");", false, false]);
+        push(cases, ["valid-strings", "print str_upper(\"ab\");print str_lower(\"AB\");print str_trim(\" αβ \");print str_contains(\"α😀β\",\"😀\");", true, true]);
+    }
+    if group == "exact-math" or group == "standalone" {
+        push(cases, ["num_mod-div0", "fn invoke(f,a,b){return f(a,b);}invoke(num_mod,bigint(7),bigint(0));", false, false]);
+        push(cases, ["num_pow-nil", "fn invoke(f,a,b){return f(a,b);}invoke(num_pow,nil,2);", false, false]);
+        push(cases, ["valid-exact-math", "print num_mod(bigint(17),bigint(5));print num_pow(bigint(2),10);print num_pow(rational(1,2),-2);print num_pow(decimal(2),3);", true, true]);
+    }
+    if group == "constructors" or group == "standalone" {
+        push(cases, ["bigint-bad", "fn call1(f,a){return f(a);}call1(bigint,\"bad\");", false, false]);
+        push(cases, ["rational-div0", "fn call2(f,a,b){return f(a,b);}call2(rational,1,0);", false, false]);
+        push(cases, ["valid-constructors", "print bigint(\"9007199254740993\");print decimal(\"0.5\");print rational(1,8);print rational(2,4);print rational(4,2);", true, true]);
+    }
+    if group == "bitwise" or group == "standalone" {
+        push(cases, ["bit_shl-nil", "fn call2(f,a,b){return f(a,b);}call2(bit_shl,nil,1);", false, false]);
+        push(cases, ["bit_not-nil", "fn call1(f,a){return f(a);}call1(bit_not,nil);", false, false]);
+        push(cases, ["valid-bitwise", "print bit_and(12,10);print bit_or(12,10);print bit_xor(12,10);print bit_not(5);print bit_shl(1,0);", true, true]);
+    }
+    if group == "conversions" or group == "standalone" {
+        push(cases, ["parse_number-nil", "fn call1(f,a){return f(a);}call1(parse_number,nil);", false, false]);
+        push(cases, ["charcode-nil", "fn call1(f,a){return f(a);}call1(str_from_char_code,nil);", false, false]);
+        push(cases, ["valid-conversions", "print parse_number(\" -1.25e2 \");print parse_bool(\" TRUE \");print str_from_char_code(128578);", true, true]);
+    }
+    if group == "slices" or group == "standalone" {
+        push(cases, ["str_slice-nil", "fn call3(f,a,b,c){return f(a,b,c);}call3(str_slice,nil,0,1);", false, false]);
+        push(cases, ["slice-nil", "fn call3(f,a,b,c){return f(a,b,c);}call3(slice,nil,nil,nil);", false, false]);
+        push(cases, ["valid-slices", "print str_slice(\"α🙂β\",1,2);print slice([1,2,3],1,nil);let a=[1,2,3];print a[1..2];", true, true]);
+    }
+    if group == "map-fallback" or group == "standalone" {
+        push(cases, ["map-add-unhandled", "fn apply(a,b){return a+b;}apply(map{},2);", false, false]);
+        push(cases, ["map-nil-method", "let a=map{__add__:nil};a+2;", false, false]);
+        push(cases, ["valid-overloads", "let a=map{__add__:fn(s,b){return nil;}};print a+2;let b=map{__rsub__:fn(s,a){return false;}};print 2-b;print map{x:1}==map{x:1};", true, true]);
+    }
+    if group == "equality" or group == "standalone" {
+        push(cases, ["eq-bad-method", "fn compare(a,b){return a==b;}let a=map{__eq__:3};compare(a,2);", false, false]);
+        push(cases, ["structural-valid", "print map{x:1}==map{x:1};print map{x:1}!=map{x:2};let a=map{__eq__:fn(s,b){return nil;}};print a==2;", true, true]);
+    }
+    return cases;
+}
+
+fn _execute_suite(cli, scratch, rows) {
+    let native_file = scratch + "/native.sapp";
+    if cli.suite != "" {
+        let res = _run_host(cli.runtime, cli.suite);
+        let ok = res.exit == 0 and str_contains(res.stdout, "_pass");
+        assert(ok, "suite failed: " + cli.suite);
+        push(rows, map{ label: cli.suite, passed: true });
+    } elif cli.group == "initialization" {
+        _run_initialization_checks(rows);
+    } else {
+        if cli.group == "standalone" {
+            _run_initialization_checks(rows);
+        }
+        let cases = if cli.group == "standalone" {
+            let all_c = _arithmetic_cases();
+            for ext in _extended_group_cases("standalone") {
+                push(all_c, ext);
+            }
+            all_c
+        } else {
+            _extended_group_cases(cli.group)
+        };
+
+        let end_idx = if cli.count < 0 { len(cases) } else { cli.start + cli.count };
+        if end_idx > len(cases) { end_idx = len(cases); }
+
+        let modes = ["plain", "optimized", "pbcs"];
+        let bounds = [false, true];
+        let idx = cli.start;
+        while idx < end_idx {
+            let entry = cases[idx];
+            let label = entry[0];
+            let source = entry[1];
+            let valid = entry[2];
+            let check_host = entry[3];
+
+            let ref_vm = _run_vm_route(source, "plain", false);
+            assert((ref_vm.exit == 0) == valid, "VM validity mismatch on " + label + ": " + json_stringify(ref_vm));
+
+            if check_host {
+                fs_write(native_file, source);
+                let host_res = _run_host(cli.runtime, native_file);
+                assert((host_res.exit == 0) == valid, "host validity mismatch on " + label);
+                if valid {
+                    assert(host_res.stdout == ref_vm.stdout, "host stdout mismatch on " + label);
+                } else {
+                    assert(host_res.error != nil and host_res.error != "", "host error non-empty on " + label);
+                }
+            }
+
+            for mode in modes {
+                for bounded in bounds {
+                    let actual = _run_vm_route(source, mode, bounded);
+                    let same = actual.exit == ref_vm.exit and actual.stdout == ref_vm.stdout and actual.error == ref_vm.error;
+                    assert(same, "6-route parity mismatch on " + label + "/" + mode + "/" + str(bounded));
+                    push(rows, map{ label: label + "/" + mode + "/" + str(bounded), passed: true });
+                }
+            }
+
+            if not valid {
+                let fault_res = _run_secondary_close_fault(source);
+                assert(fault_res.exit != 0 and fault_res.error == ref_vm.error, "secondary close fault preserved primary diagnostic on " + label);
+                push(rows, map{ label: label + "/secondary-close-fault", passed: true });
+            }
+            idx = idx + 1;
+        }
+    }
+
+    if cli.report != "" {
+        fs_write(cli.report, json_stringify(rows));
+    }
+}
+
+fn main() {
+    let cli = _parse_cli();
+    let scratch = "/tmp/pblang_tooling_s2_arith_" + str(now_ms());
+    fs_mkdirs(scratch);
+    let rows = [];
+    let err_msg = "";
+
+    try {
+        _execute_suite(cli, scratch, rows);
+    } catch e {
+        err_msg = str(e);
+    }
+
+    _rm_rf(scratch);
+    if err_msg != "" {
+        throw err_msg;
+    }
+
+    print json_stringify(map{
+        runner: "tests/tooling/selfhost_arithmetic_cleanup.sapp",
+        language: "PBLang",
+        group: cli.group,
+        passed: true,
+        checks: len(rows)
+    });
+}
+
+main();

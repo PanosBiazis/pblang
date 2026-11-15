@@ -1,0 +1,160 @@
+// Pure PBLang result projection model plus deterministic parent-swap with real held I/O
+// (replaces tests/semantics/archive_publication_evidence_test.py).
+
+let OS = import("stdlib:os.sapp");
+
+fn _join(arr, sep) {
+    let out = "";
+    let i = 0;
+    while i < len(arr) {
+        if i > 0 { out = out + sep; }
+        out = out + arr[i];
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _replace_all(s, old_sub, new_sub) {
+    return _join(str_split(s, old_sub), new_sub);
+}
+
+fn _resolve_runtime(cli) {
+    let rt = "./pblang";
+    if len(cli) > 0 and cli[0] != "" { rt = cli[0]; }
+    if str_starts_with(rt, "/") { return rt; }
+    if str_starts_with(rt, "./") { rt = str_slice(rt, 2, len(rt)); }
+    return OS.cwd() + "/" + rt;
+}
+
+fn _invocation(text, extract, empty) {
+    let out = text;
+    if extract {
+        out = _replace_all(out, "P.save(", "P.extract_member(");
+        out = _replace_all(out, ",[0])", ",[0],\"a\")");
+        out = _replace_all(out, ",bytes)", ",bytes,\"a\")");
+        out = _replace_all(out, ")==bytes,\"held original", ")==[0,128,255],\"held original");
+    }
+    if empty {
+        out = _replace_all(out, "data:[1]", "data:[]");
+        out = _replace_all(out, "[0,128,255]", "[]");
+    }
+    return out;
+}
+
+fn main() {
+    let cli = OS.script_args();
+    let runtime = _resolve_runtime(cli);
+    let repo = OS.cwd();
+    let source = fs_read(repo + "/stdlib/archive_publication.sapp");
+
+    let mode_arg = "";
+    if len(cli) > 1 { mode_arg = cli[1]; }
+    let extract = mode_arg == "extract" or mode_arg == "empty";
+    let empty = mode_arg == "empty";
+
+    let mk = proc_spawn_wait("/usr/bin/mktemp", ["-d", "/tmp/archive-model-XXXXXX"]);
+    assert(mk.exit_code == 0, "mktemp failed: " + mk.stderr);
+    let root = str_trim(mk.stdout);
+
+    let help_res = proc_spawn_wait(runtime, ["--help"]);
+    if str_contains(help_res.stdout, "--lock") {
+        let toml = "[package]\nname=\"archive-evidence\"\nversion=\"0.1.0\"\nentry=\"main.sapp\"\n[dependencies]\nstdlib={path=" + json_stringify(repo + "/stdlib") + ",paths=[\"stdlib\"]}\n";
+        fs_write(root + "/pblang.toml", toml);
+        let lock = proc_spawn_wait(runtime, ["--lock", root]);
+        if lock.exit_code != 0 {
+            proc_spawn_wait("/bin/rm", ["-rf", "--", root]);
+            error("pblang --lock failed: " + lock.stdout + lock.stderr);
+        }
+    }
+
+    fs_write(root + "/publication.sapp", _replace_all(source, "import(\"stdlib:linux_dirfs.sapp\")", "import(\"dir.sapp\")"));
+
+    let dir1 = _join([
+        "let state=map{mode:\"\",opens:0,closes:0,copies:0};",
+        "fn configure(mode) {state.mode=mode;state.opens=0;state.closes=0;state.copies=0;}",
+        "fn open(path,a,b) {state.opens=state.opens+1;return map{ok:true};}",
+        "fn open_absolute(path,a,b) {return open(path,a,b);}",
+        "fn sealed_child_bytes(fs,name,bytes) {return map{ok:state.mode!=\"seal_failure\"};}",
+        "fn copy_held_range_new_atomic(a,b,c,d,e,f,g,h,allow_empty=false) {",
+        " state.copies=state.copies+1;",
+        " if state.mode==\"throws\" {throw \"SECRET_BACKEND\";}",
+        " if state.mode==\"ambiguous\" {return map{ok:false,error:\"SECRET_BACKEND\"};}",
+        " if state.mode==\"unsynced\" or state.mode==\"wrapper_both\" {return map{ok:false,published:true,durability_verified:false};}",
+        " return map{ok:true,durability_verified:true};",
+        "}",
+        "fn close(fs) {state.closes=state.closes+1;return state.mode!=\"cleanup\" and state.mode!=\"wrapper_both\";}",
+        "export configure,open,open_absolute,sealed_child_bytes,copy_held_range_new_atomic,close,state;"
+    ], "\n") + "\n";
+    fs_write(root + "/dir.sapp", dir1);
+
+    let main1 = _join([
+        "let D=import(\"dir.sapp\");let P=import(\"publication.sapp\");",
+        "let A=import(\"stdlib:secure_archive.sapp\");let bytes=A.pack([map{name:\"a\",data:[1]}],\"store\");",
+        "D.configure(\"success\");let invalid=P.save(\"new.zip\",[0]);",
+        "assert(D.state.opens==0 and not invalid.publication_attempted,\"invalid bytes never open output root\");",
+        "for mode in [\"success\",\"seal_failure\",\"ambiguous\",\"throws\",\"unsynced\",\"cleanup\",\"wrapper_both\"] {",
+        " D.configure(mode);let r=P.save(\"new.zip\",bytes);",
+        " assert(D.state.closes==1,\"one root close\");",
+        " if str_contains(json_stringify(r),\"SECRET_BACKEND\") {throw \"private error exposed\";}",
+        " if mode==\"seal_failure\" {assert(not r.ok and not r.written and D.state.copies==0,\"no publication call\");}",
+        " elif mode==\"ambiguous\" or mode==\"throws\" {assert(not r.ok and not map_has(r,\"written\") and r.output_may_exist and not r.publication_confirmed,\"uncertain publication\");}",
+        " else {assert(r.written and r.publication_confirmed and r.atomic_visibility,\"retain positive evidence\");}",
+        " if mode==\"cleanup\" or mode==\"wrapper_both\" {assert(not r.ok and not r.wrapper_handles_closed and map_has(r,\"cleanup_error\"),\"cleanup ambiguity preserved\");}",
+        " if mode==\"unsynced\" or mode==\"wrapper_both\" {assert(r.code==\"publication_unconfirmed\" and not r.durability_verified,\"primary failure retained\");}",
+        " if mode==\"success\" {assert(r.ok and r.durability_verified and r.wrapper_handles_closed,\"complete success\");}",
+        "}",
+        "print \"archive_evidence_model_8_pass\";"
+    ], "\n") + "\n";
+    fs_write(root + "/main.sapp", _invocation(main1, extract, empty));
+
+    let p1 = proc_spawn_wait(runtime, ["run", root + "/main.sapp", "--allow-all"]);
+    if p1.exit_code != 0 or not str_contains(p1.stdout, "archive_evidence_model_8_pass") {
+        proc_spawn_wait("/bin/rm", ["-rf", "--", root]);
+        error("archive_evidence_model_8 failed: " + p1.stdout + p1.stderr);
+    }
+    print(str_trim(p1.stdout));
+
+    let parent = root + "/destination";
+    let moved = root + "/held-destination";
+    let replacement = root + "/replacement";
+    fs_mkdirs(parent);
+    fs_mkdirs(replacement);
+    let sentinel = replacement + "/sentinel";
+    fs_write(sentinel, "keep");
+
+    let dir2 = _join([
+        "let Real=import(\"stdlib:linux_dirfs.sapp\");",
+        "fn open_absolute(path,a,b) {",
+        " let fs=Real.open_absolute(path,a,b);",
+        " if fs.ok {",
+        "  assert(proc_spawn_wait(\"/bin/mv\",[\"--\",path," + json_stringify(moved) + "]).exit_code==0,\"move synthetic parent\");",
+        "  assert(proc_spawn_wait(\"/bin/ln\",[\"-s\",\"--\"," + json_stringify(replacement) + ",path]).exit_code==0,\"replace synthetic parent with symlink\");",
+        " }",
+        " return fs;",
+        "}",
+        "let open=Real.open;let sealed_child_bytes=Real.sealed_child_bytes;",
+        "let copy_held_range_new_atomic=Real.copy_held_range_new_atomic;let close=Real.close;",
+        "export open,open_absolute,sealed_child_bytes,copy_held_range_new_atomic,close;"
+    ], "\n") + "\n";
+    fs_write(root + "/dir.sapp", dir2);
+
+    let main2 = _join([
+        "let P=import(\"publication.sapp\");let A=import(\"stdlib:secure_archive.sapp\");",
+        "let bytes=A.pack([map{name:\"a\",data:[0,128,255]}],\"store\");",
+        "let r=P.save(" + json_stringify(parent + "/new.zip") + ",bytes);assert(r.ok,\"held parent publication\");",
+        "assert(fs_read_bytes(" + json_stringify(moved + "/new.zip") + ")==bytes,\"held original receives exact bytes\");",
+        "print \"archive_parent_swap_pass\";"
+    ], "\n") + "\n";
+    fs_write(root + "/main.sapp", _invocation(main2, extract, empty));
+
+    let p2 = proc_spawn_wait(runtime, ["run", root + "/main.sapp", "--allow-all"]);
+    if p2.exit_code != 0 or not str_contains(p2.stdout, "archive_parent_swap_pass") {
+        proc_spawn_wait("/bin/rm", ["-rf", "--", root]);
+        error("archive_parent_swap failed: " + p2.stdout + p2.stderr);
+    }
+    assert(not fs_exists(replacement + "/new.zip") and fs_read(sentinel) == "keep", "replacement directory untouched");
+    print(str_trim(p2.stdout));
+    proc_spawn_wait("/bin/rm", ["-rf", "--", root]);
+}
+
+main();

@@ -67,10 +67,6 @@ static bool zr_req_num(PbVM *vm, const char *fn, PbValue v, double *out) {
         *out = v.as.num;
         return true;
     }
-    if (v.tag == VAL_I64) {
-        *out = (double)v.as.i64;
-        return true;
-    }
     if (is_obj_type(v, OBJ_BIGINT)) {
         *out = zr_bi_to_double(&AS_BIGINT(v)->v);
         return true;
@@ -86,22 +82,11 @@ static bool zr_req_num(PbVM *vm, const char *fn, PbValue v, double *out) {
     return vm_error(vm, "%s(): expected number, got %s", fn, zr_val_type_name(v));
 }
 
-static bool zr_req_i64(PbVM *vm, const char *fn, PbValue v, int64_t *out) {
-    if (v.tag == VAL_I64) { *out = v.as.i64; return true; }
-    if (v.tag == VAL_NUM) { *out = (int64_t)v.as.num; return true; }
-    return vm_error(vm, "%s(): expected integer/number, got %s", fn, zr_val_type_name(v));
-}
-
 static bool bi_bigint(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc != 1) return vm_error(vm, "bigint() expects 1 argument");
     if (is_obj_type(argv[0], OBJ_BIGINT)) { *out = argv[0]; return true; }
     ZrBigInt b;
     zr_bi_init(&b);
-    if (argv[0].tag == VAL_I64) {
-        zr_bi_from_i64(&b, argv[0].as.i64);
-        *out = pb_bigint_new_take(vm, &b);
-        return true;
-    }
     if (argv[0].tag == VAL_NUM) {
         if (!isfinite(argv[0].as.num)) return vm_error(vm, "bigint(): non-finite number");
         zr_bi_from_i64(&b, (int64_t)trunc(argv[0].as.num));
@@ -416,93 +401,53 @@ static bool bi_checked_div(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_bit_and(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 2) return vm_error(vm, "bit_and() expects 2 arguments");
-    if (argv[0].tag == VAL_I64 || argv[1].tag == VAL_I64) {
-        int64_t a = 0, b = 0;
-        if (!zr_req_i64(vm, "bit_and", argv[0], &a) || !zr_req_i64(vm, "bit_and", argv[1], &b)) return false;
-        *out = val_i64(a & b);
-        return true;
-    }
-    double a = 0.0, b = 0.0;
-    if (!zr_req_num(vm, "bit_and", argv[0], &a) || !zr_req_num(vm, "bit_and", argv[1], &b)) return false;
+    double a, b;
+    if (argc != 2 || !zr_req_num(vm, "bit_and", argv[0], &a) || !zr_req_num(vm, "bit_and", argv[1], &b)) return false;
     *out = val_num((double)((int64_t)a & (int64_t)b));
     return true;
 }
 
 static bool bi_bit_or(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 2) return vm_error(vm, "bit_or() expects 2 arguments");
-    if (argv[0].tag == VAL_I64 || argv[1].tag == VAL_I64) {
-        int64_t a = 0, b = 0;
-        if (!zr_req_i64(vm, "bit_or", argv[0], &a) || !zr_req_i64(vm, "bit_or", argv[1], &b)) return false;
-        *out = val_i64(a | b);
-        return true;
-    }
-    double a = 0.0, b = 0.0;
-    if (!zr_req_num(vm, "bit_or", argv[0], &a) || !zr_req_num(vm, "bit_or", argv[1], &b)) return false;
+    double a, b;
+    if (argc != 2 || !zr_req_num(vm, "bit_or", argv[0], &a) || !zr_req_num(vm, "bit_or", argv[1], &b)) return false;
     *out = val_num((double)((int64_t)a | (int64_t)b));
     return true;
 }
 
 static bool bi_bit_xor(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 2) return vm_error(vm, "bit_xor() expects 2 arguments");
-    if (argv[0].tag == VAL_I64 || argv[1].tag == VAL_I64) {
-        int64_t a = 0, b = 0;
-        if (!zr_req_i64(vm, "bit_xor", argv[0], &a) || !zr_req_i64(vm, "bit_xor", argv[1], &b)) return false;
-        *out = val_i64(a ^ b);
-        return true;
-    }
-    double a = 0.0, b = 0.0;
-    if (!zr_req_num(vm, "bit_xor", argv[0], &a) || !zr_req_num(vm, "bit_xor", argv[1], &b)) return false;
+    double a, b;
+    if (argc != 2 || !zr_req_num(vm, "bit_xor", argv[0], &a) || !zr_req_num(vm, "bit_xor", argv[1], &b)) return false;
     *out = val_num((double)((int64_t)a ^ (int64_t)b));
     return true;
 }
 
 static bool bi_bit_not(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 1) return vm_error(vm, "bit_not() expects 1 argument");
-    if (argv[0].tag == VAL_I64) { *out = val_i64(~argv[0].as.i64); return true; }
-    double a = 0.0;
-    if (!zr_req_num(vm, "bit_not", argv[0], &a)) return false;
+    double a;
+    if (argc != 1 || !zr_req_num(vm, "bit_not", argv[0], &a)) return false;
     *out = val_num((double)(~(int64_t)a));
     return true;
 }
 
 static bool bi_bit_shl(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 2) return vm_error(vm, "bit_shl() expects 2 arguments");
-    if (argv[0].tag == VAL_I64 || argv[1].tag == VAL_I64) {
-        int64_t a = 0, b = 0;
-        if (!zr_req_i64(vm, "bit_shl", argv[0], &a) || !zr_req_i64(vm, "bit_shl", argv[1], &b)) return false;
-        uint32_t sh = ((uint32_t)b) & 63u;
-        *out = val_i64((int64_t)(((uint64_t)a) << sh));
-        return true;
-    }
-    double a = 0.0, b = 0.0;
-    if (!zr_req_num(vm, "bit_shl", argv[0], &a) || !zr_req_num(vm, "bit_shl", argv[1], &b)) return false;
+    double a, b;
+    if (argc != 2 || !zr_req_num(vm, "bit_shl", argv[0], &a) || !zr_req_num(vm, "bit_shl", argv[1], &b)) return false;
     uint32_t sh = ((uint32_t)(int64_t)b) & 63u;
     *out = val_num((double)(int64_t)(((uint64_t)(int64_t)a) << sh));
     return true;
 }
 
 static bool bi_bit_shr(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 2) return vm_error(vm, "bit_shr() expects 2 arguments");
-    if (argv[0].tag == VAL_I64 || argv[1].tag == VAL_I64) {
-        int64_t a = 0, b = 0;
-        if (!zr_req_i64(vm, "bit_shr", argv[0], &a) || !zr_req_i64(vm, "bit_shr", argv[1], &b)) return false;
-        uint32_t sh = ((uint32_t)b) & 63u;
-        *out = val_i64(a >> sh);
-        return true;
-    }
-    double a = 0.0, b = 0.0;
-    if (!zr_req_num(vm, "bit_shr", argv[0], &a) || !zr_req_num(vm, "bit_shr", argv[1], &b)) return false;
+    double a, b;
+    if (argc != 2 || !zr_req_num(vm, "bit_shr", argv[0], &a) || !zr_req_num(vm, "bit_shr", argv[1], &b)) return false;
     uint32_t sh = ((uint32_t)(int64_t)b) & 63u;
     *out = val_num((double)(((int64_t)a) >> sh));
     return true;
 }
 
 static bool bi_num_to_le_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 1 || (argv[0].tag != VAL_NUM && argv[0].tag != VAL_I64)) return vm_error(vm, "num_to_le_bytes() expects 1 number");
+    if (argc != 1 || argv[0].tag != VAL_NUM) return vm_error(vm, "num_to_le_bytes() expects 1 number");
     uint64_t bits = 0;
-    if (argv[0].tag == VAL_I64) bits = (uint64_t)argv[0].as.i64;
-    else memcpy(&bits, &argv[0].as.num, 8);
+    memcpy(&bits, &argv[0].as.num, 8);
     PbArray *a = pb_array_new(vm, 8);
     vm_push_root(vm, val_obj(a));
     for (int i = 0; i < 8; i++) {
@@ -519,9 +464,8 @@ static bool bi_num_from_le_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out
     if (a->len == 8) {
         uint64_t bits = 0;
         for (int i = 0; i < 8; i++) {
-            int64_t bv = 0;
-            if (!zr_req_i64(vm, "num_from_le_bytes", a->items[i], &bv)) return false;
-            bits |= ((uint64_t)((uint8_t)bv)) << (i * 8);
+            if (a->items[i].tag != VAL_NUM) return vm_error(vm, "num_from_le_bytes(): element must be number");
+            bits |= ((uint64_t)((uint8_t)a->items[i].as.num)) << (i * 8);
         }
         double d = 0.0;
         memcpy(&d, &bits, 8);
@@ -531,9 +475,8 @@ static bool bi_num_from_le_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out
     if (a->len >= 1 && a->len <= 4) {
         uint64_t v = 0;
         for (size_t i = 0; i < a->len; i++) {
-            int64_t bv = 0;
-            if (!zr_req_i64(vm, "le_bytes_to_num", a->items[i], &bv)) return false;
-            v |= ((uint64_t)((uint8_t)bv)) << (i * 8);
+            if (a->items[i].tag != VAL_NUM) return vm_error(vm, "le_bytes_to_num(): element must be number");
+            v |= ((uint64_t)((uint8_t)a->items[i].as.num)) << (i * 8);
         }
         *out = val_num((double)v);
         return true;
@@ -590,18 +533,18 @@ static bool bi_len(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 
 static bool bi_slice(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc < 2 || argc > 3) return vm_error(vm, "slice(seq, start[, end]) expects 2 or 3 arguments");
-    int64_t st_in = 0, en_in = 0;
-    bool has_en = (argc == 3 && argv[2].tag != VAL_NIL);
-    if (!zr_req_i64(vm, "slice", argv[1], &st_in)) return false;
-    if (has_en && !zr_req_i64(vm, "slice", argv[2], &en_in)) return false;
+    if (argv[1].tag != VAL_NUM) return vm_error(vm, "slice(): start index must be a number");
+    if (argc == 3 && argv[2].tag != VAL_NUM && argv[2].tag != VAL_NIL) {
+        return vm_error(vm, "slice(): end index must be a number");
+    }
     if (is_obj_type(argv[0], OBJ_BYTES)) {
         return bi_bytes_slice(vm, argc, argv, out);
     }
     if (is_obj_type(argv[0], OBJ_ARRAY)) {
         PbArray *src = AS_ARRAY(argv[0]);
         int64_t n = (int64_t)src->len;
-        int64_t st = st_in;
-        int64_t en = has_en ? en_in : n;
+        int64_t st = (int64_t)argv[1].as.num;
+        int64_t en = (argc == 3 && argv[2].tag == VAL_NUM) ? (int64_t)argv[2].as.num : n;
         if (st < 0) st += n;
         if (en < 0) en += n;
         if (st < 0) st = 0;
@@ -621,8 +564,8 @@ static bool bi_slice(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (is_obj_type(argv[0], OBJ_STR)) {
         PbStr *s = AS_STR(argv[0]);
         int64_t n = (int64_t)zr_utf8_char_len(s->chars, s->len);
-        int64_t st = st_in;
-        int64_t en = has_en ? en_in : n;
+        int64_t st = (int64_t)argv[1].as.num;
+        int64_t en = (argc == 3 && argv[2].tag == VAL_NUM) ? (int64_t)argv[2].as.num : n;
         if (st < 0) st += n;
         if (en < 0) en += n;
         if (st < 0) st = 0;
@@ -644,9 +587,7 @@ static bool bi_slice(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_str_slice(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 3 || !is_obj_type(argv[0], OBJ_STR) ||
-        (argv[1].tag != VAL_NUM && argv[1].tag != VAL_I64) ||
-        (argv[2].tag != VAL_NUM && argv[2].tag != VAL_I64)) {
+    if (argc != 3 || !is_obj_type(argv[0], OBJ_STR) || argv[1].tag != VAL_NUM || argv[2].tag != VAL_NUM) {
         return vm_error(vm, "str_slice(s, start, end) expects (string, number, number)");
     }
     return bi_slice(vm, 3, argv, out);
@@ -840,28 +781,12 @@ static bool bi_str_lower(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     ZrBuf b;
     zr_buf_init(&b);
     size_t pos = 0;
-    bool prev_cased = false;
     while (pos < s->len) {
         size_t adv = 1;
         uint32_t cp = zr_utf8_decode(s->chars + pos, s->len - pos, &adv);
         pos += adv ? adv : 1;
-        uint32_t lo = zr_cp_to_lower(cp);
-        if (cp == 0x03A3 && prev_cased) { /* Greek Final_Sigma (Σ -> ς when word-final) */
-            size_t la = pos;
-            bool next_cased = false;
-            while (la < s->len) {
-                size_t ladv = 1;
-                uint32_t ncp = zr_utf8_decode(s->chars + la, s->len - la, &ladv);
-                la += ladv ? ladv : 1;
-                if (zr_is_unicode_case_ignorable(ncp)) continue;
-                next_cased = zr_is_unicode_cased_letter(ncp);
-                break;
-            }
-            if (!next_cased) lo = 0x03C2; /* ς */
-        }
-        if (!zr_is_unicode_case_ignorable(cp)) prev_cased = zr_is_unicode_cased_letter(cp);
         char u8[4];
-        size_t ul = zr_utf8_encode(lo, u8);
+        size_t ul = zr_utf8_encode(zr_cp_to_lower(cp), u8);
         zr_buf_append(&b, u8, ul);
     }
     PbValue r = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
@@ -1324,11 +1249,15 @@ static bool bi_range(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc < 1 || argc > 3) return vm_error(vm, "range([start,] stop[, step]) expects 1..3 arguments");
     double st = 0.0, en = 0.0, step = 1.0;
     if (argc == 1) {
-        if (!zr_req_num(vm, "range", argv[0], &en)) return false;
+        if (argv[0].tag != VAL_NUM) return vm_error(vm, "range(): expected numeric bound");
+        en = argv[0].as.num;
     } else {
-        if (!zr_req_num(vm, "range", argv[0], &st) || !zr_req_num(vm, "range", argv[1], &en)) return false;
+        if (argv[0].tag != VAL_NUM || argv[1].tag != VAL_NUM) return vm_error(vm, "range(): expected numeric bounds");
+        st = argv[0].as.num;
+        en = argv[1].as.num;
         if (argc == 3) {
-            if (!zr_req_num(vm, "range", argv[2], &step) || step == 0.0) return vm_error(vm, "range(): step must be non-zero number");
+            if (argv[2].tag != VAL_NUM || argv[2].as.num == 0.0) return vm_error(vm, "range(): step must be non-zero number");
+            step = argv[2].as.num;
         }
     }
     PbArray *arr = pb_array_new(vm, 16);
@@ -1488,7 +1417,7 @@ static bool bi_is_frozen(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 
 static bool bi_is_nil(PbVM *vm, int argc, PbValue *argv, PbValue *out)    { if (argc != 1) return vm_error(vm, "is_nil() expects 1 arg"); *out = val_bool(argv[0].tag == VAL_NIL); return true; }
 static bool bi_is_bool(PbVM *vm, int argc, PbValue *argv, PbValue *out)   { if (argc != 1) return vm_error(vm, "is_bool() expects 1 arg"); *out = val_bool(argv[0].tag == VAL_BOOL); return true; }
-static bool bi_is_number(PbVM *vm, int argc, PbValue *argv, PbValue *out) { if (argc != 1) return vm_error(vm, "is_number() expects 1 arg"); *out = val_bool(argv[0].tag == VAL_NUM || argv[0].tag == VAL_I64); return true; }
+static bool bi_is_number(PbVM *vm, int argc, PbValue *argv, PbValue *out) { if (argc != 1) return vm_error(vm, "is_number() expects 1 arg"); *out = val_bool(argv[0].tag == VAL_NUM); return true; }
 static bool bi_is_string(PbVM *vm, int argc, PbValue *argv, PbValue *out) { if (argc != 1) return vm_error(vm, "is_string() expects 1 arg"); *out = val_bool(is_obj_type(argv[0], OBJ_STR)); return true; }
 static bool bi_is_array(PbVM *vm, int argc, PbValue *argv, PbValue *out)  { if (argc != 1) return vm_error(vm, "is_array() expects 1 arg"); *out = val_bool(is_obj_type(argv[0], OBJ_ARRAY)); return true; }
 static bool bi_is_map(PbVM *vm, int argc, PbValue *argv, PbValue *out)    { if (argc != 1) return vm_error(vm, "is_map() expects 1 arg"); *out = val_bool(is_obj_type(argv[0], OBJ_MAP)); return true; }
@@ -1546,7 +1475,7 @@ static bool bi_gc_stats(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 
 static bool bi_gc_stats_map(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     (void)argc; (void)argv;
-    PbMap *m = pb_map_new_raw(vm, 16);
+    PbMap *m = pb_map_new_raw(vm, 12);
     vm_push_root(vm, val_obj(m));
     pb_map_set_cstr(vm, m, "string_allocs", val_num((double)vm->string_allocs));
     pb_map_set_cstr(vm, m, "array_allocs", val_num((double)vm->array_allocs));
@@ -1556,43 +1485,17 @@ static bool bi_gc_stats_map(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     pb_map_set_cstr(vm, m, "collections", val_num((double)vm->gc_collections));
     pb_map_set_cstr(vm, m, "nursery_collections", val_num((double)vm->nursery_collections));
     pb_map_set_cstr(vm, m, "full_collections", val_num((double)vm->full_collections));
-    pb_map_set_cstr(vm, m, "slab_count", val_i64((int64_t)vm->gc_slab_len));
-    pb_map_set_cstr(vm, m, "slab_decommits", val_i64((int64_t)vm->os_pages_reclaimed));
-    pb_map_set_cstr(vm, m, "intern_count", val_i64((int64_t)vm->intern_hits));
     vm_pop_roots(vm, 1);
     *out = val_obj(m);
     return true;
 }
 
 /* ============================================================================
- * 4. Linear-Time O(M * N) Zero-ReDoS Thompson NFA / PikeVM Regex Engine
- *    (Full UTF-8, Capturing Groups, Unicode \p{Greek}/\p{L}/\p{N}, 64-Slot LRU)
+ * 4. Portable Zero-Dependency C99 Regex Engine (UTF-8 + Capturing Groups)
  * ============================================================================ */
 
-#define ZR_RE_MAX_GROUPS     16
-#define ZR_RE_MAX_QUANT_REP  1024
-#define ZR_RE_MAX_INSTS      16384
-#define ZR_RE_CACHE_SLOTS    64
-
-/* Shorthand & Unicode Property Bitmask Flags */
-#define ZR_SH_D        (1u << 0)
-#define ZR_SH_ND       (1u << 1)
-#define ZR_SH_W        (1u << 2)
-#define ZR_SH_NW       (1u << 3)
-#define ZR_SH_S        (1u << 4)
-#define ZR_SH_NS       (1u << 5)
-#define ZR_SH_GREEK    (1u << 6)
-#define ZR_SH_NGREEK   (1u << 7)
-#define ZR_SH_LETTER   (1u << 8)
-#define ZR_SH_NLETTER  (1u << 9)
-#define ZR_SH_NUM      (1u << 10)
-#define ZR_SH_NNUM     (1u << 11)
-#define ZR_SH_LATIN    (1u << 12)
-#define ZR_SH_NLATIN   (1u << 13)
-#define ZR_SH_CYR      (1u << 14)
-#define ZR_SH_NCYR     (1u << 15)
-#define ZR_SH_ASCII    (1u << 16)
-#define ZR_SH_NASCII   (1u << 17)
+#define ZR_RE_MAX_GROUPS 16
+#define ZR_RE_STEP_LIMIT 500000
 
 typedef enum {
     RE_ANY = 1,
@@ -1620,7 +1523,7 @@ struct ZrReNode {
     bool         neg_class;
     ZrReRange   *ranges;
     size_t       n_ranges;
-    uint32_t     sh_mask;
+    uint8_t      shorthand; /* 'd','D','w','W','s','S', or 0 */
     int          group_idx; /* -1 for (?:...), 1..15 for (...) */
     ZrReNode   **kids;
     size_t       n_kids;
@@ -1629,30 +1532,6 @@ struct ZrReNode {
     bool         lazy;
 };
 
-typedef enum {
-    PIKE_CHAR = 1,
-    PIKE_CLASS,
-    PIKE_ANY,      /* [^\n] */
-    PIKE_ANY_ALL,  /* [\s\S] for unanchored search prefix */
-    PIKE_BOL,
-    PIKE_EOL,
-    PIKE_WB,
-    PIKE_NWB,
-    PIKE_SAVE,
-    PIKE_JMP,
-    PIKE_SPLIT,
-    PIKE_MATCH
-} ZrPikeOp;
-
-typedef struct {
-    ZrPikeOp        op;
-    uint32_t        ch;
-    const ZrReNode *cls;
-    int             save_slot;
-    uint32_t        x;
-    uint32_t        y;
-} ZrPikeInst;
-
 typedef struct {
     const char *pat;
     size_t      len;
@@ -1660,9 +1539,6 @@ typedef struct {
     int         next_group;
     bool        case_insens;
     ZrArena     arena;
-    ZrPikeInst *insts;
-    uint32_t    inst_len;
-    uint32_t    inst_cap;
     char        err[128];
 } ZrReCompiler;
 
@@ -1691,45 +1567,8 @@ static uint32_t zr_re_next_cp(const char *s, size_t len, size_t *pos) {
     return cp;
 }
 
-static uint32_t zr_re_parse_prop_mask(ZrReCompiler *rc, bool neg_p) {
-    if (rc->pos >= rc->len || rc->pat[rc->pos] != '{') {
-        snprintf(rc->err, sizeof(rc->err), "expected '{' after \\p / \\P in regex");
-        return 0;
-    }
-    rc->pos++;
-    size_t st = rc->pos;
-    while (rc->pos < rc->len && rc->pat[rc->pos] != '}') rc->pos++;
-    if (rc->pos >= rc->len) {
-        snprintf(rc->err, sizeof(rc->err), "unclosed '\\p{...}' in regex");
-        return 0;
-    }
-    size_t n = rc->pos - st;
-    const char *p = rc->pat + st;
-    rc->pos++; /* consume '}' */
-    if ((n == 5 && strncasecmp(p, "Greek", 5) == 0) || (n == 4 && strncasecmp(p, "Grek", 4) == 0)) {
-        return neg_p ? ZR_SH_NGREEK : ZR_SH_GREEK;
-    }
-    if ((n == 1 && (p[0] == 'L' || p[0] == 'l')) || (n == 6 && strncasecmp(p, "Letter", 6) == 0)) {
-        return neg_p ? ZR_SH_NLETTER : ZR_SH_LETTER;
-    }
-    if ((n == 1 && (p[0] == 'N' || p[0] == 'n')) || (n == 6 && strncasecmp(p, "Number", 6) == 0) || (n == 2 && strncasecmp(p, "Nd", 2) == 0)) {
-        return neg_p ? ZR_SH_NNUM : ZR_SH_NUM;
-    }
-    if ((n == 5 && strncasecmp(p, "Latin", 5) == 0) || (n == 4 && strncasecmp(p, "Latn", 4) == 0)) {
-        return neg_p ? ZR_SH_NLATIN : ZR_SH_LATIN;
-    }
-    if ((n == 8 && strncasecmp(p, "Cyrillic", 8) == 0) || (n == 4 && strncasecmp(p, "Cyrl", 4) == 0)) {
-        return neg_p ? ZR_SH_NCYR : ZR_SH_CYR;
-    }
-    if (n == 5 && strncasecmp(p, "ASCII", 5) == 0) {
-        return neg_p ? ZR_SH_NASCII : ZR_SH_ASCII;
-    }
-    snprintf(rc->err, sizeof(rc->err), "unknown Unicode property in \\p{...}");
-    return 0;
-}
-
-static uint32_t zr_re_parse_esc_char(ZrReCompiler *rc, uint32_t *out_sh_mask) {
-    *out_sh_mask = 0;
+static uint32_t zr_re_parse_esc_char(ZrReCompiler *rc, uint8_t *out_short) {
+    *out_short = 0;
     if (rc->pos >= rc->len) return '\\';
     uint32_t c = zr_re_next_cp(rc->pat, rc->len, &rc->pos);
     switch (c) {
@@ -1737,14 +1576,9 @@ static uint32_t zr_re_parse_esc_char(ZrReCompiler *rc, uint32_t *out_sh_mask) {
         case 'r': return '\r';
         case 't': return '\t';
         case '0': return 0;
-        case 'd': *out_sh_mask = ZR_SH_D;  return 0;
-        case 'D': *out_sh_mask = ZR_SH_ND; return 0;
-        case 'w': *out_sh_mask = ZR_SH_W;  return 0;
-        case 'W': *out_sh_mask = ZR_SH_NW; return 0;
-        case 's': *out_sh_mask = ZR_SH_S;  return 0;
-        case 'S': *out_sh_mask = ZR_SH_NS; return 0;
-        case 'p': *out_sh_mask = zr_re_parse_prop_mask(rc, false); return 0;
-        case 'P': *out_sh_mask = zr_re_parse_prop_mask(rc, true);  return 0;
+        case 'd': case 'D': case 'w': case 'W': case 's': case 'S':
+            *out_short = (uint8_t)c;
+            return 0;
         case 'x': {
             if (rc->pos + 2 <= rc->len) {
                 int h1 = zr_hex_val(rc->pat[rc->pos]), h2 = zr_hex_val(rc->pat[rc->pos + 1]);
@@ -1770,18 +1604,24 @@ static ZrReNode *zr_re_parse_class(ZrReCompiler *rc) {
     while (rc->pos < rc->len) {
         if (!first && rc->pat[rc->pos] == ']') { rc->pos++; break; }
         first = false;
-        uint32_t sh1 = 0;
+        uint8_t sh1 = 0;
         uint32_t c1 = (rc->pat[rc->pos] == '\\') ? (rc->pos++, zr_re_parse_esc_char(rc, &sh1)) : zr_re_next_cp(rc->pat, rc->len, &rc->pos);
-        if (rc->err[0]) return NULL;
         if (sh1) {
-            n->sh_mask |= sh1;
+            if (sh1 == 'd' && nr < 126) { tmp[nr].lo = '0'; tmp[nr].hi = '9'; nr++; }
+            else if (sh1 == 's' && nr < 120) {
+                tmp[nr++] = (ZrReRange){' ', ' '}; tmp[nr++] = (ZrReRange){'\t', '\r'};
+            } else if (sh1 == 'w' && nr < 120) {
+                tmp[nr++] = (ZrReRange){'a', 'z'}; tmp[nr++] = (ZrReRange){'A', 'Z'};
+                tmp[nr++] = (ZrReRange){'0', '9'}; tmp[nr++] = (ZrReRange){'_', '_'};
+            } else {
+                n->shorthand = sh1;
+            }
             continue;
         }
         if (rc->pos + 1 < rc->len && rc->pat[rc->pos] == '-' && rc->pat[rc->pos + 1] != ']') {
             rc->pos++;
-            uint32_t sh2 = 0;
+            uint8_t sh2 = 0;
             uint32_t c2 = (rc->pat[rc->pos] == '\\') ? (rc->pos++, zr_re_parse_esc_char(rc, &sh2)) : zr_re_next_cp(rc->pat, rc->len, &rc->pos);
-            if (rc->err[0]) return NULL;
             if (nr < 127) { tmp[nr].lo = c1 <= c2 ? c1 : c2; tmp[nr].hi = c1 <= c2 ? c2 : c1; nr++; }
         } else {
             if (nr < 127) { tmp[nr].lo = c1; tmp[nr].hi = c1; nr++; }
@@ -1821,7 +1661,7 @@ static ZrReNode *zr_re_parse_atom(ZrReCompiler *rc) {
             if (rc->next_group < ZR_RE_MAX_GROUPS) gidx = rc->next_group++;
         }
         ZrReNode *inner = zr_re_parse_alt(rc);
-        if (!inner) { if (!rc->err[0]) snprintf(rc->err, sizeof(rc->err), "invalid regex group"); return NULL; }
+        if (!inner) { snprintf(rc->err, sizeof(rc->err), "invalid regex group"); return NULL; }
         if (rc->pos >= rc->len || rc->pat[rc->pos] != ')') {
             snprintf(rc->err, sizeof(rc->err), "unclosed '(' in regex");
             return NULL;
@@ -1840,12 +1680,11 @@ static ZrReNode *zr_re_parse_atom(ZrReCompiler *rc) {
             char wb = rc->pat[rc->pos++];
             return zr_re_alloc(rc, wb == 'b' ? RE_WB : RE_NWB);
         }
-        uint32_t sh = 0;
+        uint8_t sh = 0;
         uint32_t ec = zr_re_parse_esc_char(rc, &sh);
-        if (rc->err[0]) return NULL;
         if (sh) {
             ZrReNode *cl = zr_re_alloc(rc, RE_CLASS);
-            cl->sh_mask = sh;
+            cl->shorthand = sh;
             return cl;
         }
         ZrReNode *ch = zr_re_alloc(rc, RE_CHAR);
@@ -1874,31 +1713,23 @@ static ZrReNode *zr_re_parse_piece(ZrReCompiler *rc) {
             int mn = 0, mx = 0;
             bool has_d = false;
             while (save < rc->len && isdigit((unsigned char)rc->pat[save])) {
-                if (mn <= ZR_RE_MAX_QUANT_REP) mn = mn * 10 + (rc->pat[save] - '0');
-                save++;
+                mn = mn * 10 + (rc->pat[save++] - '0');
                 has_d = true;
             }
             if (has_d && save < rc->len) {
                 if (rc->pat[save] == '}') {
-                    if (mn > ZR_RE_MAX_QUANT_REP) { snprintf(rc->err, sizeof(rc->err), "regex quantifier exceeds %d", ZR_RE_MAX_QUANT_REP); return NULL; }
                     a->qmin = mn; a->qmax = mn; rc->pos = save + 1;
                 } else if (rc->pat[save] == ',') {
                     save++;
                     if (save < rc->len && rc->pat[save] == '}') {
-                        if (mn > ZR_RE_MAX_QUANT_REP) { snprintf(rc->err, sizeof(rc->err), "regex quantifier exceeds %d", ZR_RE_MAX_QUANT_REP); return NULL; }
                         a->qmin = mn; a->qmax = -1; rc->pos = save + 1;
                     } else {
                         bool hd2 = false;
                         while (save < rc->len && isdigit((unsigned char)rc->pat[save])) {
-                            if (mx <= ZR_RE_MAX_QUANT_REP) mx = mx * 10 + (rc->pat[save] - '0');
-                            save++;
+                            mx = mx * 10 + (rc->pat[save++] - '0');
                             hd2 = true;
                         }
                         if (hd2 && save < rc->len && rc->pat[save] == '}') {
-                            if (mn > ZR_RE_MAX_QUANT_REP || mx > ZR_RE_MAX_QUANT_REP || mx < mn) {
-                                snprintf(rc->err, sizeof(rc->err), "invalid regex quantifier range");
-                                return NULL;
-                            }
                             a->qmin = mn; a->qmax = mx; rc->pos = save + 1;
                         }
                     }
@@ -1951,255 +1782,28 @@ static ZrReNode *zr_re_parse_alt(ZrReCompiler *rc) {
     return alt;
 }
 
-/* ---- PikeVM Compiler & Linear-Time Thompson NFA Executor ---- */
-
-static uint32_t zr_pike_emit(ZrReCompiler *rc, ZrPikeOp op) {
-    if (rc->inst_len >= ZR_RE_MAX_INSTS) {
-        if (!rc->err[0]) snprintf(rc->err, sizeof(rc->err), "compiled regex exceeds %d NFA states", ZR_RE_MAX_INSTS);
-        return 0;
-    }
-    if (rc->inst_len >= rc->inst_cap) {
-        rc->inst_cap = rc->inst_cap ? rc->inst_cap * 2 : 64;
-        rc->insts = (ZrPikeInst *)zr_xrealloc(rc->insts, rc->inst_cap * sizeof(ZrPikeInst));
-    }
-    uint32_t idx = rc->inst_len++;
-    memset(&rc->insts[idx], 0, sizeof(ZrPikeInst));
-    rc->insts[idx].op = op;
-    return idx;
-}
-
-static void zr_pike_compile_node(ZrReCompiler *rc, const ZrReNode *n);
-
-static void zr_pike_compile_single(ZrReCompiler *rc, const ZrReNode *n) {
-    if (rc->err[0]) return;
-    switch (n->kind) {
-        case RE_BOL:   (void)zr_pike_emit(rc, PIKE_BOL); break;
-        case RE_EOL:   (void)zr_pike_emit(rc, PIKE_EOL); break;
-        case RE_WB:    (void)zr_pike_emit(rc, PIKE_WB);  break;
-        case RE_NWB:   (void)zr_pike_emit(rc, PIKE_NWB); break;
-        case RE_ANY:   (void)zr_pike_emit(rc, PIKE_ANY); break;
-        case RE_CHAR: {
-            uint32_t i = zr_pike_emit(rc, PIKE_CHAR);
-            rc->insts[i].ch = n->ch;
-            break;
-        }
-        case RE_CLASS: {
-            uint32_t i = zr_pike_emit(rc, PIKE_CLASS);
-            rc->insts[i].cls = n;
-            break;
-        }
-        case RE_SEQ:
-            for (size_t k = 0; k < n->n_kids && !rc->err[0]; k++) zr_pike_compile_node(rc, n->kids[k]);
-            break;
-        case RE_GROUP: {
-            if (n->group_idx >= 1 && n->group_idx < ZR_RE_MAX_GROUPS) {
-                uint32_t s0 = zr_pike_emit(rc, PIKE_SAVE);
-                rc->insts[s0].save_slot = n->group_idx * 2;
-            }
-            zr_pike_compile_node(rc, n->kids[0]);
-            if (n->group_idx >= 1 && n->group_idx < ZR_RE_MAX_GROUPS) {
-                uint32_t s1 = zr_pike_emit(rc, PIKE_SAVE);
-                rc->insts[s1].save_slot = n->group_idx * 2 + 1;
-            }
-            break;
-        }
-        case RE_ALT: {
-            if (n->n_kids == 0) break;
-            uint32_t end_jmps[64];
-            size_t n_jmps = 0;
-            for (size_t k = 0; k + 1 < n->n_kids; k++) {
-                uint32_t sp = zr_pike_emit(rc, PIKE_SPLIT);
-                uint32_t b_start = rc->inst_len;
-                zr_pike_compile_node(rc, n->kids[k]);
-                uint32_t jm = zr_pike_emit(rc, PIKE_JMP);
-                end_jmps[n_jmps++] = jm;
-                rc->insts[sp].x = b_start;
-                rc->insts[sp].y = rc->inst_len;
-            }
-            zr_pike_compile_node(rc, n->kids[n->n_kids - 1]);
-            uint32_t after = rc->inst_len;
-            for (size_t k = 0; k < n_jmps; k++) rc->insts[end_jmps[k]].x = after;
-            break;
-        }
-    }
-}
-
-static void zr_pike_compile_node(ZrReCompiler *rc, const ZrReNode *n) {
-    if (!n || rc->err[0]) return;
-    for (int r = 0; r < n->qmin && !rc->err[0]; r++) {
-        zr_pike_compile_single(rc, n);
-    }
-    if (rc->err[0]) return;
-    if (n->qmax == -1) {
-        if (n->qmin == 0) {
-            /* e* or e*? */
-            uint32_t l_sp = zr_pike_emit(rc, PIKE_SPLIT);
-            uint32_t l_body = rc->inst_len;
-            zr_pike_compile_single(rc, n);
-            uint32_t l_jmp = zr_pike_emit(rc, PIKE_JMP);
-            rc->insts[l_jmp].x = l_sp;
-            uint32_t l_after = rc->inst_len;
-            rc->insts[l_sp].x = n->lazy ? l_after : l_body;
-            rc->insts[l_sp].y = n->lazy ? l_body  : l_after;
-        } else {
-            /* We already emitted qmin copies; append an optional e* tail */
-            uint32_t l_sp = zr_pike_emit(rc, PIKE_SPLIT);
-            uint32_t l_body = rc->inst_len;
-            zr_pike_compile_single(rc, n);
-            uint32_t l_jmp = zr_pike_emit(rc, PIKE_JMP);
-            rc->insts[l_jmp].x = l_sp;
-            uint32_t l_after = rc->inst_len;
-            rc->insts[l_sp].x = n->lazy ? l_after : l_body;
-            rc->insts[l_sp].y = n->lazy ? l_body  : l_after;
-        }
-    } else if (n->qmax > n->qmin) {
-        int opt_n = n->qmax - n->qmin;
-        uint32_t after_splits[ZR_RE_MAX_QUANT_REP];
-        for (int r = 0; r < opt_n && !rc->err[0]; r++) {
-            uint32_t sp = zr_pike_emit(rc, PIKE_SPLIT);
-            after_splits[r] = sp;
-            uint32_t l_body = rc->inst_len;
-            zr_pike_compile_single(rc, n);
-            rc->insts[sp].x = n->lazy ? 0 : l_body;
-            rc->insts[sp].y = n->lazy ? l_body : 0;
-        }
-        uint32_t l_after = rc->inst_len;
-        for (int r = 0; r < opt_n; r++) {
-            if (n->lazy) rc->insts[after_splits[r]].x = l_after;
-            else         rc->insts[after_splits[r]].y = l_after;
-        }
-    }
-}
-
 typedef struct {
-    bool       used;
-    uint64_t   lru_tick;
-    char      *pat_str;
-    size_t     pat_len;
-    ZrArena    arena;
-    ZrPikeInst *insts;
-    uint32_t   inst_len;
-    int        next_group;
-    bool       case_insens;
-} ZrReCacheEntry;
-
-#if defined(__GNUC__) || defined(__clang__)
-static __thread ZrReCacheEntry g_zr_re_cache[ZR_RE_CACHE_SLOTS];
-static __thread uint64_t       g_zr_re_lru_clock = 0;
-#else
-static ZrReCacheEntry g_zr_re_cache[ZR_RE_CACHE_SLOTS];
-static uint64_t       g_zr_re_lru_clock = 0;
-#endif
-
-static const ZrReCacheEntry *zr_re_get_compiled(PbVM *vm, const PbStr *pat) {
-    for (int i = 0; i < ZR_RE_CACHE_SLOTS; i++) {
-        ZrReCacheEntry *ce = &g_zr_re_cache[i];
-        if (ce->used && ce->pat_len == pat->len && memcmp(ce->pat_str, pat->chars, pat->len) == 0) {
-            ce->lru_tick = ++g_zr_re_lru_clock;
-            return ce;
-        }
-    }
-
-    ZrReCompiler rc;
-    memset(&rc, 0, sizeof(rc));
-    rc.pat = pat->chars;
-    rc.len = pat->len;
-    rc.next_group = 1;
-    zr_arena_init(&rc.arena);
-
-    ZrReNode *root = zr_re_parse_alt(&rc);
-    if (!root || rc.err[0] || rc.pos < rc.len) {
-        zr_arena_free(&rc.arena);
-        free(rc.insts);
-        vm_error(vm, "regex error: %s", rc.err[0] ? rc.err : "unexpected ')' in pattern");
-        return NULL;
-    }
-
-    /* Emit unanchored search prefix:
-     *   0: SPLIT 3, 1
-     *   1: ANY_ALL
-     *   2: JMP 0
-     *   3: SAVE 0
-     *   ... <root> ...
-     *   k: SAVE 1
-     *   k+1: MATCH
-     */
-    uint32_t l0 = zr_pike_emit(&rc, PIKE_SPLIT);
-    uint32_t l_step = zr_pike_emit(&rc, PIKE_ANY_ALL);
-    uint32_t l_jmp = zr_pike_emit(&rc, PIKE_JMP);
-    uint32_t l_body = zr_pike_emit(&rc, PIKE_SAVE);
-    rc.insts[l0].x = l_body;
-    rc.insts[l0].y = l_step;
-    rc.insts[l_jmp].x = l0;
-    rc.insts[l_body].save_slot = 0;
-
-    zr_pike_compile_node(&rc, root);
-    uint32_t l_s1 = zr_pike_emit(&rc, PIKE_SAVE);
-    rc.insts[l_s1].save_slot = 1;
-    (void)zr_pike_emit(&rc, PIKE_MATCH);
-
-    if (rc.err[0]) {
-        zr_arena_free(&rc.arena);
-        free(rc.insts);
-        vm_error(vm, "regex error: %s", rc.err);
-        return NULL;
-    }
-
-    int victim = 0;
-    for (int i = 0; i < ZR_RE_CACHE_SLOTS; i++) {
-        if (!g_zr_re_cache[i].used) { victim = i; break; }
-        if (g_zr_re_cache[i].lru_tick < g_zr_re_cache[victim].lru_tick) victim = i;
-    }
-    ZrReCacheEntry * dst = &g_zr_re_cache[victim];
-    if (dst->used) {
-        free(dst->pat_str);
-        zr_arena_free(&dst->arena);
-        free(dst->insts);
-    }
-    dst->used = true;
-    dst->lru_tick = ++g_zr_re_lru_clock;
-    dst->pat_str = (char *)zr_xmalloc(pat->len + 1);
-    memcpy(dst->pat_str, pat->chars, pat->len);
-    dst->pat_str[pat->len] = '\0';
-    dst->pat_len = pat->len;
-    dst->arena = rc.arena;
-    dst->insts = rc.insts;
-    dst->inst_len = rc.inst_len;
-    dst->next_group = rc.next_group;
-    dst->case_insens = rc.case_insens;
-    return dst;
-}
-
-typedef struct {
-    ssize_t g_start[ZR_RE_MAX_GROUPS];
-    ssize_t g_end[ZR_RE_MAX_GROUPS];
+    const char *s;
+    size_t      len;
+    bool        case_insens;
+    int         steps;
+    ssize_t     g_start[ZR_RE_MAX_GROUPS];
+    ssize_t     g_end[ZR_RE_MAX_GROUPS];
 } ZrReExec;
-
-static bool zr_re_match_shorthand(uint32_t mask, uint32_t cp) {
-    if ((mask & ZR_SH_D)       && zr_re_is_digit(cp)) return true;
-    if ((mask & ZR_SH_ND)      && !zr_re_is_digit(cp)) return true;
-    if ((mask & ZR_SH_W)       && zr_re_is_word(cp)) return true;
-    if ((mask & ZR_SH_NW)      && !zr_re_is_word(cp)) return true;
-    if ((mask & ZR_SH_S)       && zr_re_is_space(cp)) return true;
-    if ((mask & ZR_SH_NS)      && !zr_re_is_space(cp)) return true;
-    if ((mask & ZR_SH_GREEK)   && zr_cp_is_greek(cp)) return true;
-    if ((mask & ZR_SH_NGREEK)  && !zr_cp_is_greek(cp)) return true;
-    if ((mask & ZR_SH_LETTER)  && zr_cp_script(cp) != 0) return true;
-    if ((mask & ZR_SH_NLETTER) && zr_cp_script(cp) == 0) return true;
-    if ((mask & ZR_SH_NUM)     && ((cp >= '0' && cp <= '9') || (cp >= 0x0660 && cp <= 0x0669))) return true;
-    if ((mask & ZR_SH_NNUM)    && !((cp >= '0' && cp <= '9') || (cp >= 0x0660 && cp <= 0x0669))) return true;
-    if ((mask & ZR_SH_LATIN)   && zr_cp_script(cp) == 1) return true;
-    if ((mask & ZR_SH_NLATIN)  && zr_cp_script(cp) != 1) return true;
-    if ((mask & ZR_SH_CYR)     && zr_cp_script(cp) == 3) return true;
-    if ((mask & ZR_SH_NCYR)    && zr_cp_script(cp) != 3) return true;
-    if ((mask & ZR_SH_ASCII)   && cp <= 0x7Fu) return true;
-    if ((mask & ZR_SH_NASCII)  && cp > 0x7Fu) return true;
-    return false;
-}
 
 static bool zr_re_match_class(const ZrReNode *n, uint32_t cp, bool ci) {
     uint32_t tcp = ci ? zr_cp_to_lower(cp) : cp;
-    bool hit = (n->sh_mask != 0) ? zr_re_match_shorthand(n->sh_mask, cp) : false;
+    bool hit = false;
+    if (n->shorthand) {
+        switch (n->shorthand) {
+            case 'd': hit = zr_re_is_digit(cp); break;
+            case 'D': hit = !zr_re_is_digit(cp); break;
+            case 'w': hit = zr_re_is_word(cp); break;
+            case 'W': hit = !zr_re_is_word(cp); break;
+            case 's': hit = zr_re_is_space(cp); break;
+            case 'S': hit = !zr_re_is_space(cp); break;
+        }
+    }
     for (size_t i = 0; i < n->n_ranges && !hit; i++) {
         uint32_t lo = ci ? zr_cp_to_lower(n->ranges[i].lo) : n->ranges[i].lo;
         uint32_t hi = ci ? zr_cp_to_lower(n->ranges[i].hi) : n->ranges[i].hi;
@@ -2223,159 +1827,167 @@ static bool zr_re_at_word_boundary(const char *s, size_t len, size_t pos) {
     return left_w != right_w;
 }
 
-typedef struct {
-    uint32_t pc;
-    ssize_t  saves[ZR_RE_MAX_GROUPS * 2];
-} ZrPikeThread;
+static bool zr_re_eval_seq(ZrReExec *ex, ZrReNode **kids, size_t idx, size_t n_kids, size_t pos, size_t *out_end);
+static bool zr_re_eval_single(ZrReExec *ex, const ZrReNode *n, size_t pos, size_t *out_end);
 
-typedef struct {
-    ZrPikeThread *th;
-    uint32_t      len;
-} ZrPikeList;
+static bool zr_re_eval_node_cont(ZrReExec *ex, ZrReNode **kids, size_t idx, size_t n_kids, int rep, size_t pos, size_t *out_end) {
+    if (++ex->steps > ZR_RE_STEP_LIMIT) return false;
+    const ZrReNode *n = kids[idx];
+    if (n->qmax != -1 && rep >= n->qmax) {
+        return zr_re_eval_seq(ex, kids, idx + 1, n_kids, pos, out_end);
+    }
+    if (rep < n->qmin) {
+        size_t mid = pos;
+        if (!zr_re_eval_single(ex, n, pos, &mid)) return false;
+        return zr_re_eval_node_cont(ex, kids, idx, n_kids, rep + 1, mid, out_end);
+    }
+    ssize_t save_gs[ZR_RE_MAX_GROUPS], save_ge[ZR_RE_MAX_GROUPS];
+    memcpy(save_gs, ex->g_start, sizeof(save_gs));
+    memcpy(save_ge, ex->g_end, sizeof(save_ge));
 
-static void zr_pike_add_thread(
-    const ZrReCacheEntry *prog,
-    ZrPikeList *list,
-    uint32_t *visited_gen,
-    uint32_t cur_gen,
-    uint32_t pc,
-    const ssize_t *saves,
-    const char *s,
-    size_t slen,
-    size_t pos
-) {
-    if (pc >= prog->inst_len || visited_gen[pc] == cur_gen) return;
-    visited_gen[pc] = cur_gen;
-    const ZrPikeInst *in = &prog->insts[pc];
-    switch (in->op) {
-        case PIKE_JMP:
-            zr_pike_add_thread(prog, list, visited_gen, cur_gen, in->x, saves, s, slen, pos);
-            return;
-        case PIKE_SPLIT:
-            zr_pike_add_thread(prog, list, visited_gen, cur_gen, in->x, saves, s, slen, pos);
-            zr_pike_add_thread(prog, list, visited_gen, cur_gen, in->y, saves, s, slen, pos);
-            return;
-        case PIKE_SAVE: {
-            ssize_t ns[ZR_RE_MAX_GROUPS * 2];
-            memcpy(ns, saves, sizeof(ns));
-            if (in->save_slot >= 0 && in->save_slot < ZR_RE_MAX_GROUPS * 2) ns[in->save_slot] = (ssize_t)pos;
-            zr_pike_add_thread(prog, list, visited_gen, cur_gen, pc + 1, ns, s, slen, pos);
-            return;
+    if (n->lazy) {
+        if (zr_re_eval_seq(ex, kids, idx + 1, n_kids, pos, out_end)) return true;
+        memcpy(ex->g_start, save_gs, sizeof(save_gs));
+        memcpy(ex->g_end, save_ge, sizeof(save_ge));
+        size_t mid = pos;
+        if (zr_re_eval_single(ex, n, pos, &mid) && mid > pos) {
+            if (zr_re_eval_node_cont(ex, kids, idx, n_kids, rep + 1, mid, out_end)) return true;
         }
-        case PIKE_BOL:
-            if (pos == 0) zr_pike_add_thread(prog, list, visited_gen, cur_gen, pc + 1, saves, s, slen, pos);
-            return;
-        case PIKE_EOL:
-            if (pos == slen) zr_pike_add_thread(prog, list, visited_gen, cur_gen, pc + 1, saves, s, slen, pos);
-            return;
-        case PIKE_WB:
-            if (zr_re_at_word_boundary(s, slen, pos)) zr_pike_add_thread(prog, list, visited_gen, cur_gen, pc + 1, saves, s, slen, pos);
-            return;
-        case PIKE_NWB:
-            if (!zr_re_at_word_boundary(s, slen, pos)) zr_pike_add_thread(prog, list, visited_gen, cur_gen, pc + 1, saves, s, slen, pos);
-            return;
-        default: {
-            ZrPikeThread *t = &list->th[list->len++];
-            t->pc = pc;
-            memcpy(t->saves, saves, sizeof(t->saves));
-            return;
+        memcpy(ex->g_start, save_gs, sizeof(save_gs));
+        memcpy(ex->g_end, save_ge, sizeof(save_ge));
+        return false;
+    } else {
+        size_t mid = pos;
+        if (zr_re_eval_single(ex, n, pos, &mid) && (mid > pos || rep < n->qmin)) {
+            if (zr_re_eval_node_cont(ex, kids, idx, n_kids, rep + 1, mid, out_end)) return true;
         }
+        memcpy(ex->g_start, save_gs, sizeof(save_gs));
+        memcpy(ex->g_end, save_ge, sizeof(save_ge));
+        return zr_re_eval_seq(ex, kids, idx + 1, n_kids, pos, out_end);
     }
 }
 
-static bool zr_pike_search(const ZrReCacheEntry *prog, const char *s, size_t len, size_t start_pos, ZrReExec *ex_out) {
-    for (int g = 0; g < ZR_RE_MAX_GROUPS; g++) { ex_out->g_start[g] = -1; ex_out->g_end[g] = -1; }
-    if (start_pos > len) return false;
+static bool zr_re_eval_seq(ZrReExec *ex, ZrReNode **kids, size_t idx, size_t n_kids, size_t pos, size_t *out_end) {
+    if (idx >= n_kids) { *out_end = pos; return true; }
+    return zr_re_eval_node_cont(ex, kids, idx, n_kids, 0, pos, out_end);
+}
 
-    uint32_t n_inst = prog->inst_len;
-    ZrPikeThread *buf_a = (ZrPikeThread *)zr_xmalloc(n_inst * sizeof(ZrPikeThread));
-    ZrPikeThread *buf_b = (ZrPikeThread *)zr_xmalloc(n_inst * sizeof(ZrPikeThread));
-    uint32_t *visited = (uint32_t *)zr_xcalloc(n_inst, sizeof(uint32_t));
-    uint32_t gen = 1;
+static bool zr_re_eval_single(ZrReExec *ex, const ZrReNode *n, size_t pos, size_t *out_end) {
+    if (++ex->steps > ZR_RE_STEP_LIMIT) return false;
+    switch (n->kind) {
+        case RE_BOL:
+            if (pos == 0) { *out_end = pos; return true; }
+            return false;
+        case RE_EOL:
+            if (pos == ex->len) { *out_end = pos; return true; }
+            return false;
+        case RE_WB:
+            if (zr_re_at_word_boundary(ex->s, ex->len, pos)) { *out_end = pos; return true; }
+            return false;
+        case RE_NWB:
+            if (!zr_re_at_word_boundary(ex->s, ex->len, pos)) { *out_end = pos; return true; }
+            return false;
+        case RE_ANY: {
+            if (pos >= ex->len) return false;
+            size_t adv = 1;
+            uint32_t cp = zr_utf8_decode(ex->s + pos, ex->len - pos, &adv);
+            if (cp == '\n') return false;
+            *out_end = pos + (adv ? adv : 1);
+            return true;
+        }
+        case RE_CHAR: {
+            if (pos >= ex->len) return false;
+            size_t adv = 1;
+            uint32_t cp = zr_utf8_decode(ex->s + pos, ex->len - pos, &adv);
+            bool eq = ex->case_insens ? (zr_cp_to_lower(cp) == zr_cp_to_lower(n->ch)) : (cp == n->ch);
+            if (!eq) return false;
+            *out_end = pos + (adv ? adv : 1);
+            return true;
+        }
+        case RE_CLASS: {
+            if (pos >= ex->len) return false;
+            size_t adv = 1;
+            uint32_t cp = zr_utf8_decode(ex->s + pos, ex->len - pos, &adv);
+            if (!zr_re_match_class(n, cp, ex->case_insens)) return false;
+            *out_end = pos + (adv ? adv : 1);
+            return true;
+        }
+        case RE_SEQ:
+            return zr_re_eval_seq(ex, n->kids, 0, n->n_kids, pos, out_end);
+        case RE_ALT: {
+            ssize_t s_gs[ZR_RE_MAX_GROUPS], s_ge[ZR_RE_MAX_GROUPS];
+            memcpy(s_gs, ex->g_start, sizeof(s_gs));
+            memcpy(s_ge, ex->g_end, sizeof(s_ge));
+            for (size_t i = 0; i < n->n_kids; i++) {
+                ZrReNode *one[1] = { n->kids[i] };
+                if (zr_re_eval_seq(ex, one, 0, 1, pos, out_end)) return true;
+                memcpy(ex->g_start, s_gs, sizeof(s_gs));
+                memcpy(ex->g_end, s_ge, sizeof(s_ge));
+            }
+            return false;
+        }
+        case RE_GROUP: {
+            ZrReNode *one[1] = { n->kids[0] };
+            size_t ge = pos;
+            if (!zr_re_eval_seq(ex, one, 0, 1, pos, &ge)) return false;
+            if (n->group_idx >= 1 && n->group_idx < ZR_RE_MAX_GROUPS) {
+                ex->g_start[n->group_idx] = (ssize_t)pos;
+                ex->g_end[n->group_idx] = (ssize_t)ge;
+            }
+            *out_end = ge;
+            return true;
+        }
+    }
+    return false;
+}
 
-    ZrPikeList clist = { buf_a, 0 };
-    ZrPikeList nlist = { buf_b, 0 };
+static bool zr_re_compile_entry(PbVM *vm, const PbStr *pat, ZrReCompiler *rc, ZrReNode **out_root) {
+    memset(rc, 0, sizeof(*rc));
+    rc->pat = pat->chars;
+    rc->len = pat->len;
+    rc->next_group = 1;
+    zr_arena_init(&rc->arena);
+    ZrReNode *r = zr_re_parse_alt(rc);
+    if (!r || rc->err[0] || rc->pos < rc->len) {
+        zr_arena_free(&rc->arena);
+        return vm_error(vm, "regex error: %s", rc->err[0] ? rc->err : "unexpected ')' in pattern");
+    }
+    *out_root = r;
+    return true;
+}
 
-    ssize_t init_saves[ZR_RE_MAX_GROUPS * 2];
-    for (int i = 0; i < ZR_RE_MAX_GROUPS * 2; i++) init_saves[i] = -1;
-
-    zr_pike_add_thread(prog, &clist, visited, gen++, 0, init_saves, s, len, start_pos);
-
-    bool matched = false;
-    ssize_t best_saves[ZR_RE_MAX_GROUPS * 2];
-    for (int i = 0; i < ZR_RE_MAX_GROUPS * 2; i++) best_saves[i] = -1;
-
+static bool zr_re_search_from(const ZrReCompiler *rc, ZrReNode *root, const char *s, size_t len, size_t start_pos, ZrReExec *ex_out) {
     size_t pos = start_pos;
     for (;;) {
-        if (clist.len == 0) break;
+        memset(ex_out, 0, sizeof(*ex_out));
+        ex_out->s = s;
+        ex_out->len = len;
+        ex_out->case_insens = rc->case_insens;
+        for (int g = 0; g < ZR_RE_MAX_GROUPS; g++) { ex_out->g_start[g] = -1; ex_out->g_end[g] = -1; }
+        ZrReNode *one[1] = { root };
+        size_t end_pos = pos;
+        if (zr_re_eval_seq(ex_out, one, 0, 1, pos, &end_pos)) {
+            ex_out->g_start[0] = (ssize_t)pos;
+            ex_out->g_end[0] = (ssize_t)end_pos;
+            return true;
+        }
+        if (pos >= len) break;
         size_t adv = 1;
-        uint32_t cp = 0;
-        bool at_end = (pos >= len);
-        if (!at_end) {
-            cp = zr_utf8_decode(s + pos, len - pos, &adv);
-            if (adv == 0) adv = 1;
-        }
-        nlist.len = 0;
-        uint32_t step_gen = gen++;
-        for (uint32_t i = 0; i < clist.len; i++) {
-            const ZrPikeThread *t = &clist.th[i];
-            const ZrPikeInst *in = &prog->insts[t->pc];
-            if (in->op == PIKE_MATCH) {
-                matched = true;
-                memcpy(best_saves, t->saves, sizeof(best_saves));
-                /* Cut off lower-priority threads (including later start positions in L_step) */
-                break;
-            }
-            if (at_end) continue;
-            bool ok = false;
-            switch (in->op) {
-                case PIKE_ANY_ALL:
-                    ok = true;
-                    break;
-                case PIKE_ANY:
-                    ok = (cp != '\n');
-                    break;
-                case PIKE_CHAR:
-                    ok = prog->case_insens ? (zr_cp_to_lower(cp) == zr_cp_to_lower(in->ch)) : (cp == in->ch);
-                    break;
-                case PIKE_CLASS:
-                    ok = zr_re_match_class(in->cls, cp, prog->case_insens);
-                    break;
-                default:
-                    break;
-            }
-            if (ok) {
-                zr_pike_add_thread(prog, &nlist, visited, step_gen, t->pc + 1, t->saves, s, len, pos + adv);
-            }
-        }
-        if (at_end) break;
-        ZrPikeList tmp = clist;
-        clist = nlist;
-        nlist = tmp;
-        pos += adv;
+        (void)zr_utf8_decode(s + pos, len - pos, &adv);
+        pos += adv ? adv : 1;
     }
-
-    free(buf_a);
-    free(buf_b);
-    free(visited);
-
-    if (matched) {
-        for (int g = 0; g < prog->next_group && g < ZR_RE_MAX_GROUPS; g++) {
-            ex_out->g_start[g] = best_saves[g * 2];
-            ex_out->g_end[g]   = best_saves[g * 2 + 1];
-        }
-    }
-    return matched;
+    return false;
 }
 
 static bool bi_regex_match(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc != 2 || !is_obj_type(argv[0], OBJ_STR) || !is_obj_type(argv[1], OBJ_STR)) {
         return vm_error(vm, "regex_match(s, pattern) expects 2 strings");
     }
-    const ZrReCacheEntry *prog = zr_re_get_compiled(vm, AS_STR(argv[1]));
-    if (!prog) return false;
+    ZrReCompiler rc; ZrReNode *root = NULL;
+    if (!zr_re_compile_entry(vm, AS_STR(argv[1]), &rc, &root)) return false;
     ZrReExec ex;
-    bool ok = zr_pike_search(prog, AS_STR(argv[0])->chars, AS_STR(argv[0])->len, 0, &ex);
+    bool ok = zr_re_search_from(&rc, root, AS_STR(argv[0])->chars, AS_STR(argv[0])->len, 0, &ex);
+    zr_arena_free(&rc.arena);
     *out = val_bool(ok);
     return true;
 }
@@ -2384,16 +1996,18 @@ static bool bi_regex_find(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc != 2 || !is_obj_type(argv[0], OBJ_STR) || !is_obj_type(argv[1], OBJ_STR)) {
         return vm_error(vm, "regex_find(s, pattern) expects 2 strings");
     }
-    const ZrReCacheEntry *prog = zr_re_get_compiled(vm, AS_STR(argv[1]));
-    if (!prog) return false;
+    ZrReCompiler rc; ZrReNode *root = NULL;
+    if (!zr_re_compile_entry(vm, AS_STR(argv[1]), &rc, &root)) return false;
     PbStr *s = AS_STR(argv[0]);
     ZrReExec ex;
-    if (zr_pike_search(prog, s->chars, s->len, 0, &ex)) {
+    if (zr_re_search_from(&rc, root, s->chars, s->len, 0, &ex)) {
+        zr_arena_free(&rc.arena);
         vm_push_root(vm, argv[0]);
         PbStr *m = pb_str_new(vm, s->chars + ex.g_start[0], (size_t)(ex.g_end[0] - ex.g_start[0]));
         vm_pop_roots(vm, 1);
         *out = val_obj(m);
     } else {
+        zr_arena_free(&rc.arena);
         *out = val_nil();
     }
     return true;
@@ -2403,8 +2017,8 @@ static bool bi_regex_find_all(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc != 2 || !is_obj_type(argv[0], OBJ_STR) || !is_obj_type(argv[1], OBJ_STR)) {
         return vm_error(vm, "regex_find_all(s, pattern) expects 2 strings");
     }
-    const ZrReCacheEntry *prog = zr_re_get_compiled(vm, AS_STR(argv[1]));
-    if (!prog) return false;
+    ZrReCompiler rc; ZrReNode *root = NULL;
+    if (!zr_re_compile_entry(vm, AS_STR(argv[1]), &rc, &root)) return false;
     vm_push_root(vm, argv[0]);
     PbArray *arr = pb_array_new(vm, 4);
     vm_push_root(vm, val_obj(arr));
@@ -2412,7 +2026,7 @@ static bool bi_regex_find_all(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     while (pos <= AS_STR(argv[0])->len) {
         PbStr *s = AS_STR(argv[0]);
         ZrReExec ex;
-        if (!zr_pike_search(prog, s->chars, s->len, pos, &ex)) break;
+        if (!zr_re_search_from(&rc, root, s->chars, s->len, pos, &ex)) break;
         PbStr *m = pb_str_new(vm, s->chars + ex.g_start[0], (size_t)(ex.g_end[0] - ex.g_start[0]));
         pb_array_push(vm, arr, val_obj(m));
         if (ex.g_end[0] == (ssize_t)pos) {
@@ -2424,6 +2038,7 @@ static bool bi_regex_find_all(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
             pos = (size_t)ex.g_end[0];
         }
     }
+    zr_arena_free(&rc.arena);
     vm_pop_roots(vm, 2);
     *out = val_obj(arr);
     return true;
@@ -2473,21 +2088,20 @@ static bool zr_regex_replace_impl(PbVM *vm, int argc, PbValue *argv, bool all, P
     if (argc != 3 || !is_obj_type(argv[0], OBJ_STR) || !is_obj_type(argv[1], OBJ_STR) || !is_obj_type(argv[2], OBJ_STR)) {
         return vm_error(vm, "%s(s, pat, rep) expects 3 strings", all ? "regex_replace_all" : "regex_replace");
     }
-    const ZrReCacheEntry *prog = zr_re_get_compiled(vm, AS_STR(argv[1]));
-    if (!prog) return false;
-    int ng = prog->next_group;
+    ZrReCompiler rc; ZrReNode *root = NULL;
+    if (!zr_re_compile_entry(vm, AS_STR(argv[1]), &rc, &root)) return false;
     PbStr *s = AS_STR(argv[0]), *rep = AS_STR(argv[2]);
     ZrBuf b;
     zr_buf_init(&b);
     size_t pos = 0;
     while (pos <= s->len) {
         ZrReExec ex;
-        if (!zr_pike_search(prog, s->chars, s->len, pos, &ex)) {
+        if (!zr_re_search_from(&rc, root, s->chars, s->len, pos, &ex)) {
             zr_buf_append(&b, s->chars + pos, s->len - pos);
             break;
         }
         zr_buf_append(&b, s->chars + pos, (size_t)ex.g_start[0] - pos);
-        zr_re_append_rep(&b, s->chars, &ex, ng, rep);
+        zr_re_append_rep(&b, s->chars, &ex, rc.next_group, rep);
         if (!all) {
             zr_buf_append(&b, s->chars + ex.g_end[0], s->len - (size_t)ex.g_end[0]);
             break;
@@ -2503,6 +2117,7 @@ static bool zr_regex_replace_impl(PbVM *vm, int argc, PbValue *argv, bool all, P
             pos = (size_t)ex.g_end[0];
         }
     }
+    zr_arena_free(&rc.arena);
     *out = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
     zr_buf_free(&b);
     return true;
@@ -2515,8 +2130,8 @@ static bool bi_regex_split(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc != 2 || !is_obj_type(argv[0], OBJ_STR) || !is_obj_type(argv[1], OBJ_STR)) {
         return vm_error(vm, "regex_split(s, pattern) expects 2 strings");
     }
-    const ZrReCacheEntry *prog = zr_re_get_compiled(vm, AS_STR(argv[1]));
-    if (!prog) return false;
+    ZrReCompiler rc; ZrReNode *root = NULL;
+    if (!zr_re_compile_entry(vm, AS_STR(argv[1]), &rc, &root)) return false;
     vm_push_root(vm, argv[0]);
     PbArray *arr = pb_array_new(vm, 4);
     vm_push_root(vm, val_obj(arr));
@@ -2524,7 +2139,7 @@ static bool bi_regex_split(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     for (;;) {
         PbStr *s = AS_STR(argv[0]);
         ZrReExec ex;
-        if (!zr_pike_search(prog, s->chars, s->len, pos, &ex) || ex.g_end[0] == ex.g_start[0]) {
+        if (!zr_re_search_from(&rc, root, s->chars, s->len, pos, &ex) || ex.g_end[0] == ex.g_start[0]) {
             PbStr *tail = pb_str_new(vm, s->chars + pos, s->len - pos);
             pb_array_push(vm, arr, val_obj(tail));
             break;
@@ -2533,6 +2148,7 @@ static bool bi_regex_split(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         pb_array_push(vm, arr, val_obj(part));
         pos = (size_t)ex.g_end[0];
     }
+    zr_arena_free(&rc.arena);
     vm_pop_roots(vm, 2);
     *out = val_obj(arr);
     return true;
@@ -2542,20 +2158,22 @@ static bool bi_regex_capture(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc != 2 || !is_obj_type(argv[0], OBJ_STR) || !is_obj_type(argv[1], OBJ_STR)) {
         return vm_error(vm, "regex_capture(s, pattern) expects 2 strings");
     }
-    const ZrReCacheEntry *prog = zr_re_get_compiled(vm, AS_STR(argv[1]));
-    if (!prog) return false;
-    int ng = prog->next_group;
+    ZrReCompiler rc; ZrReNode *root = NULL;
+    if (!zr_re_compile_entry(vm, AS_STR(argv[1]), &rc, &root)) return false;
     ZrReExec ex;
-    if (!zr_pike_search(prog, AS_STR(argv[0])->chars, AS_STR(argv[0])->len, 0, &ex)) {
+    if (!zr_re_search_from(&rc, root, AS_STR(argv[0])->chars, AS_STR(argv[0])->len, 0, &ex)) {
+        zr_arena_free(&rc.arena);
         *out = val_nil();
         return true;
     }
+    int ng = rc.next_group;
+    zr_arena_free(&rc.arena);
     vm_push_root(vm, argv[0]);
     PbArray *arr = pb_array_new(vm, (size_t)ng);
     vm_push_root(vm, val_obj(arr));
     for (int g = 0; g < ng; g++) {
         if (ex.g_start[g] >= 0 && ex.g_end[g] >= ex.g_start[g]) {
-            PbStr *gs = pb_str_new(vm, AS_STR(argv[0])->chars + ex.g_start[g], (size_t)(ex.g_end[g] - ex.g_start[g]));
+            PbStr * gs = pb_str_new(vm, AS_STR(argv[0])->chars + ex.g_start[g], (size_t)(ex.g_end[g] - ex.g_start[g]));
             pb_array_push(vm, arr, val_obj(gs));
         } else {
             pb_array_push(vm, arr, val_nil());
@@ -2574,7 +2192,6 @@ typedef enum {
     XF_NIL = 0,
     XF_BOOL,
     XF_NUM,
-    XF_I64,
     XF_STR,
     XF_ARR,
     XF_MAP,
@@ -2596,7 +2213,6 @@ struct ZrXferVal {
     union {
         bool     b;
         double   num;
-        int64_t  i64;
         struct { char *s; size_t len; } str;
         struct { ZrXferVal *items; size_t len; } arr;
         struct { char **keys; size_t *klens; ZrXferVal *vals; size_t len; } map;
@@ -2651,7 +2267,6 @@ static bool zr_xfer_pack(PbVM *vm, PbValue v, ZrXferVal *out, int depth) {
         case VAL_NIL:  out->tag = XF_NIL; return true;
         case VAL_BOOL: out->tag = XF_BOOL; out->u.b = v.as.b; return true;
         case VAL_NUM:  out->tag = XF_NUM; out->u.num = v.as.num; return true;
-        case VAL_I64:  out->tag = XF_I64; out->u.i64 = v.as.i64; return true;
         case VAL_BUILTIN:
             out->tag = XF_BUILTIN;
             out->u.builtin_name = zr_xstrdup(v.as.builtin_id < vm->builtin_count ? vm->builtin_defs[v.as.builtin_id].name : "");
@@ -2790,7 +2405,6 @@ static PbValue zr_xfer_unpack(PbVM *vm, const ZrXferVal *x) {
         case XF_NIL:  res = val_nil(); break;
         case XF_BOOL: res = val_bool(x->u.b); break;
         case XF_NUM:  res = val_num(x->u.num); break;
-        case XF_I64:  res = val_i64(x->u.i64); break;
         case XF_STR:  res = val_obj(pb_str_new(vm, x->u.str.s, x->u.str.len)); break;
         case XF_BYTES:
             res = val_obj(pb_bytes_from_backing(vm, x->u.shared_buf.backing, x->u.shared_buf.len));
@@ -2900,7 +2514,6 @@ static void zr_xfer_clone(const ZrXferVal *src, ZrXferVal *dst) {
         case XF_NIL: break;
         case XF_BOOL: dst->u.b = src->u.b; break;
         case XF_NUM: dst->u.num = src->u.num; break;
-        case XF_I64: dst->u.i64 = src->u.i64; break;
         case XF_STR: case XF_BIGINT: case XF_RATIONAL: case XF_DECIMAL: case XF_MODULE:
             dst->u.str.len = src->u.str.len;
             dst->u.str.s = zr_xstrndup(src->u.str.s, src->u.str.len);
@@ -6031,391 +5644,6 @@ static bool bi_coverage_snapshot(PbVM *vm, int argc, PbValue *argv, PbValue *out
     return true;
 }
 
-/* ============================================================================
- * 12. v5.0.0 Sovereign Kernel Extensions:
- *     - Native Unboxed VAL_I64, Slab OS Reclamation & @region Arenas (#1, #2)
- *     - M:N Green Fibers & Tiered Async Event Multiplexer (#3)
- *     - Unprivileged OS-Kernel Sandbox (Landlock / RLIMIT / Win32 JobObject) (#11)
- *     - Unicode 16.0 NFC/NFD, UAX #29 Graphemes, Greek Polytonic & Homoglyphs (#14)
- *     - Bomb-Proof Streaming DEFLATE / gzip / zlib / LZ4 / Zstandard (#17)
- * ============================================================================ */
-
-#if defined(__linux__)
-#include <sys/epoll.h>
-#include <sys/prctl.h>
-#include <sys/resource.h>
-#include <sys/syscall.h>
-#endif
-#if !defined(_WIN32)
-#include <poll.h>
-#endif
-
-/* ---- #1 & #2: VAL_I64, Slab Page Reclamation, @region & Intern Stats ---- */
-
-static bool bi_i64(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 1) return vm_error(vm, "i64() expects 1 argument");
-    PbValue v = argv[0];
-    if (v.tag == VAL_I64) { *out = v; return true; }
-    if (v.tag == VAL_NUM) {
-        if (!isfinite(v.as.num)) return vm_error(vm, "i64(): non-finite float");
-        if (v.as.num < -9223372036854775808.0 || v.as.num >= 9223372036854775808.0) {
-            return vm_error(vm, "i64(): float out of 64-bit signed integer range");
-        }
-        PbValue r = val_i64((int64_t)trunc(v.as.num));
-        r.taint = v.taint;
-        *out = r;
-        return true;
-    }
-    if (v.tag == VAL_BOOL) { *out = val_i64(v.as.b ? 1 : 0); return true; }
-    if (is_obj_type(v, OBJ_BIGINT)) {
-        char *bs = zr_bi_to_str(&AS_BIGINT(v)->v);
-        errno = 0;
-        char *ep = NULL;
-        long long lv = strtoll(bs, &ep, 10);
-        bool ok = (errno != ERANGE && ep && *ep == '\0');
-        free(bs);
-        if (!ok) return vm_error(vm, "i64(): bigint value out of int64 range");
-        *out = val_i64((int64_t)lv);
-        return true;
-    }
-    if (is_obj_type(v, OBJ_STR)) {
-        const char *s = AS_STR(v)->chars;
-        while (*s && isspace((unsigned char)*s)) s++;
-        int base = 10;
-        const char *p = s;
-        bool neg = false;
-        if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
-        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base = 16; p += 2; }
-        else if (p[0] == '0' && (p[1] == 'b' || p[1] == 'B')) { base = 2; p += 2; }
-        else if (p[0] == '0' && (p[1] == 'o' || p[1] == 'O')) { base = 8; p += 2; }
-        errno = 0;
-        char *ep = NULL;
-        unsigned long long uv = strtoull(p, &ep, base);
-        if (ep && strncmp(ep, "i64", 3) == 0) ep += 3;
-        while (ep && *ep && isspace((unsigned char)*ep)) ep++;
-        if (errno == ERANGE || !ep || *ep != '\0' || ep == p) {
-            return vm_error(vm, "i64(): invalid 64-bit integer string '%s'", AS_STR(v)->chars);
-        }
-        int64_t iv = 0;
-        if (neg) {
-            if (uv == 9223372036854775808ULL) iv = INT64_MIN;
-            else if (uv <= (unsigned long long)INT64_MAX) iv = -(int64_t)uv;
-            else if (base != 10) iv = -(int64_t)uv;
-            else return vm_error(vm, "i64(): integer string underflows int64");
-        } else {
-            if (uv <= (unsigned long long)INT64_MAX) iv = (int64_t)uv;
-            else if (base != 10) iv = (int64_t)uv;
-            else return vm_error(vm, "i64(): integer string overflows int64");
-        }
-        PbValue r = val_i64(iv);
-        r.taint = v.taint;
-        *out = r;
-        return true;
-    }
-    return vm_error(vm, "i64(): unsupported argument type %s", zr_val_type_name(v));
-}
-
-static bool bi_is_i64(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 1) return vm_error(vm, "is_i64() expects 1 argument");
-    *out = val_bool(argv[0].tag == VAL_I64);
-    return true;
-}
-
-static bool bi_gc_reclaim_os_pages(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    (void)argc; (void)argv;
-    size_t fa = 0, fm = 0, fmod = 0;
-    vm_collect_garbage(vm, &fa, &fm, &fmod);
-    size_t reclaimed = zr_vm_reclaim_os_pages(vm);
-    PbMap *m = pb_map_new_raw(vm, 8);
-    vm_push_root(vm, val_obj(m));
-    pb_map_set_cstr(vm, m, "reclaimed_slabs", val_i64((int64_t)reclaimed));
-    pb_map_set_cstr(vm, m, "reclaimed_bytes", val_i64((int64_t)(reclaimed * ZR_SLAB_BYTES)));
-    pb_map_set_cstr(vm, m, "slab_count", val_i64((int64_t)vm->gc_slab_len));
-    pb_map_set_cstr(vm, m, "slab_decommits", val_i64((int64_t)vm->os_pages_reclaimed));
-    pb_map_set_cstr(vm, m, "slab_bytes_live", val_i64((int64_t)vm->live_bytes));
-    vm_pop_roots(vm, 1);
-    *out = val_obj(m);
-    return true;
-}
-
-static bool bi_region_enter(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    (void)argc; (void)argv;
-    vm->region_depth++;
-    *out = val_i64((int64_t)vm->region_depth);
-    return true;
-}
-
-static bool bi_region_exit(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    (void)argc; (void)argv;
-    if (vm->region_depth > 0) vm->region_depth--;
-    size_t reclaimed = 0;
-    if (vm->region_depth == 0 && vm->gc_inhibit == 0) {
-        vm_collect_nursery(vm);
-        reclaimed = zr_vm_reclaim_os_pages(vm);
-    }
-    *out = val_i64((int64_t)reclaimed);
-    return true;
-}
-
-static bool bi_intern_stats(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    (void)argc; (void)argv;
-    PbMap *m = pb_map_new_raw(vm, 8);
-    vm_push_root(vm, val_obj(m));
-    pb_map_set_cstr(vm, m, "intern_count", val_i64((int64_t)vm->intern_hits));
-    pb_map_set_cstr(vm, m, "intern_cap", val_i64((int64_t)ZR_INTERN_SLOTS));
-    pb_map_set_cstr(vm, m, "string_allocs", val_i64((int64_t)vm->string_allocs));
-    pb_map_set_cstr(vm, m, "slab_allocs", val_i64((int64_t)vm->slab_allocs));
-    pb_map_set_cstr(vm, m, "slab_bytes_live", val_i64((int64_t)vm->live_bytes));
-    pb_map_set_cstr(vm, m, "slab_decommits", val_i64((int64_t)vm->os_pages_reclaimed));
-    vm_pop_roots(vm, 1);
-    *out = val_obj(m);
-    return true;
-}
-
-/* ---- #11: Unprivileged OS-Kernel Sandbox (Landlock LSM / RLIMIT / Win32 JobObject) ---- */
-
-static bool bi_sandbox_lock_os(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    PbMap *pol = (argc >= 1 && is_obj_type(argv[0], OBJ_MAP)) ? AS_MAP(argv[0]) : NULL;
-    bool dry_run = true;
-    int64_t max_files = 0, max_fsize = 0;
-    if (pol) {
-        PbValue v;
-        if (pb_map_get_cstr(pol, "enforce", &v) && val_truthy(v)) dry_run = false;
-        if (pb_map_get_cstr(pol, "dry_run", &v)) dry_run = val_truthy(v);
-        if (pb_map_get_cstr(pol, "max_open_files", &v)) max_files = (v.tag == VAL_I64) ? v.as.i64 : (int64_t)v.as.num;
-        if (pb_map_get_cstr(pol, "max_file_bytes", &v)) max_fsize = (v.tag == VAL_I64) ? v.as.i64 : (int64_t)v.as.num;
-    }
-    (void)max_files;
-    (void)max_fsize;
-
-    PbMap *res = pb_map_new_raw(vm, 12);
-    vm_push_root(vm, val_obj(res));
-    pb_map_set_cstr(vm, res, "dry_run", val_bool(dry_run));
-
-#if defined(__linux__)
-    long ll_abi = -1;
-#ifdef __NR_landlock_create_ruleset
-    ll_abi = syscall(__NR_landlock_create_ruleset, NULL, (size_t)0, (uint32_t)1u);
-#else
-    ll_abi = syscall(444, NULL, (size_t)0, (uint32_t)1u);
-#endif
-    bool ll_supported = (ll_abi > 0);
-    bool enforced = false;
-    if (!dry_run) {
-        (void)prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-        if (max_files > 0) {
-            struct rlimit rl;
-            if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
-                rl.rlim_cur = (rlim_t)max_files < rl.rlim_max ? (rlim_t)max_files : rl.rlim_max;
-                (void)setrlimit(RLIMIT_NOFILE, &rl);
-            }
-        }
-        if (max_fsize > 0) {
-            struct rlimit rl = { (rlim_t)max_fsize, (rlim_t)max_fsize };
-            (void)setrlimit(RLIMIT_FSIZE, &rl);
-        }
-        enforced = true;
-    }
-    pb_map_set_cstr(vm, res, "os", val_obj(pb_str_c(vm, "linux")));
-    pb_map_set_cstr(vm, res, "backend", val_obj(pb_str_c(vm, ll_supported ? "landlock+prctl+rlimit" : "prctl+rlimit_legacy_fallback")));
-    pb_map_set_cstr(vm, res, "landlock_supported", val_bool(ll_supported));
-    pb_map_set_cstr(vm, res, "landlock_abi", val_i64(ll_supported ? (int64_t)ll_abi : 0));
-    pb_map_set_cstr(vm, res, "enforced", val_bool(enforced));
-#elif defined(_WIN32)
-    bool enforced = false;
-    if (!dry_run) {
-        HANDLE hJob = CreateJobObjectW(NULL, NULL);
-        if (hJob) {
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
-            memset(&jeli, 0, sizeof(jeli));
-            jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-            SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
-            enforced = (AssignProcessToJobObject(hJob, GetCurrentProcess()) != 0);
-        }
-    }
-    pb_map_set_cstr(vm, res, "os", val_obj(pb_str_c(vm, "windows")));
-    pb_map_set_cstr(vm, res, "backend", val_obj(pb_str_c(vm, "win32_job_object")));
-    pb_map_set_cstr(vm, res, "landlock_supported", val_bool(false));
-    pb_map_set_cstr(vm, res, "landlock_abi", val_i64(0));
-    pb_map_set_cstr(vm, res, "enforced", val_bool(enforced));
-#else
-    pb_map_set_cstr(vm, res, "os", val_obj(pb_str_c(vm, "posix")));
-    pb_map_set_cstr(vm, res, "backend", val_obj(pb_str_c(vm, "rlimit_fallback")));
-    pb_map_set_cstr(vm, res, "landlock_supported", val_bool(false));
-    pb_map_set_cstr(vm, res, "landlock_abi", val_i64(0));
-    pb_map_set_cstr(vm, res, "enforced", val_bool(false));
-#endif
-    vm_pop_roots(vm, 1);
-    *out = val_obj(res);
-    return true;
-}
-
-/* ---- #3: M:N Green Fiber Scheduler & Tiered Async Event Multiplexer ---- */
-
-typedef struct {
-    int  backend_kind; /* 1=epoll, 2=poll/WSAPoll */
-    int  ep_fd;
-    int *fds;
-    short *events;
-    size_t len;
-    size_t cap;
-    bool io_uring_kernel_avail;
-} ZrAsyncMux;
-
-#define ZR_MAX_ASYNC_MUX 64
-static ZrAsyncMux g_zr_mux_table[ZR_MAX_ASYNC_MUX];
-static bool g_zr_mux_used[ZR_MAX_ASYNC_MUX];
-
-static bool bi_async_mux_backend(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    (void)argc; (void)argv;
-    PbMap *m = pb_map_new_raw(vm, 8);
-    vm_push_root(vm, val_obj(m));
-#if defined(__linux__)
-    bool uring_ok = false;
-#ifdef __NR_io_uring_setup
-    long ur = syscall(__NR_io_uring_setup, 0u, NULL);
-    uring_ok = !(ur < 0 && errno == ENOSYS);
-#else
-    long ur = syscall(425, 0u, NULL);
-    uring_ok = !(ur < 0 && errno == ENOSYS);
-#endif
-    pb_map_set_cstr(vm, m, "active_backend", val_obj(pb_str_c(vm, "epoll")));
-    pb_map_set_cstr(vm, m, "io_uring_kernel_available", val_bool(uring_ok));
-    pb_map_set_cstr(vm, m, "fallback_chain", val_obj(pb_str_c(vm, "io_uring -> epoll -> poll")));
-#elif defined(_WIN32)
-    pb_map_set_cstr(vm, m, "active_backend", val_obj(pb_str_c(vm, "wsapoll_iocp")));
-    pb_map_set_cstr(vm, m, "io_uring_kernel_available", val_bool(false));
-    pb_map_set_cstr(vm, m, "fallback_chain", val_obj(pb_str_c(vm, "iocp -> wsapoll -> select")));
-#else
-    pb_map_set_cstr(vm, m, "active_backend", val_obj(pb_str_c(vm, "poll")));
-    pb_map_set_cstr(vm, m, "io_uring_kernel_available", val_bool(false));
-    pb_map_set_cstr(vm, m, "fallback_chain", val_obj(pb_str_c(vm, "kqueue -> poll")));
-#endif
-    vm_pop_roots(vm, 1);
-    *out = val_obj(m);
-    return true;
-}
-
-static bool bi_async_mux_new(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    (void)argc; (void)argv;
-    int id = -1;
-    for (int i = 0; i < ZR_MAX_ASYNC_MUX; i++) {
-        if (!g_zr_mux_used[i]) { id = i; break; }
-    }
-    if (id < 0) return vm_error(vm, "async_mux_new(): max multiplexers (%d) reached", ZR_MAX_ASYNC_MUX);
-    ZrAsyncMux *mx = &g_zr_mux_table[id];
-    memset(mx, 0, sizeof(*mx));
-    g_zr_mux_used[id] = true;
-#if defined(__linux__)
-    mx->ep_fd = epoll_create1(EPOLL_CLOEXEC);
-    mx->backend_kind = (mx->ep_fd >= 0) ? 1 : 2;
-#else
-    mx->ep_fd = -1;
-    mx->backend_kind = 2;
-#endif
-    *out = val_i64((int64_t)id);
-    return true;
-}
-
-static bool bi_async_mux_close(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 1) return vm_error(vm, "async_mux_close(mux_id) expects 1 arg");
-    int64_t id = (argv[0].tag == VAL_I64) ? argv[0].as.i64 : (int64_t)argv[0].as.num;
-    if (id < 0 || id >= ZR_MAX_ASYNC_MUX || !g_zr_mux_used[id]) { *out = val_bool(false); return true; }
-    ZrAsyncMux *mx = &g_zr_mux_table[id];
-#if defined(__linux__)
-    if (mx->ep_fd >= 0) close(mx->ep_fd);
-#endif
-    free(mx->fds);
-    free(mx->events);
-    memset(mx, 0, sizeof(*mx));
-    g_zr_mux_used[id] = false;
-    *out = val_bool(true);
-    return true;
-}
-
-/* ---- #19: Thin VM Debug Trap Callback Bridge (Debugger & DAP live 100% in pure .sapp) ---- */
-
-typedef struct {
-    uint32_t last_line;
-    size_t   last_depth;
-} ZrPureDebugState;
-
-static bool zr_pure_debug_trap_cb(PbVM *vm, CallFrame *frame, PbFunc *fn, uint32_t ip, uint32_t line) {
-    if (!vm || !frame || !fn || line == 0) return true;
-    ZrPureDebugState *st = (ZrPureDebugState *)vm->debug_ctx;
-    if (st && st->last_line == line && st->last_depth == vm->frame_count) return true;
-    if (st) { st->last_line = line; st->last_depth = vm->frame_count; }
-    PbValue hook = val_nil();
-    if (!pb_map_get_cstr(vm->globals, "__pb_debug_hook_fn", &hook) ||
-        !(is_obj_type(hook, OBJ_CLOSURE) || is_obj_type(hook, OBJ_FUNC) || hook.tag == VAL_BUILTIN)) {
-        return true;
-    }
-    vm->debug_active = false;
-    PbMap *ev = pb_map_new_raw(vm, 8);
-    vm_push_root(vm, val_obj(ev));
-    pb_map_set_cstr(vm, ev, "file", val_obj(fn->source_name ? fn->source_name : pb_str_c(vm, "<script>")));
-    pb_map_set_cstr(vm, ev, "func", val_obj(fn->name ? fn->name : pb_str_c(vm, "<main>")));
-    pb_map_set_cstr(vm, ev, "line", val_i64((int64_t)line));
-    pb_map_set_cstr(vm, ev, "ip", val_i64((int64_t)ip));
-    pb_map_set_cstr(vm, ev, "depth", val_i64((int64_t)vm->frame_count));
-    PbValue arg = val_obj(ev);
-    PbValue ret = val_nil();
-    bool ok = vm_call_value_sync(vm, hook, 1, &arg, &ret);
-    vm_pop_roots(vm, 1);
-    PbValue cur_hook = val_nil();
-    if (pb_map_get_cstr(vm->globals, "__pb_debug_hook_fn", &cur_hook) && cur_hook.tag != VAL_NIL) {
-        vm->debug_active = true;
-    }
-    return ok;
-}
-
-static bool bi_debug_set_hook(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 1) return vm_error(vm, "debug_set_hook(fn_or_nil) expects 1 argument");
-    if (argv[0].tag == VAL_NIL) {
-        pb_map_set_cstr(vm, vm->globals, "__pb_debug_hook_fn", val_nil());
-        vm->debug_active = false;
-        vm->debug_trap_fn = NULL;
-        free(vm->debug_ctx);
-        vm->debug_ctx = NULL;
-        *out = val_bool(false);
-        return true;
-    }
-    if (!(is_obj_type(argv[0], OBJ_CLOSURE) || is_obj_type(argv[0], OBJ_FUNC) || argv[0].tag == VAL_BUILTIN)) {
-        return vm_error(vm, "debug_set_hook(): expected function or nil");
-    }
-    pb_map_set_cstr(vm, vm->globals, "__pb_debug_hook_fn", argv[0]);
-    if (!vm->debug_ctx) vm->debug_ctx = zr_xcalloc(1, sizeof(ZrPureDebugState));
-    else memset(vm->debug_ctx, 0, sizeof(ZrPureDebugState));
-    vm->debug_trap_fn = zr_pure_debug_trap_cb;
-    vm->debug_active = true;
-    *out = val_bool(true);
-    return true;
-}
-
-static bool bi_debug_frame_snapshot(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    (void)argc; (void)argv;
-    PbArray *frames = pb_array_new(vm, vm->frame_count);
-    vm_push_root(vm, val_obj(frames));
-    for (size_t i = 0; i < vm->frame_count; i++) {
-        CallFrame *fr = &vm->frames[i];
-        PbFunc *fn = (fr->closure && fr->closure->fn) ? fr->closure->fn : NULL;
-        PbMap *fm = pb_map_new_raw(vm, 8);
-        vm_push_root(vm, val_obj(fm));
-        uint32_t ip = fr->ip > 0 ? fr->ip - 1u : 0u;
-        uint32_t ln = (fn && ip < fn->code_len) ? fn->code[ip].line : 0u;
-        pb_map_set_cstr(vm, fm, "index", val_i64((int64_t)i));
-        pb_map_set_cstr(vm, fm, "func", val_obj((fn && fn->name) ? fn->name : pb_str_c(vm, "<main>")));
-        pb_map_set_cstr(vm, fm, "file", val_obj((fn && fn->source_name) ? fn->source_name : pb_str_c(vm, "<script>")));
-        pb_map_set_cstr(vm, fm, "line", val_i64((int64_t)ln));
-        pb_map_set_cstr(vm, fm, "ip", val_i64((int64_t)ip));
-        pb_array_push(vm, frames, val_obj(fm));
-        vm_pop_roots(vm, 1);
-    }
-    vm_pop_roots(vm, 1);
-    *out = val_obj(frames);
-    return true;
-}
-
 static void zr_register_all_builtins(PbVM *vm) {
     static const struct { const char *name; PbBuiltinFn fn; } table[] = {
         /* Console & Core */
@@ -6873,27 +6101,7 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"coverage_start", bi_coverage_start},
         {"coverage_stop", bi_coverage_stop},
         {"coverage_reset", bi_coverage_reset},
-        {"coverage_snapshot", bi_coverage_snapshot},
-
-        /* v5.0.0 Sovereign Microkernel Syscall & VM Tag Hooks (All engines live in pure .sapp) */
-        {"i64", bi_i64},
-        {"is_i64", bi_is_i64},
-        {"gc_reclaim_os_pages", bi_gc_reclaim_os_pages},
-        {"region_enter", bi_region_enter},
-        {"region_exit", bi_region_exit},
-        {"intern_stats", bi_intern_stats},
-        {"sandbox_lock_os", bi_sandbox_lock_os},
-        {"async_mux_backend", bi_async_mux_backend},
-        {"async_mux_new", bi_async_mux_new},
-        {"async_mux_close", bi_async_mux_close},
-        {"unix_listen", bi_unix_listen},
-        {"unix_connect", bi_unix_connect},
-        {"unix_peer_cred", bi_unix_peer_cred},
-        {"ffi_ptr_new", bi_ffi_ptr_new},
-        {"ffi_ptr_addr", bi_ffi_ptr_addr},
-        {"ffi_ptr_is_null", bi_ffi_ptr_is_null},
-        {"debug_set_hook", bi_debug_set_hook},
-        {"debug_frame_snapshot", bi_debug_frame_snapshot}
+        {"coverage_snapshot", bi_coverage_snapshot}
     };
 
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {

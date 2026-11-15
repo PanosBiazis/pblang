@@ -1,0 +1,367 @@
+// Pure PBLang verification for UNO R4 LED Studio HTTP routes, guarded >64 KiB
+// pretty JSON import, atomic invalid/oversized (>128 KiB) import rejection,
+// cross-origin 403 guard, playback/stale-form recovery, 32-bit Arduino frame
+// word packing, and 120-request 429 Retry-After budget recovery.
+
+let Web = import("../../examples/uno_r4_led_studio/web.sapp");
+let Model = import("../../examples/uno_r4_led_studio/model.sapp");
+
+fn _attr_value(attrs_str, attr_name) {
+    let marker = attr_name + "=\"";
+    if not str_contains(attrs_str, marker) {
+        return nil;
+    }
+    let after = str_split(attrs_str, marker)[1];
+    return str_split(after, "\"")[0];
+}
+
+fn _has_flag_attr(attrs_str, flag_name) {
+    let padded = " " + attrs_str + " ";
+    return str_contains(padded, " " + flag_name + " ") or str_ends_with(attrs_str, " " + flag_name);
+}
+
+fn _html_unescape(s) {
+    let out = str_join(str_split(s, "&amp;"), "&");
+    out = str_join(str_split(out, "&lt;"), "<");
+    out = str_join(str_split(out, "&gt;"), ">");
+    out = str_join(str_split(out, "&quot;"), "\"");
+    out = str_join(str_split(out, "&#39;"), "'");
+    return out;
+}
+
+fn _parse_form(page) {
+    // Strip the secondary hidden multipart file-upload form at the bottom
+    let main_html = str_split(page, "<form id=\"led-file-import\"")[0];
+    let inputs = map{};
+    let input_Order = [];
+    let in_chunks = str_split(main_html, "<input ");
+    let n_in = len(in_chunks);
+    let idx = 1;
+    while idx < n_in {
+        let tag = str_split(in_chunks[idx], ">")[0];
+        let form_ref = _attr_value(tag, "form");
+        if form_ref == nil or form_ref == "led-editor" {
+            let input_type = _attr_value(tag, "type");
+            let name = _attr_value(tag, "name");
+            if name != nil and input_type != "file" {
+                let take = true;
+                if input_type == "radio" and not _has_flag_attr(tag, "checked") {
+                    take = false;
+                }
+                if take {
+                    let raw_val = _attr_value(tag, "value");
+                    let val = "";
+                    if raw_val != nil {
+                        val = _html_unescape(raw_val);
+                    }
+                    if not map_has(inputs, name) {
+                        push(input_Order, name);
+                    }
+                    inputs[name] = val;
+                }
+            }
+        }
+        idx = idx + 1;
+    }
+
+    let buttons = map{};
+    let btn_chunks = str_split(main_html, "<button ");
+    let n_btn = len(btn_chunks);
+    let bidx = 1;
+    while bidx < n_btn {
+        let bpart = str_split(btn_chunks[bidx], "</button>")[0];
+        let gt_parts = str_split(bpart, ">");
+        if len(gt_parts) >= 2 {
+            let battrs = gt_parts[0];
+            let bval = _attr_value(battrs, "value");
+            if bval != nil {
+                let blabel = str_trim(_html_unescape(gt_parts[1]));
+                buttons[blabel] = _html_unescape(bval);
+            }
+        }
+        bidx = bidx + 1;
+    }
+    return map{inputs: inputs, order: input_Order, buttons: buttons};
+}
+
+fn _encode_form(fields_map, key_order) {
+    let pairs = [];
+    for k in key_order {
+        push(pairs, url_encode(k) + "=" + url_encode(str(fields_map[k])));
+    }
+    return str_join(pairs, "&");
+}
+
+fn _http_get(app, host, path) {
+    return app.handle(map{
+        method: "GET",
+        path: path,
+        headers: map{"Host": host},
+        body: ""
+    });
+}
+
+fn _http_post(app, host, page, button_label, animation_payload, origin_header) {
+    let parsed = _parse_form(page);
+    assert(map_has(parsed.buttons, button_label), "missing button label: " + button_label);
+    let values = map{};
+    let order = [];
+    for k in parsed.order {
+        values[k] = parsed.inputs[k];
+        push(order, k);
+    }
+    values["action"] = parsed.buttons[button_label];
+    push(order, "action");
+    values["animation"] = animation_payload;
+    push(order, "animation");
+
+    let body = _encode_form(values, order);
+    return app.handle(map{
+        method: "POST",
+        path: "/action",
+        headers: map{
+            "Host": host,
+            "Origin": origin_header,
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: body
+    });
+}
+
+fn _clone_pixels(px) {
+    let out = [];
+    for v in px {
+        push(out, v);
+    }
+    return out;
+}
+
+fn _pretty_export_json(doc_obj) {
+    // Format with 2-space indentation matching json.dumps(document, indent=2)
+    // so 64 frames naturally serialize between 64 KiB and 128 KiB.
+    let lines = [];
+    push(lines, "{");
+    push(lines, "  \"format\": " + json_stringify(doc_obj.format) + ",");
+    push(lines, "  \"mapping\": " + json_stringify(doc_obj.mapping) + ",");
+    push(lines, "  \"document\": {");
+    push(lines, "    \"format\": " + json_stringify(doc_obj.document.format) + ",");
+    push(lines, "    \"width\": " + str(doc_obj.document.width) + ",");
+    push(lines, "    \"height\": " + str(doc_obj.document.height) + ",");
+    push(lines, "    \"total_ms\": " + str(doc_obj.document.total_ms) + ",");
+    push(lines, "    \"frames\": [");
+    let n_frames = len(doc_obj.document.frames);
+    for fi n_frames {
+        let fr = doc_obj.document.frames[fi];
+        push(lines, "      {");
+        push(lines, "        \"duration_ms\": " + str(fr.duration_ms) + ",");
+        push(lines, "        \"pixels\": [");
+        let npx = len(fr.pixels);
+        for pi npx {
+            let comma = ",";
+            if pi == npx - 1 {
+                comma = "";
+            }
+            push(lines, "          " + str(fr.pixels[pi]) + comma);
+        }
+        push(lines, "        ]");
+        let fcomma = ",";
+        if fi == n_frames - 1 {
+            fcomma = "";
+        }
+        push(lines, "      }" + fcomma);
+    }
+    push(lines, "    ]");
+    push(lines, "  },");
+    push(lines, "  \"arduino_frames\": [");
+    let n_ard = len(doc_obj.arduino_frames);
+    for ai n_ard {
+        let row = doc_obj.arduino_frames[ai];
+        let rcomma = ",";
+        if ai == n_ard - 1 {
+            rcomma = "";
+        }
+        push(lines, "    [" + str(row[0]) + ", " + str(row[1]) + ", " + str(row[2]) + ", " + str(row[3]) + "]" + rcomma);
+    }
+    push(lines, "  ]");
+    push(lines, "}");
+    return str_join(lines, "\n");
+}
+
+fn _pack_word32(pixels, offset) {
+    let acc = 0;
+    for bit 32 {
+        acc = acc * 2 + pixels[offset + bit];
+    }
+    return acc;
+}
+
+fn _repeat_char(ch, count) {
+    // O(log N) doubling string builder
+    let unit = ch;
+    let out = "";
+    let rem = count;
+    while rem > 0 {
+        if rem % 2 == 1 {
+            out = out + unit;
+        }
+        rem = num_floor(rem / 2);
+        if rem > 0 {
+            unit = unit + unit;
+        }
+    }
+    return out;
+}
+
+fn _run_http_suite() {
+    let port = 18769;
+    let host = "127.0.0.1:" + str(port);
+    let origin = "http://" + host;
+    let app = Web.create(port);
+
+    let r0 = _http_get(app, host, "/");
+    assert(r0.status == 200, "initial GET / status 200");
+    let page = r0.body;
+    assert(not str_contains(page, "<set "), "initial page has no SVG <set animation");
+    assert(str_contains(page, "<button type=\"submit\" disabled hidden"), "disabled submit sentinel present");
+    assert(str_contains(page, "action=\"/action#studio-stage\""), "studio-stage form action fragment present");
+
+    let orig_res = _http_get(app, host, "/frames.json");
+    assert(orig_res.status == 200, "GET /frames.json status 200");
+    let original_raw = orig_res.body;
+    let original = json_parse(original_raw);
+
+    // Build 64-frame document at 50ms/frame (total 3200ms)
+    let base_pixels = _clone_pixels(original.document.frames[0].pixels);
+    let base_ard = original.arduino_frames[0];
+    let frames64 = [];
+    let ard64 = [];
+    for _fi 64 {
+        push(frames64, map{pixels: _clone_pixels(base_pixels), duration_ms: 50});
+        push(ard64, [base_ard[0], base_ard[1], base_ard[2], 50]);
+    }
+    let doc64 = map{
+        format: original.format,
+        mapping: original.mapping,
+        document: map{
+            format: original.document.format,
+            width: original.document.width,
+            height: original.document.height,
+            frames: frames64,
+            total_ms: 3200
+        },
+        arduino_frames: ard64
+    };
+
+    let pretty = _pretty_export_json(doc64);
+    let pretty_bytes = len(str_to_bytes(pretty));
+    assert(pretty_bytes > 65536 and pretty_bytes <= 131072, "pretty 64-frame JSON is between 64 KiB and 128 KiB");
+
+    let imp_res = _http_post(app, host, page, "Import JSON", pretty, origin);
+    assert(imp_res.status == 200, "64-frame pretty Import JSON status 200");
+    page = imp_res.body;
+    assert(str_contains(page, "Frame 1 / 64"), "imported 64 frames shown");
+    assert(not str_contains(page, "<set "), "editor has no active SVG <set");
+
+    let snap_res = _http_get(app, host, "/frames.json");
+    assert(snap_res.status == 200, "GET /frames.json after import");
+    let snapshot = snap_res.body;
+    let exported_doc = json_parse(snapshot);
+    assert(len(exported_doc.document.frames) == 64 and exported_doc.document.total_ms == 3200, "exported 64 frames total_ms 3200");
+
+    // Atomic rejection of malformed JSON, trailing garbage, and >128 KiB (131073 bytes)
+    let oversized = _repeat_char("x", 131073);
+    for bad_payload in ["{bad", pretty + "x", oversized] {
+        let bad_res = _http_post(app, host, page, "Import JSON", bad_payload, origin);
+        assert(bad_res.status == 200 or bad_res.status == 400, "invalid import returns 200 error banner or 400");
+        let after_bad = _http_get(app, host, "/frames.json").body;
+        assert(after_bad == snapshot, "invalid import preserved existing frames atomically");
+        if bad_res.status == 200 {
+            page = bad_res.body;
+        }
+    }
+
+    // Cross-origin POST must be rejected with 403 without mutating frames
+    let xorigin_res = _http_post(app, host, page, "Import JSON", original_raw, "https://invalid.example");
+    assert(xorigin_res.status == 403, "cross-origin POST rejected with 403");
+    assert(_http_get(app, host, "/frames.json").body == snapshot, "cross-origin POST preserved frames");
+
+    // Playback, stale form 403 recovery, Stop playback, Play -> Clear, and re-import
+    let stale_page = page;
+    let play_res = _http_post(app, host, page, "Play preview", "", origin);
+    assert(play_res.status == 200, "Play preview status 200");
+    page = play_res.body;
+    assert(str_contains(page, "id=\"led-playback\""), "playback SVG rendered");
+    assert(str_contains(page, "id=\"led-editor\" hidden"), "editor hidden during playback");
+
+    let stale_res = _http_post(app, host, stale_page, "Clear", "", origin);
+    assert(stale_res.status == 403 and str_contains(stale_res.body, "Return to editor"), "stale form rejected with 403 recovery link");
+    assert(_http_get(app, host, "/frames.json").body == snapshot, "stale form preserved frames");
+
+    let stop_res = _http_post(app, host, page, "Stop playback", "", origin);
+    assert(stop_res.status == 200 and not str_contains(stop_res.body, "<set "), "Stop playback removes SVG animation");
+    page = stop_res.body;
+
+    let play2_res = _http_post(app, host, page, "Play preview", "", origin);
+    assert(play2_res.status == 200, "second Play preview status 200");
+    page = play2_res.body;
+
+    // Even from playback page's hidden form, Clear stops animation and clears selected frame cleanly
+    let clear_res = _http_post(app, host, page, "Clear", "", origin);
+    assert(clear_res.status == 200 and not str_contains(clear_res.body, "<set "), "Clear exits playback cleanly");
+    page = clear_res.body;
+
+    let restore_res = _http_post(app, host, page, "Import JSON", snapshot, origin);
+    assert(restore_res.status == 200 and not str_contains(restore_res.body, "<set "), "re-import snapshot status 200");
+    page = restore_res.body;
+    assert(_http_get(app, host, "/frames.json").body == snapshot, "snapshot restored identically");
+
+    // Independently verify all three 32-bit packed Arduino words + duration_ms across all 64 frames
+    for fi 64 {
+        let fr = exported_doc.document.frames[fi];
+        let words = exported_doc.arduino_frames[fi];
+        let w0 = _pack_word32(fr.pixels, 0);
+        let w1 = _pack_word32(fr.pixels, 32);
+        let w2 = _pack_word32(fr.pixels, 64);
+        assert(words[0] == w0 and words[1] == w1 and words[2] == w2 and words[3] == fr.duration_ms, "Arduino 32-bit word packing verified for frame " + str(fi));
+    }
+
+    // Exercise the 120-request outer budget via /robots.txt; must return 429 Retry-After: 60 and preserve model state
+    let budget_state = _http_get(app, host, "/frames.json").body;
+    let saw_429 = false;
+    for _attempt 130 {
+        if not saw_429 {
+            let r_rob = _http_get(app, host, "/robots.txt");
+            if r_rob.status == 429 {
+                assert(r_rob.headers["Retry-After"] == "60", "429 Retry-After header == 60");
+                assert(str_contains(r_rob.body, "href=\"/#studio-stage\"") and str_contains(r_rob.body, "Wait 60 seconds"), "429 recovery page link and wait message");
+                saw_429 = true;
+            }
+        }
+    }
+    assert(saw_429 == true, "request budget was not reset by redraws and triggered 429");
+    assert(Model.export_document(app.state) == budget_state, "model export preserved across 429 rate limit");
+
+    app.close();
+    return map{
+        result: "pass",
+        passed: true,
+        real_http_handler: true,
+        pretty_import_bytes: pretty_bytes,
+        frames: 64,
+        atomic_invalid_imports: true,
+        origin_guard: true,
+        stale_form_recovery: true,
+        request_budget_recovery: true,
+        play_stop_edit_remove_animation: true,
+        all_words_independently_verified: true
+    };
+}
+
+fn main() {
+    assert(fs_exists(cwd() + "/tests/fixtures/uno_r4_led_studio_web.sapp"), "web fixture exists");
+    let summary = _run_http_suite();
+    print json_stringify(summary);
+    return 0;
+}
+
+main();

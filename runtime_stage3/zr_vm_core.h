@@ -96,20 +96,19 @@ enum {
 /* ---- Object & Value Model ---- */
 
 typedef enum {
-    OBJ_STR        = 1,
-    OBJ_ARRAY      = 2,
-    OBJ_MAP        = 3,
-    OBJ_FUNC       = 4,
-    OBJ_CLOSURE    = 5,
-    OBJ_UPVALUE    = 6,
-    OBJ_MODULE     = 7,
-    OBJ_BIGINT     = 8,
-    OBJ_RATIONAL   = 9,
-    OBJ_DECIMAL    = 10,
+    OBJ_STR      = 1,
+    OBJ_ARRAY    = 2,
+    OBJ_MAP      = 3,
+    OBJ_FUNC     = 4,
+    OBJ_CLOSURE  = 5,
+    OBJ_UPVALUE  = 6,
+    OBJ_MODULE   = 7,
+    OBJ_BIGINT   = 8,
+    OBJ_RATIONAL = 9,
+    OBJ_DECIMAL  = 10,
     OBJ_BYTES      = 11,
     OBJ_F64BUF     = 12,
-    OBJ_STRUCT_BUF = 13,
-    OBJ_PTR        = 14
+    OBJ_STRUCT_BUF = 13
 } PbObjType;
 
 typedef struct PbObj PbObj;
@@ -120,14 +119,12 @@ typedef enum {
     VAL_BOOL    = 1,
     VAL_NUM     = 2,
     VAL_OBJ     = 3,
-    VAL_BUILTIN = 4,
-    VAL_I64     = 5
+    VAL_BUILTIN = 4
 } PbValTag;
 
 typedef union {
     bool     b;
     double   num;
-    int64_t  i64;
     PbObj   *obj;
     uint16_t builtin_id;
 } PbValUnion;
@@ -142,13 +139,11 @@ typedef struct {
 } PbValue;
 
 struct PbObj {
-    uint8_t   type;        /* PbObjType (1..14) */
+    PbObjType type;
     uint8_t   marked;
     uint8_t   frozen;
-    uint8_t   gc_gen;      /* 0 = nursery (young), 1 = old (tenured) */
-    uint8_t   gc_rem;      /* 1 = old object in remembered set */
-    uint8_t   alloc_kind;  /* 0 = system heap, 1..6 = OS mmap/VirtualAlloc slab class */
-    uint16_t  slab_idx;    /* index in vm->gc_slabs[] */
+    uint8_t   gc_gen;  /* 0 = nursery (young), 1 = old (tenured) */
+    uint8_t   gc_rem;  /* 1 = old object in remembered set */
     size_t    tracked_bytes;
     PbObj    *next;
 };
@@ -371,20 +366,11 @@ typedef struct {
     ZrDecimal v;
 } PbDecimalObj;
 
-typedef struct {
-    PbObj     obj;
-    uintptr_t ptr;
-    size_t    byte_len;
-    bool      owned;
-    char      tag[32];
-} PbPtrObj;
-
 /* ---- Value Constructors & Exact Truthiness ---- */
 
 static inline PbValue val_nil(void)            { PbValue v; v.tag = VAL_NIL; v.taint = 0; v.as.num = 0; return v; }
 static inline PbValue val_bool(bool b)         { PbValue v; v.tag = VAL_BOOL; v.taint = 0; v.as.b = b; return v; }
 static inline PbValue val_num(double n)        { PbValue v; v.tag = VAL_NUM; v.taint = 0; v.as.num = n; return v; }
-static inline PbValue val_i64(int64_t i)       { PbValue v; v.tag = VAL_I64; v.taint = 0; v.as.i64 = i; return v; }
 static inline PbValue val_obj(void *o)         { PbValue v; v.tag = VAL_OBJ; v.taint = 0; v.as.obj = (PbObj *)o; return v; }
 static inline PbValue val_builtin(uint16_t id) { PbValue v; v.tag = VAL_BUILTIN; v.taint = 0; v.as.builtin_id = id; return v; }
 static inline PbValue val_with_taint(PbValue v, uint8_t t) { v.taint = t; return v; }
@@ -393,44 +379,18 @@ static inline bool is_obj_type(PbValue v, PbObjType t) {
     return v.tag == VAL_OBJ && v.as.obj != NULL && v.as.obj->type == t;
 }
 
-static inline double zr_val_as_f64(PbValue v) { return v.tag == VAL_I64 ? (double)v.as.i64 : v.as.num; }
-static inline int64_t zr_val_as_i64(PbValue v) { return v.tag == VAL_I64 ? v.as.i64 : (int64_t)v.as.num; }
-#ifndef ZR_INTERN_MAX_LEN
-#define ZR_INTERN_MAX_LEN 32u
-#endif
-static inline bool zr_val_is_num_like(PbValue v) {
-    return v.tag == VAL_NUM || v.tag == VAL_I64;
-}
-
-static inline bool zr_val_to_f64(PbValue v, double *out) {
-    if (v.tag == VAL_NUM) { *out = v.as.num; return true; }
-    if (v.tag == VAL_I64) { *out = (double)v.as.i64; return true; }
-    return false;
-}
-
-static inline bool zr_val_to_i64(PbValue v, int64_t *out) {
-    if (v.tag == VAL_I64) { *out = v.as.i64; return true; }
-    if (v.tag == VAL_NUM && isfinite(v.as.num) &&
-        v.as.num >= -9223372036854775808.0 && v.as.num < 9223372036854775808.0) {
-        *out = (int64_t)v.as.num;
-        return true;
-    }
-    return false;
-}
-
-#define AS_STR(v)        ((PbStr *)(v).as.obj)
-#define AS_ARRAY(v)      ((PbArray *)(v).as.obj)
-#define AS_MAP(v)        ((PbMap *)(v).as.obj)
-#define AS_FUNC(v)       ((PbFunc *)(v).as.obj)
-#define AS_CLOSURE(v)    ((PbClosure *)(v).as.obj)
-#define AS_MODULE(v)     ((PbModule *)(v).as.obj)
-#define AS_BIGINT(v)     ((PbBigIntObj *)(v).as.obj)
-#define AS_RATIONAL(v)   ((PbRationalObj *)(v).as.obj)
-#define AS_DECIMAL(v)    ((PbDecimalObj *)(v).as.obj)
+#define AS_STR(v)      ((PbStr *)(v).as.obj)
+#define AS_ARRAY(v)    ((PbArray *)(v).as.obj)
+#define AS_MAP(v)      ((PbMap *)(v).as.obj)
+#define AS_FUNC(v)     ((PbFunc *)(v).as.obj)
+#define AS_CLOSURE(v)  ((PbClosure *)(v).as.obj)
+#define AS_MODULE(v)   ((PbModule *)(v).as.obj)
+#define AS_BIGINT(v)   ((PbBigIntObj *)(v).as.obj)
+#define AS_RATIONAL(v) ((PbRationalObj *)(v).as.obj)
+#define AS_DECIMAL(v)  ((PbDecimalObj *)(v).as.obj)
 #define AS_BYTES(v)      ((PbBytes *)(v).as.obj)
 #define AS_F64BUF(v)     ((PbF64Buf *)(v).as.obj)
 #define AS_STRUCT_BUF(v) ((PbStructBuf *)(v).as.obj)
-#define AS_PTR(v)        ((PbPtrObj *)(v).as.obj)
 
 /* Matches VM::is_truthy in crates/pblang-vm/src/vm.rs */
 static inline bool val_truthy(PbValue v) {
@@ -438,7 +398,6 @@ static inline bool val_truthy(PbValue v) {
         case VAL_NIL:     return false;
         case VAL_BOOL:    return v.as.b;
         case VAL_NUM:     return v.as.num != 0.0;
-        case VAL_I64:     return v.as.i64 != 0;
         case VAL_BUILTIN: return true;
         case VAL_OBJ:
             switch (v.as.obj->type) {
@@ -451,7 +410,6 @@ static inline bool val_truthy(PbValue v) {
                 case OBJ_BYTES:      return AS_BYTES(v)->len > 0;
                 case OBJ_F64BUF:     return AS_F64BUF(v)->len > 0;
                 case OBJ_STRUCT_BUF: return AS_STRUCT_BUF(v)->is_schema ? (AS_STRUCT_BUF(v)->field_count > 0) : (AS_STRUCT_BUF(v)->len > 0);
-                case OBJ_PTR:        return AS_PTR(v)->ptr != 0;
                 default:             return true;
             }
     }
@@ -463,7 +421,6 @@ static inline const char *zr_val_type_name(PbValue v) {
         case VAL_NIL:     return "nil";
         case VAL_BOOL:    return "bool";
         case VAL_NUM:     return "number";
-        case VAL_I64:     return "i64";
         case VAL_BUILTIN: return "fn";
         case VAL_OBJ:
             switch (v.as.obj->type) {
@@ -479,7 +436,6 @@ static inline const char *zr_val_type_name(PbValue v) {
                 case OBJ_BYTES:      return "bytes";
                 case OBJ_F64BUF:     return "f64buf";
                 case OBJ_STRUCT_BUF: return AS_STRUCT_BUF(v)->is_schema ? "struct_schema" : "struct_buf";
-                case OBJ_PTR:        return "ptr";
                 default:             return "object";
             }
     }
@@ -607,24 +563,6 @@ typedef struct {
     int32_t      last_file_idx;
 } ZrCovTable;
 
-#define ZR_SLAB_BYTES      65536u
-#define ZR_SLAB_CLASSES    6u
-#define ZR_INTERN_SLOTS    1024u
-#define ZR_MAX_REGIONS     32u
-
-typedef struct {
-    uint8_t *base;
-    void    *free_head;
-    uint32_t bump_off;
-    uint16_t slot_size;
-    uint16_t live_count;
-    uint8_t  size_class;       /* 1..6 */
-    uint8_t  backing_kind;     /* 1 = mmap/VirtualAlloc, 2 = heap */
-    bool     decommitted;
-} ZrGcSlab;
-
-typedef bool (*ZrDebugTrapFn)(PbVM *vm, CallFrame *frame, PbFunc *fn, uint32_t ip, uint32_t line);
-
 struct PbVM {
     PbValue     *stack;
     size_t       sp;
@@ -651,7 +589,7 @@ struct PbVM {
     PbValue      temp_roots[ZR_MAX_TEMP_ROOTS];
     size_t       temp_root_count;
 
-    /* Two-Generation Nursery + Size-Classed OS Slab Pool + Adaptive Mark-and-Sweep GC */
+    /* Two-Generation Nursery + Adaptive Mark-and-Sweep GC */
     PbObj       *objects;          /* tenured / old generation */
     PbObj       *nursery_objects;  /* young generation */
     PbObj      **rem_set;          /* remembered set of tenured parents */
@@ -672,27 +610,6 @@ struct PbVM {
     size_t       map_allocs;
     size_t       module_allocs;
     int          gc_inhibit;
-
-    /* Zero-Fragmentation 64 KiB OS Slab Pool + Immediate Page Reclamation */
-    ZrGcSlab    *gc_slabs;
-    uint16_t     gc_slab_len;
-    uint16_t     gc_slab_cap;
-    int32_t      gc_active_slab[ZR_SLAB_CLASSES + 1];
-    size_t       os_pages_reclaimed;
-    size_t       slab_allocs;
-
-    /* Weakly-Swept Short-String Intern Table (<= 32 bytes, O(1) lookup & pointer equality) */
-    PbStr       *intern_tab[ZR_INTERN_SLOTS];
-    size_t       intern_hits;
-
-    /* Lexical @region Arena Scope Tracking */
-    uint32_t     region_depth;
-    size_t       region_enter_bytes[ZR_MAX_REGIONS];
-
-    /* Real VM Step-Debugger / DAP Trap State */
-    bool           debug_active;
-    ZrDebugTrapFn  debug_trap_fn;
-    void          *debug_ctx;
 
     /* JIT statistics */
     size_t       jit_compiled_functions;
@@ -997,234 +914,9 @@ static inline void vm_write_barrier(PbVM *vm, PbObj *parent, PbValue child) {
     }
 }
 
-#ifndef MAP_ANONYMOUS
-#ifdef MAP_ANON
-#define MAP_ANONYMOUS MAP_ANON
-#endif
-#endif
-
-static inline uint16_t zr_slab_size_for_class(uint8_t cls) {
-    static const uint16_t k_sizes[7] = { 0, 48, 64, 96, 128, 192, 256 };
-    return (cls <= 6u) ? k_sizes[cls] : 0;
-}
-
-static inline uint8_t zr_slab_class_for_size(size_t sz) {
-    if (sz <= 48u)  return 1u;
-    if (sz <= 64u)  return 2u;
-    if (sz <= 96u)  return 3u;
-    if (sz <= 128u) return 4u;
-    if (sz <= 192u) return 5u;
-    if (sz <= 256u) return 6u;
-    return 0u;
-}
-
-static uint8_t *zr_os_slab_map_64k(uint8_t *out_backing_kind) {
-#if defined(_WIN32)
-    void *p = VirtualAlloc(NULL, ZR_SLAB_BYTES, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (p) { *out_backing_kind = 1u; return (uint8_t *)p; }
-#elif defined(MAP_ANONYMOUS)
-    void *p = mmap(NULL, ZR_SLAB_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p != MAP_FAILED && p != NULL) { *out_backing_kind = 1u; return (uint8_t *)p; }
-#endif
-    *out_backing_kind = 2u;
-    return (uint8_t *)zr_xcalloc(1, ZR_SLAB_BYTES);
-}
-
-static void zr_os_slab_decommit(PbVM *vm, ZrGcSlab *s) {
-    if (!s || !s->base || s->decommitted || s->live_count > 0 || s->backing_kind != 1u) return;
-#if defined(_WIN32)
-    if (VirtualFree(s->base, ZR_SLAB_BYTES, MEM_DECOMMIT)) {
-        s->decommitted = true;
-        if (vm) vm->os_pages_reclaimed += (ZR_SLAB_BYTES / 4096u);
-    }
-#elif defined(MADV_DONTNEED)
-    if (madvise(s->base, ZR_SLAB_BYTES, MADV_DONTNEED) == 0) {
-        s->decommitted = true;
-        if (vm) vm->os_pages_reclaimed += (ZR_SLAB_BYTES / 4096u);
-    }
-#else
-    (void)vm;
-#endif
-}
-
-static bool zr_os_slab_recommit(ZrGcSlab *s) {
-    if (!s || !s->base) return false;
-    if (!s->decommitted) return true;
-#if defined(_WIN32)
-    if (!VirtualAlloc(s->base, ZR_SLAB_BYTES, MEM_COMMIT, PAGE_READWRITE)) return false;
-#endif
-    s->decommitted = false;
-    s->bump_off = 0;
-    s->free_head = NULL;
-    return true;
-}
-
-static void zr_vm_free_all_slabs(PbVM *vm) {
-    if (!vm || !vm->gc_slabs) return;
-    for (uint16_t i = 0; i < vm->gc_slab_len; i++) {
-        ZrGcSlab *s = &vm->gc_slabs[i];
-        if (!s->base) continue;
-        if (s->backing_kind == 1u) {
-#if defined(_WIN32)
-            VirtualFree(s->base, 0, MEM_RELEASE);
-#elif defined(MAP_ANONYMOUS)
-            munmap(s->base, ZR_SLAB_BYTES);
-#else
-            free(s->base);
-#endif
-        } else {
-            free(s->base);
-        }
-        s->base = NULL;
-    }
-    free(vm->gc_slabs);
-    vm->gc_slabs = NULL;
-    vm->gc_slab_len = 0;
-    vm->gc_slab_cap = 0;
-    for (size_t c = 0; c <= ZR_SLAB_CLASSES; c++) vm->gc_active_slab[c] = -1;
-}
-
-static size_t zr_vm_reclaim_os_pages(PbVM *vm) {
-    if (!vm) return 0;
-    size_t before = vm->os_pages_reclaimed;
-    for (uint16_t i = 0; i < vm->gc_slab_len; i++) {
-        ZrGcSlab *s = &vm->gc_slabs[i];
-        if (s->live_count == 0) {
-            s->bump_off = 0;
-            s->free_head = NULL;
-            zr_os_slab_decommit(vm, s);
-        }
-    }
-    return vm->os_pages_reclaimed - before;
-}
-
-static void *zr_slab_alloc_slot(PbVM *vm, uint8_t cls, uint16_t *out_slab_idx) {
-    uint16_t slot_sz = zr_slab_size_for_class(cls);
-    int32_t act = vm->gc_active_slab[cls];
-    if (act >= 0 && (uint16_t)act < vm->gc_slab_len) {
-        ZrGcSlab *s = &vm->gc_slabs[act];
-        if (!s->decommitted) {
-            if (s->free_head != NULL) {
-                void *p = s->free_head;
-                s->free_head = *(void **)p;
-                memset(p, 0, slot_sz);
-                s->live_count++;
-                *out_slab_idx = (uint16_t)act;
-                return p;
-            }
-            if ((uint32_t)s->bump_off + slot_sz <= ZR_SLAB_BYTES) {
-                void *p = s->base + s->bump_off;
-                s->bump_off += slot_sz;
-                memset(p, 0, slot_sz);
-                s->live_count++;
-                *out_slab_idx = (uint16_t)act;
-                return p;
-            }
-        }
-    }
-    /* Search existing slabs of the same class with free capacity */
-    int32_t decom_cand = -1;
-    for (uint16_t i = 0; i < vm->gc_slab_len; i++) {
-        ZrGcSlab *s = &vm->gc_slabs[i];
-        if (s->size_class != cls) continue;
-        if (s->decommitted) {
-            if (decom_cand < 0) decom_cand = (int32_t)i;
-            continue;
-        }
-        if (s->free_head != NULL || (uint32_t)s->bump_off + slot_sz <= ZR_SLAB_BYTES) {
-            vm->gc_active_slab[cls] = (int32_t)i;
-            if (s->free_head != NULL) {
-                void *p = s->free_head;
-                s->free_head = *(void **)p;
-                memset(p, 0, slot_sz);
-                s->live_count++;
-                *out_slab_idx = i;
-                return p;
-            }
-            void *p = s->base + s->bump_off;
-            s->bump_off += slot_sz;
-            memset(p, 0, slot_sz);
-            s->live_count++;
-            *out_slab_idx = i;
-            return p;
-        }
-    }
-    if (decom_cand >= 0) {
-        ZrGcSlab *s = &vm->gc_slabs[decom_cand];
-        if (zr_os_slab_recommit(s)) {
-            vm->gc_active_slab[cls] = decom_cand;
-            void *p = s->base;
-            s->bump_off = slot_sz;
-            memset(p, 0, slot_sz);
-            s->live_count = 1;
-            *out_slab_idx = (uint16_t)decom_cand;
-            return p;
-        }
-    }
-    if (vm->gc_slab_len >= 65534u) return NULL;
-    if (vm->gc_slab_len >= vm->gc_slab_cap) {
-        uint32_t ncap = vm->gc_slab_cap ? ((uint32_t)vm->gc_slab_cap * 2u) : 16u;
-        if (ncap > 65534u) ncap = 65534u;
-        vm->gc_slabs = (ZrGcSlab *)zr_xrealloc(vm->gc_slabs, ncap * sizeof(ZrGcSlab));
-        vm->gc_slab_cap = (uint16_t)ncap;
-    }
-    uint8_t bkind = 0;
-    uint8_t *base = zr_os_slab_map_64k(&bkind);
-    if (!base) return NULL;
-    uint16_t idx = vm->gc_slab_len++;
-    ZrGcSlab *ns = &vm->gc_slabs[idx];
-    ns->base = base;
-    ns->free_head = NULL;
-    ns->bump_off = slot_sz;
-    ns->slot_size = slot_sz;
-    ns->live_count = 1;
-    ns->size_class = cls;
-    ns->backing_kind = bkind;
-    ns->decommitted = false;
-    vm->gc_active_slab[cls] = (int32_t)idx;
-    memset(base, 0, slot_sz);
-    *out_slab_idx = idx;
-    return base;
-}
-
-static void zr_slab_free_slot(PbVM *vm, PbObj *o) {
-    if (!vm || o->alloc_kind == 0 || o->alloc_kind > ZR_SLAB_CLASSES || o->slab_idx >= vm->gc_slab_len) {
-        free(o);
-        return;
-    }
-    ZrGcSlab *s = &vm->gc_slabs[o->slab_idx];
-    if (s->live_count > 0) s->live_count--;
-    if (s->live_count == 0) {
-        s->bump_off = 0;
-        s->free_head = NULL;
-        /* Keep active slab warm; immediately return idle non-active 64 KiB slabs to the OS! */
-        if (vm->gc_active_slab[s->size_class] != (int32_t)o->slab_idx) {
-            zr_os_slab_decommit(vm, s);
-        }
-    } else {
-        *(void **)o = s->free_head;
-        s->free_head = (void *)o;
-    }
-}
-
 static void *vm_alloc_obj(PbVM *vm, size_t sz, PbObjType type) {
-    uint8_t cls = zr_slab_class_for_size(sz);
-    uint16_t sidx = 0;
-    PbObj *o = NULL;
-    if (vm && cls > 0) {
-        o = (PbObj *)zr_slab_alloc_slot(vm, cls, &sidx);
-        if (o) {
-            o->alloc_kind = cls;
-            o->slab_idx = sidx;
-            vm->slab_allocs++;
-        }
-    }
-    if (!o) {
-        o = (PbObj *)zr_xcalloc(1, sz);
-        o->alloc_kind = 0;
-        o->slab_idx = 0;
-    }
-    o->type = (uint8_t)type;
+    PbObj *o = (PbObj *)zr_xcalloc(1, sz);
+    o->type = type;
     o->marked = 0;
     o->frozen = 0;
     o->gc_rem = 0;
@@ -1245,29 +937,11 @@ static void *vm_alloc_obj(PbVM *vm, size_t sz, PbObjType type) {
 }
 
 static PbStr *pb_str_new(PbVM *vm, const char *chars, size_t len) {
-    uint64_t h = zr_fnv1a(chars ? chars : "", len);
-    if (vm && len <= 32u) {
-        size_t slot = (size_t)h & (ZR_INTERN_SLOTS - 1u);
-        PbStr *hit = vm->intern_tab[slot];
-        if (hit && hit->hash == h && hit->len == len &&
-            (len == 0 || memcmp(hit->chars, chars, len) == 0)) {
-            vm->intern_hits++;
-            return hit;
-        }
-        PbStr *s = (PbStr *)vm_alloc_obj(vm, sizeof(PbStr) + len + 1, OBJ_STR);
-        if (len > 0 && chars) memcpy(s->chars, chars, len);
-        s->chars[len] = '\0';
-        s->len = len;
-        s->hash = h;
-        vm->string_allocs++;
-        vm->intern_tab[slot] = s;
-        return s;
-    }
     PbStr *s = (PbStr *)vm_alloc_obj(vm, sizeof(PbStr) + len + 1, OBJ_STR);
     if (len > 0 && chars) memcpy(s->chars, chars, len);
     s->chars[len] = '\0';
     s->len = len;
-    s->hash = h;
+    s->hash = zr_fnv1a(s->chars, len);
     vm->string_allocs++;
     return s;
 }
@@ -1275,19 +949,6 @@ static PbStr *pb_str_new(PbVM *vm, const char *chars, size_t len) {
 static inline PbStr *pb_str_c(PbVM *vm, const char *cstr) {
     if (!cstr) cstr = "";
     return pb_str_new(vm, cstr, strlen(cstr));
-}
-
-static PbPtrObj *pb_ptr_new(PbVM *vm, uintptr_t ptr, size_t byte_len, bool owned, const char *tag) {
-    PbPtrObj *p = (PbPtrObj *)vm_alloc_obj(vm, sizeof(PbPtrObj), OBJ_PTR);
-    p->ptr = ptr;
-    p->byte_len = byte_len;
-    p->owned = owned;
-    if (tag && tag[0]) {
-        snprintf(p->tag, sizeof(p->tag), "%s", tag);
-    } else {
-        snprintf(p->tag, sizeof(p->tag), "void*");
-    }
-    return p;
 }
 
 static PbBytes *pb_bytes_new(PbVM *vm, size_t len, bool shared) {
@@ -1694,9 +1355,6 @@ static void vm_format_value_rec(PbVM *vm, ZrBuf *b, PbValue v, int depth) {
         case VAL_NUM:
             zr_format_number(b, v.as.num);
             return;
-        case VAL_I64:
-            zr_buf_printf(b, "%" PRId64, v.as.i64);
-            return;
         case VAL_BUILTIN: {
             const char *nm = (v.as.builtin_id < vm->builtin_count) ? vm->builtin_defs[v.as.builtin_id].name : "?";
             zr_buf_printf(b, "<builtin %s>", nm);
@@ -1751,10 +1409,6 @@ static void vm_format_value_rec(PbVM *vm, ZrBuf *b, PbValue v, int depth) {
                                       AS_STRUCT_BUF(v)->len, AS_STRUCT_BUF(v)->stride);
                     }
                     return;
-                case OBJ_PTR:
-                    zr_buf_printf(b, "<ptr %s 0x%" PRIxPTR " len=%zu>",
-                                  AS_PTR(v)->tag, AS_PTR(v)->ptr, AS_PTR(v)->byte_len);
-                    return;
                 case OBJ_ARRAY: {
                     PbArray *arr = AS_ARRAY(v);
                     zr_buf_push(b, '[');
@@ -1805,43 +1459,12 @@ static PbStr *vm_value_to_pbstr(PbVM *vm, PbValue v) {
     return res;
 }
 
-static inline bool zr_i64_eq_f64(int64_t i, double d) {
-    if (!isfinite(d) || floor(d) != d) return false;
-    if (d < -9223372036854775808.0 || d >= 9223372036854775808.0) return false;
-    return (int64_t)d == i;
-}
-
-static inline int zr_i64_cmp_f64(int64_t i, double d) {
-    if (d < -9223372036854775808.0) return 1;
-    if (d >= 9223372036854775808.0) return -1;
-    double fl = floor(d);
-    int64_t di = (int64_t)fl;
-    if (i < di) return -1;
-    if (i > di) return 1;
-    return (d > fl) ? -1 : 0;
-}
-
 static bool val_equal(PbValue a, PbValue b) {
     if (a.tag == VAL_NUM && b.tag == VAL_NUM) return a.as.num == b.as.num;
-    if (a.tag == VAL_I64 && b.tag == VAL_I64) return a.as.i64 == b.as.i64;
-    if (a.tag == VAL_I64 && b.tag == VAL_NUM) return zr_i64_eq_f64(a.as.i64, b.as.num);
-    if (a.tag == VAL_NUM && b.tag == VAL_I64) return zr_i64_eq_f64(b.as.i64, a.as.num);
-    if ((a.tag == VAL_NUM || a.tag == VAL_I64 || is_obj_type(a, OBJ_BIGINT) || is_obj_type(a, OBJ_RATIONAL) || is_obj_type(a, OBJ_DECIMAL)) &&
-        (b.tag == VAL_NUM || b.tag == VAL_I64 || is_obj_type(b, OBJ_BIGINT) || is_obj_type(b, OBJ_RATIONAL) || is_obj_type(b, OBJ_DECIMAL))) {
+    if ((a.tag == VAL_NUM || is_obj_type(a, OBJ_BIGINT) || is_obj_type(a, OBJ_RATIONAL) || is_obj_type(a, OBJ_DECIMAL)) &&
+        (b.tag == VAL_NUM || is_obj_type(b, OBJ_BIGINT) || is_obj_type(b, OBJ_RATIONAL) || is_obj_type(b, OBJ_DECIMAL))) {
         if (is_obj_type(a, OBJ_BIGINT) && is_obj_type(b, OBJ_BIGINT)) {
             return zr_bi_cmp(&AS_BIGINT(a)->v, &AS_BIGINT(b)->v) == 0;
-        }
-        if (is_obj_type(a, OBJ_BIGINT) && b.tag == VAL_I64) {
-            ZrBigInt tb; zr_bi_from_i64(&tb, b.as.i64);
-            int c = zr_bi_cmp(&AS_BIGINT(a)->v, &tb);
-            zr_bi_free(&tb);
-            return c == 0;
-        }
-        if (a.tag == VAL_I64 && is_obj_type(b, OBJ_BIGINT)) {
-            ZrBigInt ta; zr_bi_from_i64(&ta, a.as.i64);
-            int c = zr_bi_cmp(&ta, &AS_BIGINT(b)->v);
-            zr_bi_free(&ta);
-            return c == 0;
         }
         if (is_obj_type(a, OBJ_BIGINT) && b.tag == VAL_NUM) {
             ZrBigInt tb;
@@ -1872,7 +1495,6 @@ static bool val_equal(PbValue a, PbValue b) {
         case VAL_NIL:     return true;
         case VAL_BOOL:    return a.as.b == b.as.b;
         case VAL_NUM:     return a.as.num == b.as.num;
-        case VAL_I64:     return a.as.i64 == b.as.i64;
         case VAL_BUILTIN: return a.as.builtin_id == b.as.builtin_id;
         case VAL_OBJ: {
             if (a.as.obj == b.as.obj) return true;
@@ -1880,9 +1502,6 @@ static bool val_equal(PbValue a, PbValue b) {
             if (a.as.obj->type == OBJ_STR) {
                 PbStr *sa = AS_STR(a), *sb = AS_STR(b);
                 return sa->hash == sb->hash && sa->len == sb->len && memcmp(sa->chars, sb->chars, sa->len) == 0;
-            }
-            if (a.as.obj->type == OBJ_PTR) {
-                return AS_PTR(a)->ptr == AS_PTR(b)->ptr;
             }
             if (a.as.obj->type == OBJ_BYTES) {
                 PbBytes *ba = AS_BYTES(a), *bb = AS_BYTES(b);
@@ -1937,10 +1556,6 @@ static bool zr_extract_bigint(PbValue v, ZrBigInt *out) {
         zr_bi_copy(out, &AS_BIGINT(v)->v);
         return true;
     }
-    if (v.tag == VAL_I64) {
-        zr_bi_from_i64(out, v.as.i64);
-        return true;
-    }
     if (v.tag == VAL_NUM) return zr_bi_from_f64(out, v.as.num);
     return false;
 }
@@ -1953,11 +1568,6 @@ static bool zr_extract_rational(PbValue v, ZrRational *out) {
     }
     if (is_obj_type(v, OBJ_BIGINT)) {
         zr_bi_copy(&out->num, &AS_BIGINT(v)->v);
-        zr_bi_from_i64(&out->den, 1);
-        return true;
-    }
-    if (v.tag == VAL_I64) {
-        zr_bi_from_i64(&out->num, v.as.i64);
         zr_bi_from_i64(&out->den, 1);
         return true;
     }
@@ -1983,11 +1593,6 @@ static bool zr_extract_decimal(PbValue v, ZrDecimal *out) {
     }
     if (is_obj_type(v, OBJ_BIGINT)) {
         zr_bi_copy(&out->coeff, &AS_BIGINT(v)->v);
-        out->scale = 0;
-        return true;
-    }
-    if (v.tag == VAL_I64) {
-        zr_bi_from_i64(&out->coeff, v.as.i64);
         out->scale = 0;
         return true;
     }
@@ -2159,16 +1764,17 @@ static bool vm_bignum_cmp(PbVM *vm, PbValue a, PbValue b, int *out_cmp) {
             *out_cmp = zr_bi_cmp(&AS_BIGINT(a)->v, &AS_BIGINT(b)->v);
             return true;
         }
-        ZrBigInt ba, bb;
-        zr_bi_init(&ba); zr_bi_init(&bb);
-        if (zr_extract_bigint(a, &ba) && zr_extract_bigint(b, &bb)) {
-            *out_cmp = zr_bi_cmp(&ba, &bb);
+        double fa = is_obj_type(a, OBJ_BIGINT) ? zr_bi_to_f64(&AS_BIGINT(a)->v) : a.as.num;
+        double fb = is_obj_type(b, OBJ_BIGINT) ? zr_bi_to_f64(&AS_BIGINT(b)->v) : b.as.num;
+        if (floor(fa) == fa && floor(fb) == fb) {
+            ZrBigInt ba, bb;
+            if (zr_extract_bigint(a, &ba) && zr_extract_bigint(b, &bb)) {
+                *out_cmp = zr_bi_cmp(&ba, &bb);
+                zr_bi_free(&ba); zr_bi_free(&bb);
+                return true;
+            }
             zr_bi_free(&ba); zr_bi_free(&bb);
-            return true;
         }
-        zr_bi_free(&ba); zr_bi_free(&bb);
-        double fa = is_obj_type(a, OBJ_BIGINT) ? zr_bi_to_f64(&AS_BIGINT(a)->v) : (a.tag == VAL_I64 ? (double)a.as.i64 : a.as.num);
-        double fb = is_obj_type(b, OBJ_BIGINT) ? zr_bi_to_f64(&AS_BIGINT(b)->v) : (b.tag == VAL_I64 ? (double)b.as.i64 : b.as.num);
         *out_cmp = (fa < fb) ? -1 : ((fa > fb) ? 1 : 0);
         return true;
     }
@@ -2233,7 +1839,6 @@ static void gc_mark_obj(PbObj *o) {
         case OBJ_BYTES:
         case OBJ_F64BUF:
         case OBJ_STRUCT_BUF:
-        case OBJ_PTR:
             break;
         case OBJ_ARRAY: {
             PbArray *a = (PbArray *)o;
@@ -2292,7 +1897,6 @@ static void gc_scan_children_nursery(PbObj *o) {
         case OBJ_BYTES:
         case OBJ_F64BUF:
         case OBJ_STRUCT_BUF:
-        case OBJ_PTR:
             break;
         case OBJ_ARRAY: {
             PbArray *a = (PbArray *)o;
@@ -2356,14 +1960,6 @@ static void gc_free_obj(PbVM *vm, PbObj *o) {
     switch (o->type) {
         case OBJ_STR:
             break;
-        case OBJ_PTR: {
-            PbPtrObj *p = (PbPtrObj *)o;
-            if (p->owned && p->ptr != 0) {
-                free((void *)p->ptr);
-                p->ptr = 0;
-            }
-            break;
-        }
         case OBJ_BYTES: {
             PbBytes *b = (PbBytes *)o;
             if (b->backing) zr_shared_release(b->backing);
@@ -2429,7 +2025,7 @@ static void gc_free_obj(PbVM *vm, PbObj *o) {
             zr_dec_free(&((PbDecimalObj *)o)->v);
             break;
     }
-    zr_slab_free_slot(vm, o);
+    free(o);
 }
 
 static void vm_collect_nursery(PbVM *vm) {
@@ -2476,12 +2072,6 @@ static void vm_collect_nursery(PbVM *vm) {
             }
         }
         g_zr_null_vm_barrier = 0;
-    }
-
-    /* Weakly sweep unmarked nursery strings from short-string intern table */
-    for (size_t i = 0; i < ZR_INTERN_SLOTS; i++) {
-        PbStr *is = vm->intern_tab[i];
-        if (is && is->obj.gc_gen == 0 && !is->obj.marked) vm->intern_tab[i] = NULL;
     }
 
     PbObj *cur = vm->nursery_objects;
@@ -2547,12 +2137,6 @@ static void vm_collect_garbage(PbVM *vm, size_t *out_arr, size_t *out_map, size_
     if (vm->signal_handlers) gc_mark_obj((PbObj *)vm->signal_handlers);
     zr_ffi_gc_mark_roots(vm);
 
-    /* Weakly sweep unmarked strings from short-string intern table */
-    for (size_t i = 0; i < ZR_INTERN_SLOTS; i++) {
-        PbStr *is = vm->intern_tab[i];
-        if (is && !is->obj.marked) vm->intern_tab[i] = NULL;
-    }
-
     size_t swept_arr = 0, swept_map = 0, swept_mod = 0;
     PbObj **link = &vm->objects;
     while (*link != NULL) {
@@ -2571,9 +2155,6 @@ static void vm_collect_garbage(PbVM *vm, size_t *out_arr, size_t *out_map, size_
             gc_free_obj(vm, cur);
         }
     }
-
-    /* Immediately return idle empty 64 KiB slabs to the OS kernel */
-    (void)zr_vm_reclaim_os_pages(vm);
 
     size_t min_thresh = (sizeof(void *) <= 4) ? (512u * 1024u) : (2u * 1024u * 1024u);
     size_t doubled = vm->live_bytes * 2;
@@ -2746,10 +2327,10 @@ retry_call:;
     /* Tier-2 W^X Native JIT compilation trigger (at 32 calls) & fastpath execution */
     PbFunc *fn = cl->fn;
     fn->call_count++;
-    if (!ZR_UNLIKELY(vm->cov_enabled || vm->debug_active) && fn->call_count == 32 && !fn->jit_attempted) {
+    if (!ZR_UNLIKELY(vm->cov_enabled) && fn->call_count == 32 && !fn->jit_attempted) {
         zr_maybe_tier2_jit(vm, fn);
     }
-    if (!ZR_UNLIKELY(vm->cov_enabled || vm->debug_active) && fn->jit_fn != NULL && !fn->is_vararg && fn->arity <= 8) {
+    if (!ZR_UNLIKELY(vm->cov_enabled) && fn->jit_fn != NULL && !fn->is_vararg && fn->arity <= 8) {
         bool jit_ok = true;
         if (fn->jit_self_kind == 1) {
             PbMap *gmap = cl->module ? cl->module->globals : vm->globals;
@@ -3139,52 +2720,6 @@ static bool zr_try_osr_numeric_loop(PbVM *vm, CallFrame *frame, PbFunc *fn,
     return true;
 }
 
-/* ---- Exact 64-bit Integer Overflow Helpers (Item #1) ---- */
-
-static inline bool zr_i64_add_ovf(int64_t a, int64_t b, int64_t *out) {
-#if defined(__GNUC__) || defined(__clang__)
-    return __builtin_add_overflow(a, b, out);
-#else
-    if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) return true;
-    *out = a + b;
-    return false;
-#endif
-}
-
-static inline bool zr_i64_sub_ovf(int64_t a, int64_t b, int64_t *out) {
-#if defined(__GNUC__) || defined(__clang__)
-    return __builtin_sub_overflow(a, b, out);
-#else
-    if ((b < 0 && a > INT64_MAX + b) || (b > 0 && a < INT64_MIN + b)) return true;
-    *out = a - b;
-    return false;
-#endif
-}
-
-static inline bool zr_i64_mul_ovf(int64_t a, int64_t b, int64_t *out) {
-#if defined(__GNUC__) || defined(__clang__)
-    return __builtin_mul_overflow(a, b, out);
-#else
-    if (a == 0 || b == 0) { *out = 0; return false; }
-    if (a == -1 && b == INT64_MIN) return true;
-    if (b == -1 && a == INT64_MIN) return true;
-    int64_t r = (int64_t)((uint64_t)a * (uint64_t)b);
-    if (r / b != a) return true;
-    *out = r;
-    return false;
-#endif
-}
-
-static inline bool zr_val_as_exact_int64(PbValue v, int64_t *out) {
-    if (v.tag == VAL_I64) { *out = v.as.i64; return true; }
-    if (v.tag == VAL_NUM && isfinite(v.as.num) && floor(v.as.num) == v.as.num &&
-        v.as.num >= -9007199254740992.0 && v.as.num <= 9007199254740992.0) {
-        *out = (int64_t)v.as.num;
-        return true;
-    }
-    return false;
-}
-
 /* ---- Bytecode Dispatch Loop (Computed-Goto Threaded + Superinstructions + Monomorphic ICs) ---- */
 
 static bool vm_execute_until(PbVM *vm, size_t stop_frame_depth, PbValue *out_ret) {
@@ -3301,14 +2836,6 @@ static bool vm_execute_until(PbVM *vm, size_t stop_frame_depth, PbValue *out_ret
     if (__builtin_expect(frame->ip >= fn->code_len, 0)) goto frame_falloff; \
     ins = &fn->code[frame->ip++]; \
     if (ZR_UNLIKELY(vm->cov_enabled)) zr_cov_hit_line(vm, fn, ins->line); \
-    if (ZR_UNLIKELY(vm->debug_active && vm->debug_trap_fn != NULL)) { \
-        if (!vm->debug_trap_fn(vm, frame, fn, frame->ip - 1u, ins->line)) { \
-            if (vm->exited) { if (out_ret) *out_ret = val_nil(); return true; } \
-            goto handle_exception; \
-        } \
-        ZR_RELOAD_FRAME(); \
-        ins = &fn->code[frame->ip - 1u]; \
-    } \
     op = ins->op; \
     goto *disp_tab[op]; \
 } while (0)
@@ -3338,14 +2865,6 @@ next_iter:;
     if (frame->ip >= fn->code_len) goto frame_falloff;
     ins = &fn->code[frame->ip++];
     if (ZR_UNLIKELY(vm->cov_enabled)) zr_cov_hit_line(vm, fn, ins->line);
-    if (ZR_UNLIKELY(vm->debug_active && vm->debug_trap_fn != NULL)) {
-        if (!vm->debug_trap_fn(vm, frame, fn, frame->ip - 1u, ins->line)) {
-            if (vm->exited) { if (out_ret) *out_ret = val_nil(); return true; }
-            goto handle_exception;
-        }
-        ZR_RELOAD_FRAME();
-        ins = &fn->code[frame->ip - 1u];
-    }
     op = ins->op;
     switch (op)
 #endif
@@ -3386,7 +2905,7 @@ next_iter:;
         /* ---- Peephole Superinstructions (48..=54) ---- */
 
         ZR_CASE(OP_INC_LOCAL_1) {
-            if (ZR_UNLIKELY(vm->cov_enabled || vm->debug_active)) goto fallback_get_local;
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_local;
             size_t slot = frame->base + 1 + (size_t)ins->arg;
             if (slot < vm->sp && vm->stack[slot].tag == VAL_NUM) {
                 double d = fn->consts[ins->arg2].as.num;
@@ -3397,7 +2916,7 @@ next_iter:;
             goto fallback_get_local;
         }
         ZR_CASE(OP_ADD_LOCAL_LOCAL) {
-            if (ZR_UNLIKELY(vm->cov_enabled || vm->debug_active)) goto fallback_get_local;
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_local;
             size_t s1 = frame->base + 1 + (size_t)ins->arg;
             size_t s2 = frame->base + 1 + (size_t)ins->arg2;
             if (s1 < vm->sp && s2 < vm->sp &&
@@ -3413,7 +2932,7 @@ next_iter:;
             goto fallback_get_local;
         }
         ZR_CASE(OP_SUB_LOCAL_CONST) {
-            if (ZR_UNLIKELY(vm->cov_enabled || vm->debug_active)) goto fallback_get_local;
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_local;
             size_t s1 = frame->base + 1 + (size_t)ins->arg;
             if (s1 < vm->sp && vm->stack[s1].tag == VAL_NUM) {
                 double c = fn->consts[ins->arg2].as.num;
@@ -3427,7 +2946,7 @@ next_iter:;
             goto fallback_get_local;
         }
         ZR_CASE(OP_LT_LOCAL_CONST_JMPF) {
-            if (ZR_UNLIKELY(vm->cov_enabled || vm->debug_active)) goto fallback_get_local;
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_local;
             size_t s1 = frame->base + 1 + (size_t)ins->arg;
             if (s1 < vm->sp && vm->stack[s1].tag == VAL_NUM) {
                 double lv = vm->stack[s1].as.num;
@@ -3446,7 +2965,7 @@ next_iter:;
             goto fallback_get_local;
         }
         ZR_CASE(OP_LT_LOCAL_LOCAL_JMPF) {
-            if (ZR_UNLIKELY(vm->cov_enabled || vm->debug_active)) goto fallback_get_local;
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_local;
             size_t s1 = frame->base + 1 + (size_t)ins->arg;
             size_t s2 = frame->base + 1 + (size_t)ins->arg2;
             if (s1 < vm->sp && s2 < vm->sp &&
@@ -3467,7 +2986,7 @@ next_iter:;
             goto fallback_get_local;
         }
         ZR_CASE(OP_INC_GLOBAL_1) {
-            if (ZR_UNLIKELY(vm->cov_enabled || vm->debug_active)) goto fallback_get_global;
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_global;
             PbStr *name = AS_STR(fn->consts[ins->arg]);
             PbMap *gmap = vm_frame_globals(vm, frame);
             if (gmap->bcap > 0 && ins->ic_bcap == gmap->bcap && (size_t)ins->ic_slot < gmap->used) {
@@ -3491,7 +3010,7 @@ next_iter:;
             goto fallback_get_global;
         }
         ZR_CASE(OP_LT_GLOBAL_CONST_JMPF) {
-            if (ZR_UNLIKELY(vm->cov_enabled || vm->debug_active)) goto fallback_get_global;
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_global;
             PbStr *name = AS_STR(fn->consts[ins->arg]);
             PbMap *gmap = vm_frame_globals(vm, frame);
             PbMapEntry *hit = NULL;
@@ -3653,68 +3172,32 @@ next_iter:;
         }
 
         ZR_CASE(OP_ADD) {
-            if (vm->sp >= 2) {
-                uint8_t t1 = vm->stack[vm->sp - 2].tag;
-                uint8_t t2 = vm->stack[vm->sp - 1].tag;
-                if (t1 == VAL_NUM && t2 == VAL_NUM) {
-                    vm->stack[vm->sp - 2].as.num += vm->stack[vm->sp - 1].as.num;
-                    vm->stack[vm->sp - 2].taint |= vm->stack[vm->sp - 1].taint;
-                    vm->sp--;
-                    ZR_DISPATCH();
-                }
-                if (t1 == VAL_I64 && t2 == VAL_I64) {
-                    int64_t r = 0;
-                    if (!zr_i64_add_ovf(vm->stack[vm->sp - 2].as.i64, vm->stack[vm->sp - 1].as.i64, &r)) {
-                        vm->stack[vm->sp - 2].as.i64 = r;
-                        vm->stack[vm->sp - 2].taint |= vm->stack[vm->sp - 1].taint;
-                        vm->sp--;
-                        ZR_DISPATCH();
-                    }
-                }
+            if (vm->sp >= 2 &&
+                vm->stack[vm->sp - 2].tag == VAL_NUM && vm->stack[vm->sp - 1].tag == VAL_NUM) {
+                vm->stack[vm->sp - 2].as.num += vm->stack[vm->sp - 1].as.num;
+                vm->stack[vm->sp - 2].taint |= vm->stack[vm->sp - 1].taint;
+                vm->sp--;
+                ZR_DISPATCH();
             }
             goto generic_bin_arith;
         }
         ZR_CASE(OP_SUB) {
-            if (vm->sp >= 2) {
-                uint8_t t1 = vm->stack[vm->sp - 2].tag;
-                uint8_t t2 = vm->stack[vm->sp - 1].tag;
-                if (t1 == VAL_NUM && t2 == VAL_NUM) {
-                    vm->stack[vm->sp - 2].as.num -= vm->stack[vm->sp - 1].as.num;
-                    vm->stack[vm->sp - 2].taint |= vm->stack[vm->sp - 1].taint;
-                    vm->sp--;
-                    ZR_DISPATCH();
-                }
-                if (t1 == VAL_I64 && t2 == VAL_I64) {
-                    int64_t r = 0;
-                    if (!zr_i64_sub_ovf(vm->stack[vm->sp - 2].as.i64, vm->stack[vm->sp - 1].as.i64, &r)) {
-                        vm->stack[vm->sp - 2].as.i64 = r;
-                        vm->stack[vm->sp - 2].taint |= vm->stack[vm->sp - 1].taint;
-                        vm->sp--;
-                        ZR_DISPATCH();
-                    }
-                }
+            if (vm->sp >= 2 &&
+                vm->stack[vm->sp - 2].tag == VAL_NUM && vm->stack[vm->sp - 1].tag == VAL_NUM) {
+                vm->stack[vm->sp - 2].as.num -= vm->stack[vm->sp - 1].as.num;
+                vm->stack[vm->sp - 2].taint |= vm->stack[vm->sp - 1].taint;
+                vm->sp--;
+                ZR_DISPATCH();
             }
             goto generic_bin_arith;
         }
         ZR_CASE(OP_MUL) {
-            if (vm->sp >= 2) {
-                uint8_t t1 = vm->stack[vm->sp - 2].tag;
-                uint8_t t2 = vm->stack[vm->sp - 1].tag;
-                if (t1 == VAL_NUM && t2 == VAL_NUM) {
-                    vm->stack[vm->sp - 2].as.num *= vm->stack[vm->sp - 1].as.num;
-                    vm->stack[vm->sp - 2].taint |= vm->stack[vm->sp - 1].taint;
-                    vm->sp--;
-                    ZR_DISPATCH();
-                }
-                if (t1 == VAL_I64 && t2 == VAL_I64) {
-                    int64_t r = 0;
-                    if (!zr_i64_mul_ovf(vm->stack[vm->sp - 2].as.i64, vm->stack[vm->sp - 1].as.i64, &r)) {
-                        vm->stack[vm->sp - 2].as.i64 = r;
-                        vm->stack[vm->sp - 2].taint |= vm->stack[vm->sp - 1].taint;
-                        vm->sp--;
-                        ZR_DISPATCH();
-                    }
-                }
+            if (vm->sp >= 2 &&
+                vm->stack[vm->sp - 2].tag == VAL_NUM && vm->stack[vm->sp - 1].tag == VAL_NUM) {
+                vm->stack[vm->sp - 2].as.num *= vm->stack[vm->sp - 1].as.num;
+                vm->stack[vm->sp - 2].taint |= vm->stack[vm->sp - 1].taint;
+                vm->sp--;
+                ZR_DISPATCH();
             }
             goto generic_bin_arith;
         }
@@ -3740,93 +3223,19 @@ next_iter:;
                     r = pow(a.as.num, b.as.num);
                 }
                 vm_push(vm, val_with_taint(val_num(r), (uint8_t)(a.taint | b.taint)));
-            } else if ((a.tag == VAL_I64 || b.tag == VAL_I64) &&
-                       zr_val_is_num_like(a) && zr_val_is_num_like(b)) {
-                uint8_t mtaint = (uint8_t)(a.taint | b.taint);
-                int64_t ia = 0, ib = 0;
-                bool both_int = zr_val_as_exact_int64(a, &ia) && zr_val_as_exact_int64(b, &ib);
-                if (both_int && (aop == OP_ADD || aop == OP_SUB || aop == OP_MUL)) {
-                    int64_t ir = 0;
-                    bool ovf = (aop == OP_ADD) ? zr_i64_add_ovf(ia, ib, &ir) :
-                               (aop == OP_SUB) ? zr_i64_sub_ovf(ia, ib, &ir) :
-                                                 zr_i64_mul_ovf(ia, ib, &ir);
-                    if (!ovf) {
-                        vm_push(vm, val_with_taint(val_i64(ir), mtaint));
-                    } else {
-                        /* Automatic overflow promotion to exact arbitrary-precision BigInt */
-                        PbValue res = val_nil();
-                        if (!vm_bignum_arith(vm, aop, val_i64(ia), val_i64(ib), &res)) goto handle_exception;
-                        res.taint = mtaint;
-                        vm_push(vm, res);
-                    }
-                } else if (both_int && aop == OP_MOD) {
-                    if (ib == 0) RUNTIME_ERR("modulo by zero");
-                    if (ia == INT64_MIN && ib == -1) {
-                        vm_push(vm, val_with_taint(val_i64(0), mtaint));
-                    } else {
-                        vm_push(vm, val_with_taint(val_i64(ia % ib), mtaint));
-                    }
-                } else if (both_int && aop == OP_DIV) {
-                    if (ib == 0) RUNTIME_ERR("division by zero");
-                    if (ia != INT64_MIN && (ia % ib) == 0) {
-                        vm_push(vm, val_with_taint(val_i64(ia / ib), mtaint));
-                    } else {
-                        vm_push(vm, val_with_taint(val_num((double)ia / (double)ib), mtaint));
-                    }
-                } else if (both_int && aop == OP_POW && ib >= 0 && ib <= 62) {
-                    int64_t acc = 1, base_v = ia, exp_v = ib;
-                    bool ovf = false;
-                    while (exp_v > 0 && !ovf) {
-                        if (exp_v & 1) ovf = zr_i64_mul_ovf(acc, base_v, &acc);
-                        exp_v >>= 1;
-                        if (exp_v > 0 && !ovf) ovf = zr_i64_mul_ovf(base_v, base_v, &base_v);
-                    }
-                    if (!ovf) {
-                        vm_push(vm, val_with_taint(val_i64(acc), mtaint));
-                    } else {
-                        PbValue res = val_nil();
-                        if (!vm_bignum_arith(vm, aop, val_i64(ia), val_i64(ib), &res)) goto handle_exception;
-                        res.taint = mtaint;
-                        vm_push(vm, res);
-                    }
-                } else {
-                    double da = zr_val_as_f64(a), db = zr_val_as_f64(b), r = 0.0;
-                    if (aop == OP_ADD) r = da + db;
-                    else if (aop == OP_SUB) r = da - db;
-                    else if (aop == OP_MUL) r = da * db;
-                    else if (aop == OP_DIV) {
-                        if (db == 0.0) RUNTIME_ERR("division by zero");
-                        r = da / db;
-                    } else if (aop == OP_MOD) {
-                        if (db == 0.0) RUNTIME_ERR("modulo by zero");
-                        r = fmod(da, db);
-                    } else {
-                        r = pow(da, db);
-                    }
-                    vm_push(vm, val_with_taint(val_num(r), mtaint));
-                }
             } else if (aop == OP_ADD && is_obj_type(a, OBJ_STR) && is_obj_type(b, OBJ_STR)) {
                 PbStr *sa = AS_STR(a), *sb = AS_STR(b);
                 uint8_t merged_taint = (uint8_t)(a.taint | b.taint);
                 vm_push_root(vm, a);
                 vm_push_root(vm, b);
                 size_t nlen = sa->len + sb->len;
-                PbStr *res = NULL;
-                if (nlen <= ZR_INTERN_MAX_LEN) {
-                    char sbuf[ZR_INTERN_MAX_LEN + 1];
-                    if (sa->len > 0) memcpy(sbuf, sa->chars, sa->len);
-                    if (sb->len > 0) memcpy(sbuf + sa->len, sb->chars, sb->len);
-                    sbuf[nlen] = '\0';
-                    res = pb_str_new(vm, sbuf, nlen);
-                } else {
-                    res = (PbStr *)vm_alloc_obj(vm, sizeof(PbStr) + nlen + 1, OBJ_STR);
-                    if (sa->len > 0) memcpy(res->chars, sa->chars, sa->len);
-                    if (sb->len > 0) memcpy(res->chars + sa->len, sb->chars, sb->len);
-                    res->chars[nlen] = '\0';
-                    res->len = nlen;
-                    res->hash = zr_fnv1a(res->chars, nlen);
-                    vm->string_allocs++;
-                }
+                PbStr *res = (PbStr *)vm_alloc_obj(vm, sizeof(PbStr) + nlen + 1, OBJ_STR);
+                if (sa->len > 0) memcpy(res->chars, sa->chars, sa->len);
+                if (sb->len > 0) memcpy(res->chars + sa->len, sb->chars, sb->len);
+                res->chars[nlen] = '\0';
+                res->len = nlen;
+                res->hash = zr_fnv1a(res->chars, nlen);
+                vm->string_allocs++;
                 vm_pop_roots(vm, 2);
                 vm_push(vm, val_with_taint(val_obj(res), merged_taint));
             } else if (aop == OP_ADD && is_obj_type(a, OBJ_ARRAY) && is_obj_type(b, OBJ_ARRAY)) {
@@ -3892,17 +3301,6 @@ next_iter:;
             PbValue a = vm_pop(vm);
             if (a.tag == VAL_NUM) {
                 vm_push(vm, val_with_taint(val_num(-a.as.num), a.taint));
-            } else if (a.tag == VAL_I64) {
-                if (a.as.i64 != INT64_MIN) {
-                    vm_push(vm, val_with_taint(val_i64(-a.as.i64), a.taint));
-                } else {
-                    ZrBigInt nb;
-                    zr_bi_from_i64(&nb, INT64_MIN);
-                    nb.sign = 1;
-                    PbValue r = pb_bigint_new_take(vm, &nb);
-                    r.taint = a.taint;
-                    vm_push(vm, r);
-                }
             } else if (is_obj_type(a, OBJ_BIGINT)) {
                 vm_push_root(vm, a);
                 ZrBigInt nb;
@@ -3961,11 +3359,6 @@ next_iter:;
                 vm_push(vm, val_bool(op == OP_EQ ? eq : !eq));
                 ZR_DISPATCH();
             }
-            if (a.tag == VAL_I64 && b.tag == VAL_I64) {
-                bool eq = (a.as.i64 == b.as.i64);
-                vm_push(vm, val_bool(op == OP_EQ ? eq : !eq));
-                ZR_DISPATCH();
-            }
             PbValue fn_val;
             if (vm_lookup_map_dunder(a, (op == OP_EQ) ? "__eq__" : "__ne__", &fn_val)) {
                 PbValue args2[2] = {a, b};
@@ -4008,22 +3401,6 @@ next_iter:;
                          (op == OP_GT) ? (a.as.num > b.as.num) :
                                          (a.as.num >= b.as.num);
                 vm_push(vm, val_bool(r));
-            } else if (a.tag == VAL_I64 && b.tag == VAL_I64) {
-                bool r = (op == OP_LT) ? (a.as.i64 < b.as.i64) :
-                         (op == OP_LE) ? (a.as.i64 <= b.as.i64) :
-                         (op == OP_GT) ? (a.as.i64 > b.as.i64) :
-                                         (a.as.i64 >= b.as.i64);
-                vm_push(vm, val_bool(r));
-            } else if ((a.tag == VAL_I64 && b.tag == VAL_NUM) || (a.tag == VAL_NUM && b.tag == VAL_I64)) {
-                double d = (a.tag == VAL_NUM) ? a.as.num : b.as.num;
-                if (isnan(d)) {
-                    vm_push(vm, val_bool(false));
-                } else {
-                    int c = (a.tag == VAL_I64) ? zr_i64_cmp_f64(a.as.i64, b.as.num)
-                                               : -zr_i64_cmp_f64(b.as.i64, a.as.num);
-                    bool r = (op == OP_LT) ? (c < 0) : (op == OP_LE) ? (c <= 0) : (op == OP_GT) ? (c > 0) : (c >= 0);
-                    vm_push(vm, val_bool(r));
-                }
             } else if (is_obj_type(a, OBJ_STR) && is_obj_type(b, OBJ_STR)) {
                 PbStr *sa = AS_STR(a), *sb = AS_STR(b);
                 size_t ml = sa->len < sb->len ? sa->len : sb->len;
@@ -4067,7 +3444,7 @@ next_iter:;
                 if (vm->gc_inhibit == 0 && vm->nursery_bytes >= vm->nursery_threshold) {
                     vm_collect_nursery(vm);
                 }
-                if (!ZR_UNLIKELY(vm->cov_enabled || vm->debug_active) && ins->ic_slot >= 0 && ++ins->ic_slot >= 32) {
+                if (!ZR_UNLIKELY(vm->cov_enabled) && ins->ic_slot >= 0 && ++ins->ic_slot >= 32) {
                     if (zr_try_osr_numeric_loop(vm, frame, fn, tgt, jump_ip)) {
                         ins->ic_slot = 0;
                         ZR_DISPATCH();
@@ -4200,9 +3577,9 @@ next_iter:;
                 ZR_DISPATCH();
             }
             if (is_obj_type(obj_v, OBJ_ARRAY)) {
-                if (!zr_val_is_num_like(idx_v)) RUNTIME_ERR("array index must be a number");
+                if (idx_v.tag != VAL_NUM) RUNTIME_ERR("array index must be a number");
                 PbArray *arr = AS_ARRAY(obj_v);
-                int64_t idx = zr_val_as_i64(idx_v);
+                int64_t idx = (int64_t)idx_v.as.num;
                 if (idx < 0) idx += (int64_t)arr->len;
                 if (idx < 0 || (size_t)idx >= arr->len) {
                     if (opt) { vm_push(vm, val_nil()); ZR_DISPATCH(); }
@@ -4210,9 +3587,9 @@ next_iter:;
                 }
                 vm_push(vm, arr->items[idx]);
             } else if (is_obj_type(obj_v, OBJ_BYTES)) {
-                if (!zr_val_is_num_like(idx_v)) RUNTIME_ERR("bytes index must be a number");
+                if (idx_v.tag != VAL_NUM) RUNTIME_ERR("bytes index must be a number");
                 PbBytes *bb = AS_BYTES(obj_v);
-                int64_t idx = zr_val_as_i64(idx_v);
+                int64_t idx = (int64_t)idx_v.as.num;
                 if (idx < 0) idx += (int64_t)bb->len;
                 if (idx < 0 || (size_t)idx >= bb->len) {
                     if (opt) { vm_push(vm, val_nil()); ZR_DISPATCH(); }
@@ -4220,9 +3597,9 @@ next_iter:;
                 }
                 vm_push(vm, val_with_taint(val_num((double)bb->data[idx]), obj_v.taint));
             } else if (is_obj_type(obj_v, OBJ_F64BUF)) {
-                if (!zr_val_is_num_like(idx_v)) RUNTIME_ERR("f64buf index must be a number");
+                if (idx_v.tag != VAL_NUM) RUNTIME_ERR("f64buf index must be a number");
                 PbF64Buf *fb = AS_F64BUF(obj_v);
-                int64_t idx = zr_val_as_i64(idx_v);
+                int64_t idx = (int64_t)idx_v.as.num;
                 if (idx < 0) idx += (int64_t)fb->len;
                 if (idx < 0 || (size_t)idx >= fb->len) {
                     if (opt) { vm_push(vm, val_nil()); ZR_DISPATCH(); }
@@ -4239,10 +3616,10 @@ next_iter:;
                 }
                 vm_push(vm, out);
             } else if (is_obj_type(obj_v, OBJ_STR)) {
-                if (!zr_val_is_num_like(idx_v)) RUNTIME_ERR("string index must be a number");
+                if (idx_v.tag != VAL_NUM) RUNTIME_ERR("string index must be a number");
                 PbStr *s = AS_STR(obj_v);
                 size_t clen = zr_utf8_char_len(s->chars, s->len);
-                int64_t idx = zr_val_as_i64(idx_v);
+                int64_t idx = (int64_t)idx_v.as.num;
                 if (idx < 0) idx += (int64_t)clen;
                 if (idx < 0 || (size_t)idx >= clen) {
                     if (opt) { vm_push(vm, val_nil()); ZR_DISPATCH(); }
@@ -4279,9 +3656,9 @@ next_iter:;
                 RUNTIME_ERR("cannot mutate frozen %s", zr_val_type_name(obj_v));
             }
             if (is_obj_type(obj_v, OBJ_ARRAY)) {
-                if (!zr_val_is_num_like(idx_v)) RUNTIME_ERR("array index must be a number");
+                if (idx_v.tag != VAL_NUM) RUNTIME_ERR("array index must be a number");
                 PbArray *arr = AS_ARRAY(obj_v);
-                int64_t idx = zr_val_as_i64(idx_v);
+                int64_t idx = (int64_t)idx_v.as.num;
                 if (idx < 0) idx += (int64_t)arr->len;
                 if (idx >= 0 && (size_t)idx == arr->len) {
                     vm_push_root(vm, val);
@@ -4296,24 +3673,24 @@ next_iter:;
                 }
                 vm_push(vm, val);
             } else if (is_obj_type(obj_v, OBJ_BYTES)) {
-                if (!zr_val_is_num_like(idx_v) || !zr_val_is_num_like(val))
+                if (idx_v.tag != VAL_NUM || val.tag != VAL_NUM)
                     RUNTIME_ERR("bytes index assignment expects (number, number)");
                 PbBytes *bb = AS_BYTES(obj_v);
-                int64_t idx = zr_val_as_i64(idx_v);
+                int64_t idx = (int64_t)idx_v.as.num;
                 if (idx < 0) idx += (int64_t)bb->len;
                 if (idx < 0 || (size_t)idx >= bb->len)
                     RUNTIME_ERR("bytes index %" PRId64 " out of bounds (len %zu)", idx, bb->len);
-                bb->data[idx] = (uint8_t)(zr_val_as_i64(val) & 0xFF);
+                bb->data[idx] = (uint8_t)((int64_t)val.as.num & 0xFF);
                 vm_push(vm, val);
             } else if (is_obj_type(obj_v, OBJ_F64BUF)) {
-                if (!zr_val_is_num_like(idx_v) || !zr_val_is_num_like(val))
+                if (idx_v.tag != VAL_NUM || val.tag != VAL_NUM)
                     RUNTIME_ERR("f64buf index assignment expects (number, number)");
                 PbF64Buf *fb = AS_F64BUF(obj_v);
-                int64_t idx = zr_val_as_i64(idx_v);
+                int64_t idx = (int64_t)idx_v.as.num;
                 if (idx < 0) idx += (int64_t)fb->len;
                 if (idx < 0 || (size_t)idx >= fb->len)
                     RUNTIME_ERR("f64buf index %" PRId64 " out of bounds (len %zu)", idx, fb->len);
-                fb->data[idx] = zr_val_as_f64(val);
+                fb->data[idx] = val.as.num;
                 vm_push(vm, val);
             } else if (is_obj_type(obj_v, OBJ_MAP)) {
                 PbMap *m = AS_MAP(obj_v);
@@ -4616,27 +3993,6 @@ handle_exception:;
                 snprintf(vm->err_msg + cur_len, sizeof(vm->err_msg) - cur_len,
                          " (at %.160s:%u in %.60s)", esrc, (unsigned)eln, efname);
             }
-            if (vm->frame_count > stop_frame_depth + 1) {
-                cur_len = strlen(vm->err_msg);
-                if (cur_len + 24 < sizeof(vm->err_msg)) {
-                    snprintf(vm->err_msg + cur_len, sizeof(vm->err_msg) - cur_len, "\nStack trace:");
-                }
-                size_t shown = 0;
-                for (size_t fi = vm->frame_count; fi > stop_frame_depth && shown < 10; fi--, shown++) {
-                    CallFrame *sf = &vm->frames[fi - 1];
-                    PbFunc *sfn = sf->closure ? sf->closure->fn : NULL;
-                    if (!sfn || !sfn->code || sfn->code_len == 0) continue;
-                    uint32_t sip = sf->ip > 0 ? sf->ip - 1 : 0;
-                    if (sip >= sfn->code_len) sip = sfn->code_len - 1;
-                    uint32_t sln = sfn->code[sip].line;
-                    const char *ssrc = sfn->source_name ? sfn->source_name->chars : "<script>";
-                    const char *sfname = sfn->name ? sfn->name->chars : "<main>";
-                    cur_len = strlen(vm->err_msg);
-                    if (cur_len + 80 >= sizeof(vm->err_msg)) break;
-                    snprintf(vm->err_msg + cur_len, sizeof(vm->err_msg) - cur_len,
-                             "\n  at %.48s (%.96s:%u)", sfname, ssrc, (unsigned)sln);
-                }
-            }
         }
     }
     while (vm->frame_count > stop_frame_depth) {
@@ -4703,7 +4059,6 @@ static void vm_register_builtin(PbVM *vm, const char *name, PbBuiltinFn fn) {
 
 static void vm_init(PbVM *vm) {
     memset(vm, 0, sizeof(*vm));
-    for (size_t c = 0; c <= ZR_SLAB_CLASSES; c++) vm->gc_active_slab[c] = -1;
     vm->gc_inhibit = 1;
     vm->nursery_enabled = false;
     vm->nursery_threshold = (sizeof(void *) <= 4) ? (256u * 1024u) : (512u * 1024u);
@@ -4747,7 +4102,6 @@ static void vm_free(PbVM *vm) {
         gc_free_obj(vm, cur);
         cur = next;
     }
-    zr_vm_free_all_slabs(vm);
     free(vm->rem_set);
     free(vm->stack);
     free(vm->current_file);
@@ -4799,7 +4153,6 @@ static inline void vm_format_value(PbValue v, ZrBuf *b) {
         case VAL_NIL:     zr_buf_append_cstr(b, "nil"); break;
         case VAL_BOOL:    zr_buf_append_cstr(b, v.as.b ? "true" : "false"); break;
         case VAL_NUM:     zr_format_number(b, v.as.num); break;
-        case VAL_I64:     zr_buf_printf(b, "%" PRId64, v.as.i64); break;
         case VAL_BUILTIN: zr_buf_printf(b, "<builtin#%u>", (unsigned)v.as.builtin_id); break;
         case VAL_OBJ:
             if (v.as.obj->type == OBJ_STR) {
@@ -4820,10 +4173,6 @@ static inline void vm_format_value(PbValue v, ZrBuf *b) {
                 zr_buf_printf(b, "<bytes len=%zu>", AS_BYTES(v)->len);
             } else if (v.as.obj->type == OBJ_F64BUF) {
                 zr_buf_printf(b, "<f64buf len=%zu>", AS_F64BUF(v)->len);
-            } else if (v.as.obj->type == OBJ_PTR) {
-                zr_buf_printf(b, "<ptr %s 0x%" PRIxPTR ">",
-                              AS_PTR(v)->tag[0] ? AS_PTR(v)->tag : "raw",
-                              (uintptr_t)AS_PTR(v)->ptr);
             } else if (v.as.obj->type == OBJ_STRUCT_BUF) {
                 if (AS_STRUCT_BUF(v)->is_schema) {
                     zr_buf_printf(b, "<struct_schema fields=%u stride=%zu>",

@@ -1,0 +1,264 @@
+// Pure-PBLang verification of reader CLI document admission, hostile filenames, sparse/FIFO/symlink safety, and field limits.
+let DocFile = import("../../examples/declarative_browser/document_file.sapp");
+let Dir = import("stdlib:linux_dirfs.sapp");
+
+fn _parse_cli() {
+    let raw = os_args();
+    let out = map{package: nil, evidence: nil, report: nil, runtime: nil};
+    let after = false;
+    let i = 0;
+    while i < len(raw) {
+        let arg = raw[i];
+        if not after {
+            if arg == "--" { after = true; }
+        } elif (arg == "--package" or arg == "--evidence" or arg == "--report" or arg == "--runtime") and i + 1 < len(raw) {
+            let val = raw[i + 1];
+            if arg == "--package" { out.package = val; }
+            elif arg == "--evidence" { out.evidence = val; }
+            elif arg == "--report" { out.report = val; }
+            elif arg == "--runtime" { out.runtime = val; }
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _resolve_runtime(explicit, repo) {
+    if explicit != nil and explicit != "" { return explicit; }
+    if fs_exists(repo + "/pblang") { return repo + "/pblang"; }
+    if fs_exists(repo + "/target/release/pblang") { return repo + "/target/release/pblang"; }
+    return "./pblang";
+}
+
+fn _mkdir_private(parent, name) {
+    let fs = Dir.open_absolute(parent, false, false);
+    assert(fs.ok, "open parent");
+    let created = Dir.mkdir_new(fs, name, false);
+    let closed = Dir.close(fs);
+    assert(created.ok and closed, "mkdir private");
+    return parent + "/" + name;
+}
+
+fn _rm_tree(path) {
+    let removed = false;
+    try { fs_remove(path); removed = true; } catch {}
+    if removed { return true; }
+    let kids = try fs_listdir(path) catch nil;
+    if type(kids) == "array" {
+        for kid in kids { let _child = _rm_tree(path + "/" + kid); }
+    }
+    let ok = false;
+    try { fs_remove(path); ok = true; } catch {}
+    return ok;
+}
+
+fn _libc_handle() {
+    for p in ["/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib/x86_64-linux-gnu/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6", "/lib64/libc.so.6"] {
+        if fs_exists(p) { return ffi_load(p); }
+    }
+    throw "libc unavailable";
+}
+
+fn _repeat_str(ch, count) {
+    let parts = [];
+    for _i count { array_push(parts, ch); }
+    return str_join(parts, "");
+}
+
+fn _cli_check(runtime, entry_script, data_dir, script_args) {
+    let prev_args = try env_get("PBLANG_SCRIPT_ARGS") catch nil;
+    let prev_data = try env_get("PBLANG_READER_DATA_DIR") catch nil;
+    env_set("PBLANG_SCRIPT_ARGS", str_join(script_args, "\n"));
+    env_set("PBLANG_READER_DATA_DIR", data_dir);
+    let res = proc_spawn_wait(runtime, [
+        "run", entry_script,
+        "--allow-all", "--deny-net", "--deny-http", "--deny-exec", "--deny-spawn"
+    ]);
+    if prev_args == nil { env_set("PBLANG_SCRIPT_ARGS", ""); }
+    else { env_set("PBLANG_SCRIPT_ARGS", prev_args); }
+    if prev_data == nil { env_set("PBLANG_READER_DATA_DIR", ""); }
+    else { env_set("PBLANG_READER_DATA_DIR", prev_data); }
+    return res;
+}
+
+fn _verify_case(checks, runtime, entry_script, data_dir, inputs_root, name, target_path, valid, expected_code) {
+    let p = _cli_check(runtime, entry_script, data_dir, ["--check-document", "--open", target_path]);
+    let combined = p.stdout + p.stderr;
+    assert(not str_contains(combined, "PRIVATE_TITLE") and not str_contains(combined, "SECRET_SOURCE_MARKER"), "no source disclosure: " + name);
+    assert(not str_contains(combined, inputs_root), "no path disclosure: " + name);
+    if valid {
+        assert(p.exit_code == 0 and p.stderr == "", "valid exit: " + name);
+        let res = json_parse(str_trim(p.stdout));
+        assert(res.ok == true and res.format == "pblang.reader.document.v1" and len(map_keys(res)) == 4, "valid schema: " + name);
+    } else {
+        assert(p.exit_code != 0, "invalid exit: " + name);
+        if expected_code != "" {
+            let diag = json_parse(str_trim(p.stdout));
+            assert(diag.ok == false and diag.format == "pblang.reader.document.v1" and len(map_keys(diag)) == 4, "diagnostic schema: " + name);
+            if expected_code == "invalid_utf8" {
+                assert(diag.code == "invalid_utf8" or diag.code == "unsupported_document", "utf8 rejection code: " + name);
+            } else {
+                assert(diag.code == expected_code, "expected code " + expected_code + " for " + name + " got " + str(diag.code));
+            }
+            assert(p.stderr == "" and str_contains(diag.error, "no document or preferences changed"), "clean error message: " + name);
+            assert(not str_contains(p.stdout, "Stack trace"), "no stack trace: " + name);
+        }
+    }
+    array_push(checks, map{name: name, passed: true});
+}
+
+fn _run(scratch, repo, runtime, pkg_arg) {
+    let base_root = if pkg_arg != nil and pkg_arg != "" { pkg_arg } else { repo };
+    let entry_script = base_root + "/examples/declarative_browser/main.sapp";
+    let data_dir = _mkdir_private(scratch, "data");
+    let inputs = _mkdir_private(scratch, "inputs");
+    let checks = [];
+    let libc = _libc_handle();
+
+    let source = "<article><h1>PRIVATE_TITLE</h1><p>Ελληνικό κείμενο.</p><a href=\"pb://guide\">Guide</a></article>";
+    let source_bytes = str_to_bytes(source);
+    let good = inputs + "/Έγγραφο with spaces.html";
+    fs_write(good, source);
+
+    _verify_case(checks, runtime, entry_script, data_dir, inputs, "absolute Unicode and spaces", good, true, "");
+    for literal_name in ["root", "literal $(touch unwanted) ; quoted \" name.html"] {
+        let p = inputs + "/" + literal_name;
+        fs_write(p, source);
+        _verify_case(checks, runtime, entry_script, data_dir, inputs, "literal filename " + literal_name, p, true, "");
+        assert(fs_read(p) == source, "literal file preserved");
+    }
+
+    let nested = inputs + "/nested";
+    fs_mkdirs(nested);
+    _verify_case(checks, runtime, entry_script, data_dir, inputs, "lexical dot segments", inputs + "/nested/../Έγγραφο with spaces.html", true, "");
+
+    // Exact 16384-byte limit with trailing ASCII spaces.
+    let exact = inputs + "/exact.html";
+    let padded = [];
+    for b in source_bytes { array_push(padded, b); }
+    while len(padded) < 16384 { array_push(padded, 32); }
+    fs_write_bytes(exact, padded);
+    _verify_case(checks, runtime, entry_script, data_dir, inputs, "exact byte limit with outer whitespace", exact, true, "");
+
+    let over_bytes = [];
+    for b in padded { array_push(over_bytes, b); }
+    array_push(over_bytes, 32);
+
+    let invalid_cases: any = [
+        ["whitespace", str_to_bytes(" \n\t"), "empty_document"],
+        ["oversize", over_bytes, "too_large"],
+        ["empty", [], "empty_document"],
+        ["utf8", [255], "invalid_utf8"],
+        ["malformed", str_to_bytes("<article><h1>SECRET_SOURCE_MARKER</h1>"), "unsupported_document"],
+        ["script", str_to_bytes("<article><h1>x</h1><script>SECRET_SOURCE_MARKER</script></article>"), "unsupported_document"],
+        ["remote", str_to_bytes("<article><h1>x</h1><a href=\"https://example.com/\">link</a></article>"), "unsupported_document"],
+        ["nested", str_to_bytes("<article><h1>x</h1><p><b>x</b></p></article>"), "unsupported_document"],
+        ["attributes", str_to_bytes("<article><h1>x</h1><p onclick=\"run\">x</p></article>"), "unsupported_document"],
+        ["title", str_to_bytes("<article><h1>" + _repeat_str("x", 81) + "</h1></article>"), "unsupported_document"],
+        ["block", str_to_bytes("<article><h1>x</h1><p>" + _repeat_str("x", 257) + "</p></article>"), "unsupported_document"],
+        ["blocks", str_to_bytes("<article><h1>x</h1>" + _repeat_str("<p>x</p>", 9) + "</article>"), "unsupported_document"],
+        ["link", str_to_bytes("<article><h1>x</h1><a href=\"pb://home\">" + _repeat_str("x", 65) + "</a></article>"), "unsupported_document"]
+    ];
+    for item in invalid_cases {
+        let cname = item[0];
+        let cbytes = item[1];
+        let ccode = item[2];
+        let fpath = inputs + "/" + cname + ".html";
+        fs_write_bytes(fpath, cbytes);
+        _verify_case(checks, runtime, entry_script, data_dir, inputs, cname, fpath, false, ccode);
+        assert(fs_read_bytes(fpath) == cbytes, "invalid input untouched: " + cname);
+    }
+
+    let maximum = inputs + "/maximum.html";
+    let max_html = "<article><h1>" + _repeat_str("x", 80) + "</h1><p>" + _repeat_str("x", 256) + "</p>"
+        + _repeat_str("<p>x</p>", 6) + "<a href=\"pb://home\">" + _repeat_str("x", 64) + "</a></article>";
+    fs_write(maximum, max_html);
+    _verify_case(checks, runtime, entry_script, data_dir, inputs, "maximum admitted fields", maximum, true, "");
+
+    // 100 MiB sparse input rejected immediately without allocating 100 MiB of RAM.
+    let sparse = inputs + "/sparse.html";
+    fs_write_bytes(sparse, []);
+    assert(ffi_call_typed(libc, "truncate", "string,i64->i32", [sparse, 104857600]) == 0, "sparse truncate 100 MiB");
+    _verify_case(checks, runtime, entry_script, data_dir, inputs, "100 MiB sparse input rejected", sparse, false, "too_large");
+
+    // Leaf symlink, parent symlink, FIFO, directory, missing file, and read-only hardlink.
+    let leaf_sym = inputs + "/symlink.html";
+    assert(ffi_call_typed(libc, "symlink", "string,string->i32", [good, leaf_sym]) == 0, "leaf symlink");
+    _verify_case(checks, runtime, entry_script, data_dir, inputs, "leaf symlink refused", leaf_sym, false, "read_failed");
+
+    let parent_sym = inputs + "/linked-parent";
+    assert(ffi_call_typed(libc, "symlink", "string,string->i32", [inputs, parent_sym]) == 0, "parent symlink");
+    _verify_case(checks, runtime, entry_script, data_dir, inputs, "parent symlink refused", parent_sym + "/Έγγραφο with spaces.html", false, "read_failed");
+
+    let fifo = inputs + "/fifo";
+    assert(ffi_call_typed(libc, "mkfifo", "string,i32->i32", [fifo, 384]) == 0, "mkfifo");
+    _verify_case(checks, runtime, entry_script, data_dir, inputs, "FIFO refuses without blocking", fifo, false, "read_failed");
+
+    _verify_case(checks, runtime, entry_script, data_dir, inputs, "directory refused", nested, false, "read_failed");
+    _verify_case(checks, runtime, entry_script, data_dir, inputs, "missing file refused", inputs + "/missing.html", false, "read_failed");
+
+    let hard = inputs + "/hardlink.html";
+    assert(ffi_call_typed(libc, "link", "string,string->i32", [good, hard]) == 0, "hardlink");
+    _verify_case(checks, runtime, entry_script, data_dir, inputs, "read-only hardlink accepted", hard, true, "");
+    assert(fs_read_bytes(hard) == source_bytes, "hardlink bytes preserved");
+
+    // Control-character paths diagnosed cleanly without touching filesystem.
+    let tab_path = inputs + "/tab\tname.html";
+    fs_write(tab_path, source);
+    _verify_case(checks, runtime, entry_script, data_dir, inputs, "tab filename diagnosed", tab_path, false, "invalid_path");
+    let nl_res = DocFile.load(inputs + "/newline\nname.html");
+    assert(not nl_res.ok and nl_res.code == "invalid_path", "newline filename refused");
+    array_push(checks, map{name: "newline filename refused", passed: true});
+
+    // Invalid CLI argument shapes rejected by main.sapp.
+    let bad_arg_sets = [
+        ["--open"],
+        ["--check-document", "--open", ""],
+        ["--open", good, "--open", good],
+        ["--check-document", "--gui-profile"],
+        ["--unknown"]
+    ];
+    for aset in bad_arg_sets {
+        let r = _cli_check(runtime, entry_script, data_dir, aset);
+        assert(r.exit_code != 0, "invalid argument shape rejected");
+        array_push(checks, map{name: "invalid arguments " + json_stringify(aset), passed: true});
+    }
+
+    assert(not fs_exists(data_dir + "/reader-style") and not fs_exists(inputs + "/unwanted"), "no side-effect files created");
+    assert(fs_read_bytes(good) == source_bytes, "good input preserved");
+    ffi_close(libc);
+
+    return map{
+        passed: true,
+        checks: checks,
+        check_count: len(checks),
+        headless_check: true,
+        no_source_disclosure: true,
+        no_input_or_profile_writes: true
+    };
+}
+
+fn main() {
+    let cli = _parse_cli();
+    let repo = cwd();
+    let runtime = _resolve_runtime(cli.runtime, repo);
+    let scratch = _mkdir_private("/tmp", "pblang_tooling_s3_doc_cli_" + str(num_floor(now_ms())));
+    let result = try _run(scratch, repo, runtime, cli.package) catch nil;
+    let ok = result != nil;
+
+    if ok and cli.evidence != nil {
+        fs_mkdirs(cli.evidence);
+        fs_write(cli.evidence + "/acceptance.json", json_stringify(result) + "\n");
+    }
+    if ok and cli.report != nil {
+        fs_mkdirs(path_dirname(cli.report));
+        fs_write(cli.report, json_stringify(result) + "\n");
+    }
+    let _cleaned = _rm_tree(scratch);
+    assert(not fs_exists(scratch), "disposable scratch cleaned");
+    assert(ok, "reader_document_file_cli verification failed");
+    print json_stringify(result);
+}
+
+main();

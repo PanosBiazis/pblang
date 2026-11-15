@@ -1,0 +1,357 @@
+// Pure PBLang verification: exercise reader installer transitions, rollback, tamper/symlink refusals, and lock exclusion in a temporary root.
+let Builder = import("../../examples/declarative_browser/package_builder.sapp");
+let Install = import("../../examples/declarative_browser/install_manager.sapp");
+let Dir = import("stdlib:linux_dirfs.sapp");
+
+fn _cli_args() {
+    let raw = try env_get("PBLANG_SCRIPT_ARGS") catch "";
+    if type(raw) == "string" and raw != "" { return str_split(raw, "\n"); }
+    let argv = os_args();
+    let out = [];
+    let after = false;
+    for item in argv {
+        if after { array_push(out, item); }
+        elif item == "--" { after = true; }
+    }
+    return out;
+}
+
+fn _parse_opts(args) {
+    let opts = map{ package: "", evidence: "", runtime: "", report: "" };
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if (a == "--package" or a == "--evidence" or a == "--runtime" or a == "--report") and i + 1 < len(args) {
+            opts[str_slice(a, 2, len(a))] = args[i + 1];
+            i = i + 2;
+        } else {
+            i = i + 1;
+        }
+    }
+    return opts;
+}
+
+fn _mk_private_tmp(prefix) {
+    let name = "pblang_tooling_s4_" + prefix + "_" + str(num_floor(now_ms()));
+    let tmp_fs = Dir.open_absolute("/tmp", false, false);
+    assert(tmp_fs.ok, "open /tmp handle");
+    let created = Dir.mkdir_new(tmp_fs, name, false);
+    let closed = Dir.close(tmp_fs);
+    assert(created.ok and closed, "create private temp dir");
+    return path_join("/tmp", name);
+}
+
+fn _open_libc() {
+    let h = try ffi_load("/usr/lib/x86_64-linux-gnu/libc.so.6") catch nil;
+    if h != nil { return h; }
+    return try ffi_load("libc.so.6") catch nil;
+}
+
+fn _rm_tree(path) {
+    let libc = _open_libc();
+    if libc != nil {
+        let u = ffi_call_typed(libc, "unlink", "string->i32", [path]);
+        if u == 0 {
+            let _c0 = try ffi_close(libc) catch nil;
+            return;
+        }
+        let _c1 = try ffi_close(libc) catch nil;
+    }
+    if not (try fs_exists(path) catch false) { return; }
+    let entries = try fs_listdir(path) catch nil;
+    if type(entries) == "array" {
+        for name in entries { _rm_tree(path_join(path, name)); }
+    }
+    let _r = try fs_remove(path) catch nil;
+}
+
+fn _mkdir_private(parent_path, child_name) {
+    let fs = Dir.open_absolute(parent_path, false, false);
+    assert(fs.ok, "open parent directory");
+    let mk = Dir.mkdir_new(fs, child_name, false);
+    let closed = Dir.close(fs);
+    assert(mk.ok and closed, "mkdir_new private directory: " + child_name);
+    return path_join(parent_path, child_name);
+}
+
+fn _write_private_file(dir_path, rel_name, bytes) {
+    let full = path_join(dir_path, rel_name);
+    if fs_exists(full) {
+        let _u = try fs_remove(full) catch nil;
+    }
+    let fs = Dir.open_absolute(dir_path, false, true);
+    assert(fs.ok, "open private directory for write");
+    let wr = Dir.write_new_atomic(fs, rel_name, bytes, false);
+    let closed = Dir.close(fs);
+    assert(wr.ok and closed, "write private file: " + rel_name);
+}
+
+fn _default_runtime(repo) {
+    return path_join(repo, "pblang");
+}
+
+fn _copy_tree(src, dst) {
+    let entries = try fs_listdir(src) catch nil;
+    if type(entries) == "array" {
+        fs_mkdirs(dst);
+        for name in entries {
+            _copy_tree(path_join(src, name), path_join(dst, name));
+        }
+        return;
+    }
+    fs_write_bytes(dst, fs_read_bytes(src));
+}
+
+fn _stage_stdlib_env(pkg_dir, dst_stdlib) {
+    _copy_tree(path_join(pkg_dir, "stdlib"), dst_stdlib);
+    let sentinel = path_join(dst_stdlib, "math.sapp");
+    if not fs_exists(sentinel) {
+        fs_write(sentinel, "// sentinel for single-file PBLANG_STDLIB lookup\n");
+    }
+    return dst_stdlib;
+}
+
+fn _manage_subprocess(pkg, stdlib_env, cmd_args) {
+    let pb = path_join(pkg, "pblang");
+    let entry = path_join(pkg, "examples/declarative_browser/install.sapp");
+    return proc_spawn_wait("/usr/bin/env", [
+        "-C", "/tmp",
+        "PBLANG_STDLIB=" + stdlib_env,
+        "PBLANG_SCRIPT_ARGS=" + str_join(cmd_args, "\n"),
+        pb, "run", entry, "--allow-all", "--deny-net", "--deny-http"
+    ]);
+}
+
+fn _last_json_row(text) {
+    let lines = str_split(text, "\n");
+    let found = nil;
+    for line in lines {
+        let trimmed = str_trim(line);
+        if str_starts_with(trimmed, "{") {
+            found = json_parse(trimmed);
+        }
+    }
+    return found;
+}
+
+fn _independent_fingerprint(version, files_map) {
+    let lines = ["pblang.reader.release.v1", version];
+    for k in array_sort(map_keys(files_map)) {
+        array_push(lines, k + "=" + files_map[k]);
+    }
+    return sha256(str_join(lines, "\n") + "\n");
+}
+
+fn _write_synthetic_receipt(work, metadata) {
+    let p = path_join(work, metadata.version + ".json");
+    let doc = map{
+        format: "pblang.reader.acceptance.v1",
+        version: metadata.version,
+        fingerprint: metadata.fingerprint,
+        passed: true,
+        checks: map{
+            source_hidden: true,
+            launcher: true,
+            style: true,
+            pagination: true,
+            content_unchanged: true
+        },
+        provenance: "Synthetic TEST ONLY, not product acceptance"
+    };
+    fs_write(p, json_stringify(doc) + "\n");
+    return p;
+}
+
+fn _journey(opts, work) {
+    let repo = cwd();
+    let runtime = if opts.runtime != "" { opts.runtime } else { _default_runtime(repo) };
+    let pkg = opts.package;
+    if pkg == "" {
+        pkg = path_join(work, "candidate");
+        let built = Builder.bundle(repo, pkg, runtime);
+        assert(built.ok and built.owned_handles_closed, "built candidate package for installer test");
+    }
+
+    let pin = sha256(base64_encode_bytes(fs_read_bytes(path_join(pkg, "pblang"))));
+    let results = [];
+    let record = fn(name, ok, extra) {
+        array_push(results, map{ name: name, passed: ok, details: extra });
+        if opts.evidence != "" {
+            fs_mkdirs(opts.evidence);
+            fs_write(path_join(opts.evidence, "acceptance.json"), json_stringify(results) + "\n");
+        }
+        if not ok {
+            print "FAILED INSTALL CHECK: " + name + " -> " + json_stringify(extra);
+        }
+        assert(ok, "installer check failed: " + name);
+    };
+
+    let install_work = _mkdir_private(work, "install_work");
+    let root = path_join(install_work, "reader");
+    let bin_dir = _mkdir_private(install_work, "bin");
+    let launcher = path_join(bin_dir, "pb-document-reader");
+    let stdlib_env = _stage_stdlib_env(pkg, path_join(work, "stdlib_env"));
+
+    let call = fn(name, cmd_args, expect_ok) {
+        let res = _manage_subprocess(pkg, stdlib_env, cmd_args);
+        let data = _last_json_row(res.stdout);
+        if data == nil {
+            print "NO JSON FROM --manage " + name + " stdout=" + res.stdout + " stderr=" + res.stderr;
+        }
+        assert(data != nil, "expected JSON status line from --manage: " + name);
+        let exit_matches = if expect_ok { res.exit_code == 0 } else { res.exit_code != 0 };
+        record(name, data.ok == expect_ok and exit_matches and data.owned_handles_closed == true, map{ error: data.error, exit: res.exit_code });
+        return data;
+    };
+
+    // 1. Wrong runtime pin refused without creating root.
+    let zero_pin = str_repeat("0", 64);
+    let _c1 = call("wrong runtime pin", ["prepare", pkg, root, "v1", zero_pin], false);
+    record("wrong pin made no root", not fs_exists(root), map{});
+
+    // 2. Unmanaged root refused and preserved.
+    let foreign = _mkdir_private(install_work, "foreign");
+    fs_write(path_join(foreign, "sentinel"), "untouched");
+    let _c2 = call("unmanaged root refused", ["prepare", pkg, foreign, "v1", pin], false);
+    record("unmanaged root preserved", array_sort(fs_listdir(foreign)) == ["sentinel"] and fs_read(path_join(foreign, "sentinel")) == "untouched", map{});
+
+    // 3. Prepare v1 & v2, preserve user data, refuse duplicate v1, verify v1 & independent fingerprint.
+    let one = call("prepare v1", ["prepare", pkg, root, "v1", pin], true).release;
+    let keep_file = path_join(path_join(root, "data"), "keep.txt");
+    fs_write(keep_file, "user data stays");
+    let two = call("prepare v2", ["prepare", pkg, root, "v2", pin], true).release;
+    let _c3 = call("existing version refused", ["prepare", pkg, root, "v1", pin], false);
+    let _c4 = call("verify v1", ["verify", root, "v1"], true);
+    record("independent fingerprint", one.fingerprint == _independent_fingerprint("v1", one.files), map{});
+
+    // 4. Mismatched acceptance receipt refused.
+    let r1 = _write_synthetic_receipt(install_work, one);
+    let r2 = _write_synthetic_receipt(install_work, two);
+    let wrong_receipt = path_join(install_work, "wrong.json");
+    fs_write(wrong_receipt, str_replace_all(fs_read(r1), one.fingerprint, zero_pin));
+    let _c5 = call("mismatched acceptance refused", ["activate", root, "v1", bin_dir, wrong_receipt], false);
+    record("no activation from wrong acceptance", not fs_exists(launcher), map{});
+
+    // 5. Foreign launcher refused and preserved byte-for-byte.
+    fs_write(launcher, "#!/bin/sh\necho foreign\n");
+    let foreign_bytes = fs_read_bytes(launcher);
+    let _c6 = call("foreign launcher refused", ["activate", root, "v1", bin_dir, r1], false);
+    record("foreign launcher preserved", fs_read_bytes(launcher) == foreign_bytes, map{});
+    let _rm_fl = try fs_remove(launcher) catch nil;
+    assert(not fs_exists(launcher), "removed test-owned foreign launcher");
+
+    // 6. Activate v1, verify rollback without baseline refused, verify concurrent flock contention refused.
+    let _c7 = call("activate v1", ["activate", root, "v1", bin_dir, r1], true);
+    let v1_launcher_bytes = fs_read_bytes(launcher);
+    let _c8 = call("no rollback baseline refused", ["rollback", root, bin_dir], false);
+    record("failed rollback preserves launcher", fs_read_bytes(launcher) == v1_launcher_bytes, map{});
+
+    let root_fs = Dir.open_absolute(root, false, true);
+    assert(root_fs.ok, "open root_fs for lock check");
+    let held_lock = Dir.acquire_lock(root_fs, "install.lock", 0, 10, true);
+    assert(held_lock.ok, "acquired exclusive install.lock");
+    let busy_data = call("concurrent install refused", ["status", root, bin_dir], false);
+    assert(str_contains(str(busy_data.error), "busy"), "busy lock reported");
+    let _rel_lk = Dir.release_lock(root_fs, held_lock);
+    let _cls_rt = Dir.close(root_fs);
+
+    // 7. Activate v2, idempotent re-activation, rollback to v1, rollback back to v2.
+    let _c9 = call("activate v2", ["activate", root, "v2", bin_dir, r2], true);
+    let dup = call("same activation is no-op", ["activate", root, "v2", bin_dir, r2], true);
+    record("same activation preserves previous", not dup.selection_changed and dup.selection.previous == "v1", map{});
+    let rolled_v1 = call("rollback to v1", ["rollback", root, bin_dir], true);
+    record("rollback selects accepted previous", rolled_v1.selection.current == "v1" and rolled_v1.selection.previous == "v2", map{});
+    let _c10 = call("rollback to v2", ["rollback", root, bin_dir], true);
+
+    // 8. Tamper v2 README.txt (preserving 0600 permissions), verify rejection, rollback to v1, refuse rollback to damaged v2, restore & return to v2.
+    let v2_dir = path_join(path_join(root, "releases"), "v2");
+    let saved_readme = fs_read_bytes(path_join(v2_dir, "README.txt"));
+    let tampered_bytes = [];
+    for b in saved_readme { array_push(tampered_bytes, b); }
+    for b in str_to_bytes("changed") { array_push(tampered_bytes, b); }
+    _write_private_file(v2_dir, "README.txt", tampered_bytes);
+
+    let _c11 = call("tampered release rejected", ["verify", root, "v2"], false);
+    let _c12 = call("damaged current can roll back", ["rollback", root, bin_dir], true);
+    let active_v1_bytes = fs_read_bytes(launcher);
+    let _c13 = call("damaged previous refused", ["rollback", root, bin_dir], false);
+    record("failed selection remains unchanged", fs_read_bytes(launcher) == active_v1_bytes, map{});
+
+    _write_private_file(v2_dir, "README.txt", saved_readme);
+    let _c14 = call("restored previous verified", ["verify", root, "v2"], true);
+    let _c15 = call("return to v2", ["rollback", root, bin_dir], true);
+
+    // 9. Unexpected extra file in release refused.
+    _write_private_file(v2_dir, "unexpected.txt", str_to_bytes("extra"));
+    let _c16 = call("unexpected release file refused", ["verify", root, "v2"], false);
+    let extra_path = path_join(v2_dir, "unexpected.txt");
+    let _rm_ex = try fs_remove(extra_path) catch nil;
+    assert(not fs_exists(extra_path), "removed unexpected.txt");
+
+    // 10. Symlink inside release refused (via libc symlink/unlink FFI, zero external shell).
+    let libc = _open_libc();
+    assert(libc != nil, "loaded libc for symlink test");
+    let readme_v2 = path_join(v2_dir, "README.txt");
+    let readme_v1 = path_join(path_join(path_join(root, "releases"), "v1"), "README.txt");
+    assert(ffi_call_typed(libc, "unlink", "string->i32", [readme_v2]) == 0, "unlinked v2 README before symlink check");
+    assert(ffi_call_typed(libc, "symlink", "string,string->i32", [readme_v1, readme_v2]) == 0, "created symlink in v2 release");
+    let _c17 = call("symlink release refused", ["verify", root, "v2"], false);
+    assert(ffi_call_typed(libc, "unlink", "string->i32", [readme_v2]) == 0, "removed test symlink");
+    ffi_close(libc);
+    _write_private_file(v2_dir, "README.txt", saved_readme);
+
+    // 11. Installed launcher selection, installed release manager status and --check, user data preservation, release list, and 0700 mode.
+    let sel = Install.selection(fs_read(launcher), root);
+    assert(sel.current == "v2" and sel.previous == "v1", "installed launcher points to v2 with v1 rollback");
+    let v2_stdlib_env = _stage_stdlib_env(v2_dir, path_join(work, "v2_stdlib_env"));
+    let status_run = _manage_subprocess(v2_dir, v2_stdlib_env, ["status", root, bin_dir]);
+    let status_json = _last_json_row(status_run.stdout);
+    record("installed launcher manager status", status_run.exit_code == 0 and status_json != nil and status_json.selection.current == "v2", map{});
+
+    let check_run = proc_spawn_wait("/usr/bin/env", [
+        "-C", "/tmp",
+        "PBLANG_STDLIB=" + v2_stdlib_env,
+        "PBLANG_SCRIPT_ARGS=",
+        path_join(v2_dir, "pblang"), "run", path_join(v2_dir, "examples/declarative_browser/main.sapp"),
+        "--allow-all", "--deny-net", "--deny-http", "--deny-exec", "--deny-spawn"
+    ]);
+    record("installed launcher offline check", check_run.exit_code == 0 and str_contains(check_run.stdout, "declarative_browser_pass"), map{});
+
+    record("user data preserved", fs_read(keep_file) == "user data stays" and fs_listdir(path_join(root, "data")) == ["keep.txt"], map{});
+    record("two complete releases retained", array_sort(fs_listdir(path_join(root, "releases"))) == ["v1", "v2"], map{});
+
+    let bin_fs = Dir.open_absolute(bin_dir, false, true);
+    assert(bin_fs.ok, "open bin_dir for launcher metadata");
+    let lmeta = Dir.metadata(bin_fs, "pb-document-reader");
+    assert(Dir.close(bin_fs), "close bin_dir handle");
+    record("private executable launcher", lmeta.ok and bit_and(lmeta.mode, 511) == 448, map{ mode: lmeta.mode });
+
+    let summary = map{
+        passed: true,
+        checks: len(results),
+        current: "v2",
+        releases: ["v1", "v2"],
+        user_data_preserved: true
+    };
+    if opts.report != "" {
+        fs_write(opts.report, json_stringify(summary) + "\n");
+    }
+    print json_stringify(summary);
+    return true;
+}
+
+fn main() {
+    let opts = _parse_opts(_cli_args());
+    let work = _mk_private_tmp("install");
+    let ok = false;
+    try {
+        ok = _journey(opts, work);
+    } catch {
+        print "JOURNEY_ERR";
+    }
+    _rm_tree(work);
+    assert(not fs_exists(work), "cleaned temporary directory");
+    assert(ok, "reader_install checks passed");
+}
+
+main();

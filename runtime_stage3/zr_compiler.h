@@ -210,13 +210,7 @@ static bool zr_preprocess_sapp(const char *raw,
             char *lang = zr_xstrndup(buf + i + 1, p - (i + 1));
             if (strcmp(lang, "nogc") == 0 || strcmp(lang, "packed") == 0 ||
                 strcmp(lang, "inline") == 0 || strcmp(lang, "isr") == 0 ||
-                strcmp(lang, "interrupt") == 0 || strcmp(lang, "aligned") == 0 ||
-                strcmp(lang, "region") == 0 || strcmp(lang, "constant_time") == 0 ||
-                strcmp(lang, "zeroize") == 0 || strcmp(lang, "secret") == 0 ||
-                strcmp(lang, "gpu") == 0 || strcmp(lang, "pure") == 0 ||
-                strcmp(lang, "hot") == 0 || strcmp(lang, "cold") == 0 ||
-                strcmp(lang, "deprecated") == 0 || strcmp(lang, "test") == 0 ||
-                strcmp(lang, "bench") == 0) {
+                strcmp(lang, "interrupt") == 0 || strcmp(lang, "aligned") == 0) {
                 free(lang);
                 i = p;
                 continue;
@@ -363,20 +357,13 @@ typedef struct {
     size_t      lex_len;
     double      num_val;
     uint32_t    line;
-    uint32_t    col;
-    int64_t     i64_val;
-    bool        is_i64;
-    bool        is_i64_min_mag;
 } ZrToken;
 
 typedef struct {
     const char *src;
     size_t      len;
     size_t      pos;
-    size_t      line_start_pos;
     uint32_t    line;
-    uint32_t    err_line;
-    uint32_t    err_col;
     ZrArena    *arena;
     ZrToken    *tokens;
     size_t      tok_len;
@@ -540,12 +527,10 @@ static bool zr_lex_all(ZrLexer *lx) {
         if (c == '\n') {
             lx->line++;
             lx->pos++;
-            lx->line_start_pos = lx->pos;
             continue;
         }
 
         uint32_t tline = lx->line;
-        uint32_t tcol = (uint32_t)((lx->pos >= lx->line_start_pos) ? (lx->pos - lx->line_start_pos + 1) : 1);
 
         /* f"..." / f'...' interpolated string */
         if (c == 'f' && lx->pos + 1 < lx->len && (lx->src[lx->pos + 1] == '"' || lx->src[lx->pos + 1] == '\'')) {
@@ -555,9 +540,9 @@ static bool zr_lex_all(ZrLexer *lx) {
             bool closed = false;
             while (lx->pos < lx->len) {
                 char sc = lx->src[lx->pos];
-                if (sc == '\n') { lx->line++; lx->line_start_pos = lx->pos + 1; }
+                if (sc == '\n') lx->line++;
                 if (sc == '\\' && lx->pos + 1 < lx->len) {
-                    if (lx->src[lx->pos + 1] == '\n') { lx->line++; lx->line_start_pos = lx->pos + 2; }
+                    if (lx->src[lx->pos + 1] == '\n') lx->line++;
                     lx->pos += 2;
                     continue;
                 }
@@ -570,14 +555,14 @@ static bool zr_lex_all(ZrLexer *lx) {
                     lx->pos++;
                     while (lx->pos < lx->len && bdepth > 0) {
                         char ic = lx->src[lx->pos];
-                        if (ic == '\n') { lx->line++; lx->line_start_pos = lx->pos + 1; }
+                        if (ic == '\n') lx->line++;
                         if (ic == '"' || ic == '\'') {
                             char iq = ic;
                             lx->pos++;
                             while (lx->pos < lx->len && lx->src[lx->pos] != iq) {
-                                if (lx->src[lx->pos] == '\n') { lx->line++; lx->line_start_pos = lx->pos + 1; }
+                                if (lx->src[lx->pos] == '\n') lx->line++;
                                 if (lx->src[lx->pos] == '\\' && lx->pos + 1 < lx->len) {
-                                    if (lx->src[lx->pos + 1] == '\n') { lx->line++; lx->line_start_pos = lx->pos + 2; }
+                                    if (lx->src[lx->pos + 1] == '\n') lx->line++;
                                     lx->pos += 2;
                                     continue;
                                 }
@@ -599,14 +584,13 @@ static bool zr_lex_all(ZrLexer *lx) {
                 lx->pos++;
             }
             if (!closed) {
-                lx->err_line = tline; lx->err_col = tcol;
-                snprintf(lx->err, sizeof(lx->err), "line %u:%u: unterminated f-string literal", tline, tcol);
+                snprintf(lx->err, sizeof(lx->err), "line %u: unterminated f-string literal", tline);
                 return false;
             }
             size_t flen = lx->pos - start;
             const char *fraw = zr_arena_strndup(lx->arena, lx->src + start, flen);
             lx->pos++; /* consume closing quote */
-            ZrToken tok = { TOK_FSTR, fraw, flen, 0.0, tline, tcol, 0, false, false };
+            ZrToken tok = { TOK_FSTR, fraw, flen, 0.0, tline };
             zr_lex_push(lx, tok);
             continue;
         }
@@ -619,9 +603,9 @@ static bool zr_lex_all(ZrLexer *lx) {
             bool closed = false;
             while (lx->pos < lx->len) {
                 char sc = lx->src[lx->pos];
-                if (sc == '\n') { lx->line++; lx->line_start_pos = lx->pos + 1; }
+                if (sc == '\n') lx->line++;
                 if (sc == '\\' && lx->pos + 1 < lx->len) {
-                    if (lx->src[lx->pos + 1] == '\n') { lx->line++; lx->line_start_pos = lx->pos + 2; }
+                    if (lx->src[lx->pos + 1] == '\n') lx->line++;
                     lx->pos += 2;
                     continue;
                 }
@@ -632,8 +616,7 @@ static bool zr_lex_all(ZrLexer *lx) {
                 lx->pos++;
             }
             if (!closed) {
-                lx->err_line = tline; lx->err_col = tcol;
-                snprintf(lx->err, sizeof(lx->err), "line %u:%u: unterminated string literal", tline, tcol);
+                snprintf(lx->err, sizeof(lx->err), "line %u: unterminated string literal", tline);
                 return false;
             }
             size_t rlen = lx->pos - start;
@@ -641,7 +624,7 @@ static bool zr_lex_all(ZrLexer *lx) {
             const char *unesc = NULL;
             size_t ulen = 0;
             zr_unescape_string(lx->arena, lx->src + start, rlen, &unesc, &ulen);
-            ZrToken tok = { TOK_STR, unesc, ulen, 0.0, tline, tcol, 0, false, false };
+            ZrToken tok = { TOK_STR, unesc, ulen, 0.0, tline };
             zr_lex_push(lx, tok);
             continue;
         }
@@ -650,9 +633,6 @@ static bool zr_lex_all(ZrLexer *lx) {
         if (c >= '0' && c <= '9') {
             size_t start = lx->pos;
             double val = 0.0;
-            int64_t i64_val = 0;
-            bool is_i64 = false;
-            bool is_i64_min_mag = false;
             if (c == '0' && lx->pos + 1 < lx->len &&
                 (lx->src[lx->pos + 1] == 'x' || lx->src[lx->pos + 1] == 'X' ||
                  lx->src[lx->pos + 1] == 'b' || lx->src[lx->pos + 1] == 'B' ||
@@ -661,43 +641,24 @@ static bool zr_lex_all(ZrLexer *lx) {
                 uint32_t base = (mode == 'x') ? 16 : (mode == 'b') ? 2 : 8;
                 lx->pos += 2;
                 uint64_t u = 0;
-                bool u_ov = false;
                 size_t ndig = 0;
                 while (lx->pos < lx->len) {
                     char dc = lx->src[lx->pos];
                     if (dc == '_') { lx->pos++; continue; }
                     int hv = zr_hex_val(dc);
                     if (hv < 0 || (uint32_t)hv >= base) break;
-                    if (u > (UINT64_MAX - (uint64_t)hv) / base) u_ov = true;
                     u = u * base + (uint64_t)hv;
                     lx->pos++;
                     ndig++;
                 }
                 if (ndig == 0) {
-                    lx->err_line = tline; lx->err_col = tcol;
-                    snprintf(lx->err, sizeof(lx->err), "line %u:%u: invalid base-%u number literal", tline, tcol, base);
+                    snprintf(lx->err, sizeof(lx->err), "line %u: invalid base-%u number literal", tline, base);
                     return false;
-                }
-                bool has_i64_suf = (lx->pos + 3 <= lx->len && memcmp(lx->src + lx->pos, "i64", 3) == 0 &&
-                                    (lx->pos + 3 == lx->len || !zr_is_ident_continue_cp((unsigned char)lx->src[lx->pos + 3])));
-                if (has_i64_suf) {
-                    lx->pos += 3;
-                    is_i64 = true;
-                    i64_val = (int64_t)u;
-                    if (!u_ov && u == 9223372036854775808ULL) is_i64_min_mag = true;
-                } else if (!u_ov && u > 9007199254740991ULL) {
-                    if (u <= (uint64_t)INT64_MAX) {
-                        is_i64 = true;
-                        i64_val = (int64_t)u;
-                    } else if (u == 9223372036854775808ULL) {
-                        is_i64_min_mag = true;
-                    }
                 }
                 val = (double)u;
             } else {
                 ZrBuf clean;
                 zr_buf_init(&clean);
-                bool is_float = false;
                 while (lx->pos < lx->len && ((lx->src[lx->pos] >= '0' && lx->src[lx->pos] <= '9') || lx->src[lx->pos] == '_')) {
                     if (lx->src[lx->pos] != '_') zr_buf_push(&clean, lx->src[lx->pos]);
                     lx->pos++;
@@ -705,7 +666,6 @@ static bool zr_lex_all(ZrLexer *lx) {
                 /* Fractional part — do NOT consume '..' range operator! */
                 if (lx->pos + 1 < lx->len && lx->src[lx->pos] == '.' &&
                     lx->src[lx->pos + 1] >= '0' && lx->src[lx->pos + 1] <= '9') {
-                    is_float = true;
                     zr_buf_push(&clean, '.');
                     lx->pos++;
                     while (lx->pos < lx->len && ((lx->src[lx->pos] >= '0' && lx->src[lx->pos] <= '9') || lx->src[lx->pos] == '_')) {
@@ -714,7 +674,6 @@ static bool zr_lex_all(ZrLexer *lx) {
                     }
                 }
                 if (lx->pos < lx->len && (lx->src[lx->pos] == 'e' || lx->src[lx->pos] == 'E')) {
-                    is_float = true;
                     zr_buf_push(&clean, 'e');
                     lx->pos++;
                     if (lx->pos < lx->len && (lx->src[lx->pos] == '+' || lx->src[lx->pos] == '-')) {
@@ -725,38 +684,12 @@ static bool zr_lex_all(ZrLexer *lx) {
                         lx->pos++;
                     }
                 }
-                bool has_i64_suf = (!is_float && lx->pos + 3 <= lx->len && memcmp(lx->src + lx->pos, "i64", 3) == 0 &&
-                                    (lx->pos + 3 == lx->len || !zr_is_ident_continue_cp((unsigned char)lx->src[lx->pos + 3])));
-                if (has_i64_suf) lx->pos += 3;
-                if (!is_float && clean.data && clean.len > 0) {
-                    uint64_t u = 0;
-                    bool u_ov = false;
-                    for (size_t di = 0; di < clean.len; di++) {
-                        uint64_t d = (uint64_t)(clean.data[di] - '0');
-                        if (u > (UINT64_MAX - d) / 10ULL) { u_ov = true; break; }
-                        u = u * 10ULL + d;
-                    }
-                    if (!u_ov) {
-                        if (has_i64_suf) {
-                            is_i64 = true;
-                            i64_val = (int64_t)u;
-                            if (u == 9223372036854775808ULL) is_i64_min_mag = true;
-                        } else if (u > 9007199254740991ULL) {
-                            if (u <= (uint64_t)INT64_MAX) {
-                                is_i64 = true;
-                                i64_val = (int64_t)u;
-                            } else if (u == 9223372036854775808ULL) {
-                                is_i64_min_mag = true;
-                            }
-                        }
-                    }
-                }
                 val = strtod(clean.data ? clean.data : "0", NULL);
                 zr_buf_free(&clean);
             }
             size_t nlen = lx->pos - start;
             const char *nlex = zr_arena_strndup(lx->arena, lx->src + start, nlen);
-            ZrToken tok = { TOK_NUM, nlex, nlen, val, tline, tcol, i64_val, is_i64, is_i64_min_mag };
+            ZrToken tok = { TOK_NUM, nlex, nlen, val, tline };
             zr_lex_push(lx, tok);
             continue;
         }
@@ -776,7 +709,7 @@ static bool zr_lex_all(ZrLexer *lx) {
             size_t ilen = lx->pos - start;
             const char *ilex = zr_arena_strndup(lx->arena, lx->src + start, ilen);
             ZrTokKind kw = zr_classify_keyword(ilex, ilen);
-            ZrToken tok = { kw, ilex, ilen, 0.0, tline, tcol, 0, false, false };
+            ZrToken tok = { kw, ilex, ilen, 0.0, tline };
             zr_lex_push(lx, tok);
             continue;
         }
@@ -786,13 +719,13 @@ static bool zr_lex_all(ZrLexer *lx) {
             const char *p3 = lx->src + lx->pos;
             if (memcmp(p3, "...", 3) == 0) {
                 lx->pos += 3;
-                ZrToken tok = { TOK_ELLIPSIS, "...", 3, 0.0, tline, tcol, 0, false, false };
+                ZrToken tok = { TOK_ELLIPSIS, "...", 3, 0.0, tline };
                 zr_lex_push(lx, tok);
                 continue;
             }
             if (memcmp(p3, "**=", 3) == 0) {
                 lx->pos += 3;
-                ZrToken tok = { TOK_STARSTAREQ, "**=", 3, 0.0, tline, tcol, 0, false, false };
+                ZrToken tok = { TOK_STARSTAREQ, "**=", 3, 0.0, tline };
                 zr_lex_push(lx, tok);
                 continue;
             }
@@ -826,7 +759,7 @@ static bool zr_lex_all(ZrLexer *lx) {
             else if (c0 == '>' && c1 == '>') { k2 = TOK_SHR;       s2 = ">>"; }
             if (k2 != TOK_EOF) {
                 lx->pos += 2;
-                ZrToken tok = { k2, s2, 2, 0.0, tline, tcol, 0, false, false };
+                ZrToken tok = { k2, s2, 2, 0.0, tline };
                 zr_lex_push(lx, tok);
                 continue;
             }
@@ -862,16 +795,15 @@ static bool zr_lex_all(ZrLexer *lx) {
             case '?': k1 = TOK_QMARK;   s1 = "?"; break;
             case '@': k1 = TOK_AT;      s1 = "@"; break;
             default:
-                lx->err_line = tline; lx->err_col = tcol;
-                snprintf(lx->err, sizeof(lx->err), "line %u:%u: unexpected character '%c' (0x%02x)", tline, tcol, c, (unsigned char)c);
+                snprintf(lx->err, sizeof(lx->err), "line %u: unexpected character '%c' (0x%02x)", tline, c, (unsigned char)c);
                 return false;
         }
         lx->pos++;
-        ZrToken tok = { k1, s1, 1, 0.0, tline, tcol, 0, false, false };
+        ZrToken tok = { k1, s1, 1, 0.0, tline };
         zr_lex_push(lx, tok);
     }
 
-    ZrToken eof_tok = { TOK_EOF, "", 0, 0.0, lx->line, 1, 0, false, false };
+    ZrToken eof_tok = { TOK_EOF, "", 0, 0.0, lx->line };
     zr_lex_push(lx, eof_tok);
     return true;
 }
@@ -922,7 +854,6 @@ typedef enum {
     EX_NIL = 0,
     EX_BOOL,
     EX_NUM,
-    EX_I64,
     EX_STR,
     EX_VAR,
     EX_UNARY,
@@ -952,7 +883,6 @@ struct ZrExpr {
     union {
         bool     b;
         double   num;
-        int64_t  i64;
         struct { const char *s; size_t len; } str;
         const char *var;
         struct { ZrTokKind op; ZrExpr *rhs; } unary;
@@ -1056,10 +986,6 @@ typedef struct {
     bool     no_struct_brace;
     uint32_t gensym;
     ZrArena *arena;
-    uint32_t err_line;
-    uint32_t err_col;
-    size_t   err_span;
-    char     err_tok[64];
     char     err[512];
 } ZrParser;
 
@@ -1092,18 +1018,13 @@ static inline bool zp_match(ZrParser *p, ZrTokKind k) {
 
 static bool zp_err(ZrParser *p, const char *fmt, ...) {
     if (p->err[0] != '\0') return false;
-    ZrToken *tk = zp_peek(p);
-    uint32_t ln = tk->line;
-    p->err_line = ln;
-    p->err_col = tk->col ? tk->col : 1;
-    p->err_span = tk->lex_len > 0 ? tk->lex_len : 1;
-    snprintf(p->err_tok, sizeof(p->err_tok), "%.63s", tk->lexeme ? tk->lexeme : "");
+    uint32_t ln = zp_peek(p)->line;
     char msg[420];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    snprintf(p->err, sizeof(p->err), "parse error at line %u:%u: %s", ln, p->err_col, msg);
+    snprintf(p->err, sizeof(p->err), "parse error at line %u: %s", ln, msg);
     return false;
 }
 
@@ -1174,12 +1095,6 @@ static ZrExpr *zp_mk_num(ZrParser *p, double v, uint32_t line) {
     return e;
 }
 
-static ZrExpr *zp_mk_i64(ZrParser *p, int64_t v, uint32_t line) {
-    ZrExpr *e = zp_alloc_expr(p, EX_I64, line);
-    e->u.i64 = v;
-    return e;
-}
-
 static ZrExpr *zp_mk_call1(ZrParser *p, const char *fn_name, ZrExpr *arg0, uint32_t line) {
     ZrExpr *c = zp_alloc_expr(p, EX_CALL, line);
     c->u.call.callee = zp_mk_var(p, fn_name, line);
@@ -1212,14 +1127,6 @@ static ZrExpr *zp_mk_call3(ZrParser *p, const char *fn_name, ZrExpr *a0, ZrExpr 
 
 static ZrExpr *zp_mk_bin(ZrParser *p, ZrTokKind op, ZrExpr *lhs, ZrExpr *rhs, uint32_t line) {
     /* Constant folding for pure numeric/string literals */
-    if (lhs->kind == EX_I64 && rhs->kind == EX_I64) {
-        int64_t r = 0;
-#if defined(__GNUC__) || defined(__clang__)
-        if (op == TOK_PLUS && !__builtin_add_overflow(lhs->u.i64, rhs->u.i64, &r))  return zp_mk_i64(p, r, line);
-        if (op == TOK_MINUS && !__builtin_sub_overflow(lhs->u.i64, rhs->u.i64, &r)) return zp_mk_i64(p, r, line);
-        if (op == TOK_STAR && !__builtin_mul_overflow(lhs->u.i64, rhs->u.i64, &r))  return zp_mk_i64(p, r, line);
-#endif
-    }
     if (lhs->kind == EX_NUM && rhs->kind == EX_NUM) {
         if (op == TOK_PLUS)  return zp_mk_num(p, lhs->u.num + rhs->u.num, line);
         if (op == TOK_MINUS) return zp_mk_num(p, lhs->u.num - rhs->u.num, line);
@@ -1331,17 +1238,6 @@ static bool zp_parse_param_list(ZrParser *p, ZrParam **out_params, size_t *out_c
     ZrParam *arr = NULL;
     size_t n = 0, cap = 0;
     while (!zp_check(p, TOK_RPAREN) && !zp_check(p, TOK_EOF)) {
-        while (zp_match(p, TOK_AT)) {
-            if (!zp_expect_any_name(p, "parameter attribute")) return false;
-            if (zp_match(p, TOK_LPAREN)) {
-                int ad = 1;
-                while (ad > 0 && !zp_check(p, TOK_EOF)) {
-                    if (zp_match(p, TOK_LPAREN)) ad++;
-                    else if (zp_match(p, TOK_RPAREN)) ad--;
-                    else zp_advance(p);
-                }
-            }
-        }
         bool is_va = zp_match(p, TOK_ELLIPSIS);
         const char *pname = zp_expect_decl_name(p, "parameter name");
         if (!pname) return false;
@@ -1694,15 +1590,13 @@ static ZrPat *zp_parse_single_pat(ZrParser *p) {
             if (nt->kind != TOK_NUM) { zp_err(p, "expected number after '-' in pattern"); return NULL; }
             zp_advance(p);
             pat->kind = PAT_LIT;
-            if (nt->is_i64_min_mag) pat->lit_expr = zp_mk_i64(p, INT64_MIN, ln);
-            else if (nt->is_i64) pat->lit_expr = zp_mk_i64(p, -nt->i64_val, ln);
-            else pat->lit_expr = zp_mk_num(p, -nt->num_val, ln);
+            pat->lit_expr = zp_mk_num(p, -nt->num_val, ln);
             return pat;
         }
         if (zp_check(p, TOK_NUM)) {
             ZrToken *nt = zp_advance(p);
             pat->kind = PAT_LIT;
-            pat->lit_expr = nt->is_i64 ? zp_mk_i64(p, nt->i64_val, ln) : zp_mk_num(p, nt->num_val, ln);
+            pat->lit_expr = zp_mk_num(p, nt->num_val, ln);
             return pat;
         }
         if (zp_check(p, TOK_STR)) {
@@ -1959,7 +1853,7 @@ static ZrExpr *zp_parse_primary(ZrParser *p) {
             break;
         case TOK_NUM:
             zp_advance(p);
-            res = t->is_i64 ? zp_mk_i64(p, t->i64_val, ln) : zp_mk_num(p, t->num_val, ln);
+            res = zp_mk_num(p, t->num_val, ln);
             break;
         case TOK_STR:
             zp_advance(p);
@@ -2366,14 +2260,9 @@ static ZrExpr *zp_parse_unary(ZrParser *p) {
         return zp_parse_unary(p);
     }
     if (zp_match(p, TOK_MINUS)) {
-        if (zp_check(p, TOK_NUM) && zp_peek(p)->is_i64_min_mag) {
-            zp_advance(p);
-            return zp_mk_i64(p, INT64_MIN, ln);
-        }
         ZrExpr *rhs = zp_parse_unary(p);
         if (!rhs) return NULL;
         if (rhs->kind == EX_NUM) return zp_mk_num(p, -rhs->u.num, ln);
-        if (rhs->kind == EX_I64 && rhs->u.i64 != INT64_MIN) return zp_mk_i64(p, -rhs->u.i64, ln);
         ZrExpr *e = zp_alloc_expr(p, EX_UNARY, ln);
         e->u.unary.op = TOK_MINUS;
         e->u.unary.rhs = rhs;
@@ -3375,11 +3264,8 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
         }
     }
 
-    bool has_region_attr = false;
     while (zp_match(p, TOK_AT)) {
-        const char *aname = zp_expect_any_name(p, "attribute name");
-        if (!aname) { p->depth--; return NULL; }
-        if (strcmp(aname, "region") == 0) has_region_attr = true;
+        if (!zp_expect_any_name(p, "attribute name")) { p->depth--; return NULL; }
         if (zp_match(p, TOK_LPAREN)) {
             int ad = 1;
             while (ad > 0 && !zp_check(p, TOK_EOF)) {
@@ -3389,65 +3275,6 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
             }
         }
         t = zp_peek(p);
-    }
-
-    if (has_region_attr && t->kind == TOK_LBRACE) {
-        ZrStmt **rbody = NULL; size_t rbn = 0;
-        if (!zp_parse_block_stmts(p, &rbody, &rbn)) { p->depth--; return NULL; }
-        ZrExpr *ent_call = zp_alloc_expr(p, EX_CALL, ln);
-        ent_call->u.call.callee = zp_mk_var(p, "region_enter", ln);
-        ent_call->u.call.args = NULL;
-        ent_call->u.call.argc = 0;
-        ZrStmt *s_enter = zp_alloc_stmt(p, ST_EXPR, ln);
-        s_enter->u.expr = ent_call;
-
-        ZrExpr *ext_call = zp_alloc_expr(p, EX_CALL, ln);
-        ext_call->u.call.callee = zp_mk_var(p, "region_exit", ln);
-        ext_call->u.call.args = NULL;
-        ext_call->u.call.argc = 0;
-        ZrStmt *s_exit = zp_alloc_stmt(p, ST_EXPR, ln);
-        s_exit->u.expr = ext_call;
-
-        ZrExpr *ext_err_call = zp_alloc_expr(p, EX_CALL, ln);
-        ext_err_call->u.call.callee = zp_mk_var(p, "region_exit", ln);
-        ext_err_call->u.call.args = NULL;
-        ext_err_call->u.call.argc = 0;
-        ZrStmt *s_exit_err = zp_alloc_stmt(p, ST_EXPR, ln);
-        s_exit_err->u.expr = ext_err_call;
-
-        const char *ev = zp_gensym(p, "reg_err");
-        ZrStmt *s_rethrow = zp_alloc_stmt(p, ST_THROW, ln);
-        s_rethrow->u.expr = zp_mk_var(p, ev, ln);
-
-        ZrStmt **cstmts = (ZrStmt **)zr_arena_alloc(p->arena, 2 * sizeof(ZrStmt *));
-        cstmts[0] = s_exit_err;
-        cstmts[1] = s_rethrow;
-        ZrExpr *catch_blk = zp_alloc_expr(p, EX_BLOCK, ln);
-        catch_blk->u.blk.stmts = cstmts;
-        catch_blk->u.blk.stmt_count = 2;
-        catch_blk->u.blk.tail = zp_alloc_expr(p, EX_NIL, ln);
-
-        ZrExpr *try_blk = zp_alloc_expr(p, EX_BLOCK, ln);
-        try_blk->u.blk.stmts = rbody;
-        try_blk->u.blk.stmt_count = rbn;
-        try_blk->u.blk.tail = zp_alloc_expr(p, EX_NIL, ln);
-
-        ZrExpr *try_ex = zp_alloc_expr(p, EX_TRY, ln);
-        try_ex->u.try_e.try_e = try_blk;
-        try_ex->u.try_e.err_var = ev;
-        try_ex->u.try_e.catch_e = catch_blk;
-        ZrStmt *s_try = zp_alloc_stmt(p, ST_EXPR, ln);
-        s_try->u.expr = try_ex;
-
-        ZrStmt **wstmts = (ZrStmt **)zr_arena_alloc(p->arena, 3 * sizeof(ZrStmt *));
-        wstmts[0] = s_enter;
-        wstmts[1] = s_try;
-        wstmts[2] = s_exit;
-        res = zp_alloc_stmt(p, ST_BLOCK, ln);
-        res->u.blk.stmts = wstmts;
-        res->u.blk.count = 3;
-        p->depth--;
-        return res;
     }
 
     switch (t->kind) {
@@ -3940,13 +3767,12 @@ static inline void zc_patch_jump(ZrCompiler *c, uint32_t ins_idx, uint32_t targe
 
 static uint32_t zc_add_const(ZrCompiler *c, PbValue v) {
     PbFunc *fn = c->fn;
-    /* Deduplicate string, number, i64, bool, and nil constants */
+    /* Deduplicate string, number, bool, and nil constants */
     for (uint32_t i = 0; i < fn->const_len; i++) {
         PbValue cur = fn->consts[i];
         if (cur.tag == v.tag) {
             if (v.tag == VAL_NIL) return i;
             if (v.tag == VAL_BOOL && cur.as.b == v.as.b) return i;
-            if (v.tag == VAL_I64 && cur.as.i64 == v.as.i64) return i;
             if (v.tag == VAL_NUM && cur.as.num == v.as.num && signbit(cur.as.num) == signbit(v.as.num)) return i;
             if (is_obj_type(v, OBJ_STR) && is_obj_type(cur, OBJ_STR)) {
                 PbStr *sa = AS_STR(cur), *sb = AS_STR(v);
@@ -4074,16 +3900,10 @@ static bool zc_eval_default_const(ZrCompiler *c, const ZrExpr *e, PbValue *out) 
         case EX_NIL:  *out = val_nil(); return true;
         case EX_BOOL: *out = val_bool(e->u.b); return true;
         case EX_NUM:  *out = val_num(e->u.num); return true;
-        case EX_I64:  *out = val_i64(e->u.i64); return true;
         case EX_STR:  *out = val_obj(pb_str_new(c->vm, e->u.str.s, e->u.str.len)); return true;
         case EX_UNARY:
             if (e->u.unary.op == TOK_MINUS && e->u.unary.rhs->kind == EX_NUM) {
                 *out = val_num(-e->u.unary.rhs->u.num);
-                return true;
-            }
-            if (e->u.unary.op == TOK_MINUS && e->u.unary.rhs->kind == EX_I64 &&
-                e->u.unary.rhs->u.i64 != INT64_MIN) {
-                *out = val_i64(-e->u.unary.rhs->u.i64);
                 return true;
             }
             break;
@@ -4371,9 +4191,6 @@ static bool zc_compile_expr(ZrCompiler *c, const ZrExpr *e) {
         case EX_NUM:
             zc_emit(c, OP_CONSTANT, zc_add_const(c, val_num(e->u.num)), ln);
             return true;
-        case EX_I64:
-            zc_emit(c, OP_CONSTANT, zc_add_const(c, val_i64(e->u.i64)), ln);
-            return true;
         case EX_STR:
             zc_emit(c, OP_CONSTANT, zc_str_const(c, e->u.str.s, e->u.str.len), ln);
             return true;
@@ -4382,11 +4199,6 @@ static bool zc_compile_expr(ZrCompiler *c, const ZrExpr *e) {
             return true;
 
         case EX_UNARY:
-            if (e->u.unary.op == TOK_MINUS && e->u.unary.rhs->kind == EX_I64 &&
-                e->u.unary.rhs->u.i64 != INT64_MIN) {
-                zc_emit(c, OP_CONSTANT, zc_add_const(c, val_i64(-e->u.unary.rhs->u.i64)), ln);
-                return true;
-            }
             if (!zc_compile_expr(c, e->u.unary.rhs)) return false;
             zc_emit(c, e->u.unary.op == TOK_MINUS ? OP_NEGATE :
                        (e->u.unary.op == TOK_THROW ? OP_THROW : OP_NOT), 0, ln);
@@ -4755,10 +4567,6 @@ static bool zc_compile_comptime_expr(ZrCompiler *c, const ZrExpr *e, uint32_t ln
                     break;
                 case VAL_NUM:
                     zc_emit(c, OP_CONSTANT, zc_add_const(c, val_num(v.as.num)), ln);
-                    sp--;
-                    break;
-                case VAL_I64:
-                    zc_emit(c, OP_CONSTANT, zc_add_const(c, val_i64(v.as.i64)), ln);
                     sp--;
                     break;
                 case VAL_OBJ:
@@ -5454,7 +5262,7 @@ static PbFunc *zc_compile_fn_node(ZrCompiler *enclosing,
     /* Emit runtime initialization for non-literal default parameter expressions! */
     for (size_t i = min_ar; i < fixed_count; i++) {
         const ZrExpr *de = params[i].def_expr;
-        if (de && de->kind != EX_NIL && de->kind != EX_BOOL && de->kind != EX_NUM && de->kind != EX_I64 && de->kind != EX_STR) {
+        if (de && de->kind != EX_NIL && de->kind != EX_BOOL && de->kind != EX_NUM && de->kind != EX_STR) {
             zc_emit(&sub, OP_GET_LOCAL, (uint32_t)i, line);
             zc_emit(&sub, OP_IS_NIL, 0, line);
             uint32_t j_skip = zc_emit(&sub, OP_JUMP_IF_FALSE, 0, line);
@@ -5574,116 +5382,6 @@ static void zr_scan_top_tests(PbFunc *root_fn, ZrStmt *const *stmts, size_t coun
     }
 }
 
-/* ---- Rich Source-Span Diagnostics Formatter (Item #20) ---- */
-
-static size_t zr_levenshtein_ci(const char *a, const char *b) {
-    size_t la = strlen(a), lb = strlen(b);
-    if (la > 48 || lb > 48) return 99;
-    size_t dp[49];
-    for (size_t j = 0; j <= lb; j++) dp[j] = j;
-    for (size_t i = 1; i <= la; i++) {
-        size_t prev = dp[0];
-        dp[0] = i;
-        unsigned char ca = (unsigned char)tolower((unsigned char)a[i - 1]);
-        for (size_t j = 1; j <= lb; j++) {
-            size_t tmp = dp[j];
-            unsigned char cb = (unsigned char)tolower((unsigned char)b[j - 1]);
-            size_t cost = (ca == cb) ? 0u : 1u;
-            size_t del_c = dp[j] + 1u;
-            size_t ins_c = dp[j - 1] + 1u;
-            size_t sub_c = prev + cost;
-            size_t m = del_c < ins_c ? del_c : ins_c;
-            dp[j] = sub_c < m ? sub_c : m;
-            prev = tmp;
-        }
-    }
-    return dp[lb];
-}
-
-static const char *zr_suggest_keyword(const char *tok) {
-    static const char *const kws[] = {
-        "let", "const", "fn", "async", "await", "return", "if", "elif", "else",
-        "while", "for", "loop", "break", "continue", "try", "catch", "throw",
-        "defer", "print", "printf", "export", "import", "struct", "class",
-        "interface", "enum", "match", "true", "false", "nil", NULL
-    };
-    if (!tok || tok[0] == '\0' || strlen(tok) < 2) return NULL;
-    const char *best = NULL;
-    size_t best_d = 3;
-    for (size_t i = 0; kws[i]; i++) {
-        if (strcmp(tok, kws[i]) == 0) return NULL;
-        size_t d = zr_levenshtein_ci(tok, kws[i]);
-        if (d < best_d) { best_d = d; best = kws[i]; }
-    }
-    return (best_d <= 2) ? best : NULL;
-}
-
-static void zr_format_rich_diagnostic(const char *raw_src,
-                                      size_t raw_len,
-                                      const char *source_name,
-                                      uint32_t err_line,
-                                      uint32_t err_col,
-                                      size_t span_len,
-                                      const char *bad_tok,
-                                      char err_buf[512]) {
-    if (!raw_src || err_buf[0] == '\0') return;
-    if (err_line == 0) {
-        const char *lp = strstr(err_buf, "line ");
-        if (lp) err_line = (uint32_t)strtoul(lp + 5, NULL, 10);
-    }
-    if (err_line == 0) return;
-    if (err_col == 0) err_col = 1;
-    if (span_len == 0) span_len = 1;
-    if (span_len > 24) span_len = 24;
-
-    /* Locate target line in raw_src */
-    uint32_t cur_ln = 1;
-    size_t ls = 0;
-    while (ls < raw_len && cur_ln < err_line) {
-        if (raw_src[ls] == '\n') cur_ln++;
-        ls++;
-    }
-    if (cur_ln != err_line || ls > raw_len) return;
-    size_t le = ls;
-    while (le < raw_len && raw_src[le] != '\n' && raw_src[le] != '\r') le++;
-    size_t line_len = le - ls;
-    if (line_len > 96) line_len = 96;
-
-    char base_msg[260];
-    snprintf(base_msg, sizeof(base_msg), "%s", err_buf);
-
-    char carets[64];
-    size_t pad = (err_col > 1 && err_col <= 60) ? (size_t)(err_col - 1) : 0;
-    size_t ci = 0;
-    while (ci < pad && ci + 2 < sizeof(carets)) carets[ci++] = ' ';
-    carets[ci++] = '^';
-    for (size_t k = 1; k < span_len && ci + 1 < sizeof(carets); k++) carets[ci++] = '~';
-    carets[ci] = '\0';
-
-    const char *lang_env = getenv("PBLANG_DIAG_LANG");
-    bool is_el = (lang_env && (strncmp(lang_env, "el", 2) == 0 || strncmp(lang_env, "EL", 2) == 0));
-    const char *sug = bad_tok ? zr_suggest_keyword(bad_tok) : NULL;
-    const char *sname = (source_name && source_name[0]) ? source_name : "<script>";
-
-    if (sug) {
-        snprintf(err_buf, 512,
-                 "%s (%s:%u:%u)\n  %4u | %.*s\n       | %s\n  %s: '%s'?",
-                 base_msg, sname, (unsigned)err_line, (unsigned)err_col,
-                 (unsigned)err_line, (int)line_len, raw_src + ls, carets,
-                 is_el ? "μήπως εννοούσατε" : "did you mean", sug);
-    } else if (is_el) {
-        snprintf(err_buf, 512,
-                 "%s (%s:%u:%u — σφάλμα σύνταξης/μεταγλώττισης)\n  %4u | %.*s\n       | %s",
-                 base_msg, sname, (unsigned)err_line, (unsigned)err_col,
-                 (unsigned)err_line, (int)line_len, raw_src + ls, carets);
-    } else {
-        snprintf(err_buf, 512,
-                 "%s (%s:%u:%u)\n  %4u | %.*s\n       | %s",
-                 base_msg, sname, (unsigned)err_line, (unsigned)err_col,
-                 (unsigned)err_line, (int)line_len, raw_src + ls, carets);
-    }
-}
-
 /* Main Entry: Compile .sapp source text -> PbFunc* */
 static PbFunc *zr_compile_sapp(PbVM *vm,
                                const char *source,
@@ -5696,7 +5394,6 @@ static PbFunc *zr_compile_sapp(PbVM *vm,
     PbPolyBlock *polys = NULL;
     size_t poly_count = 0;
     if (!zr_preprocess_sapp(source, source_len, &clean, &polys, &poly_count, err_out)) {
-        zr_format_rich_diagnostic(source, source_len, source_name, 0, 1, 1, NULL, err_out);
         return NULL;
     }
 
@@ -5712,7 +5409,6 @@ static PbFunc *zr_compile_sapp(PbVM *vm,
 
     if (!zr_lex_all(&lx)) {
         snprintf(err_out, 512, "%s", lx.err);
-        zr_format_rich_diagnostic(source, source_len, source_name, lx.err_line, lx.err_col, 1, NULL, err_out);
         free(lx.tokens);
         zr_arena_free(&arena);
         free(clean);
@@ -5750,18 +5446,11 @@ static PbFunc *zr_compile_sapp(PbVM *vm,
         top_stmts[top_len++] = s;
     }
 
-    uint32_t perr_ln = parser.err_line;
-    uint32_t perr_col = parser.err_col;
-    size_t perr_span = parser.err_span;
-    char perr_tok[64];
-    snprintf(perr_tok, sizeof(perr_tok), "%s", parser.err_tok);
-
     free(lx.tokens);
     free(clean);
 
     if (!parse_ok) {
         snprintf(err_out, 512, "%s", parser.err[0] ? parser.err : "syntax error");
-        zr_format_rich_diagnostic(source, source_len, source_name, perr_ln, perr_col, perr_span, perr_tok, err_out);
         zr_arena_free(&arena);
         for (size_t i = 0; i < poly_count; i++) {
             free(polys[i].lang); free(polys[i].name); free(polys[i].code);
@@ -5824,10 +5513,7 @@ static PbFunc *zr_compile_sapp(PbVM *vm,
     zr_arena_free(&arena);
     vm->gc_inhibit--;
 
-    if (!comp_ok) {
-        zr_format_rich_diagnostic(source, source_len, source_name, 0, 1, 1, NULL, err_out);
-        return NULL;
-    }
+    if (!comp_ok) return NULL;
     return root_fn;
 }
 

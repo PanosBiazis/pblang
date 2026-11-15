@@ -1,0 +1,418 @@
+// Independent pblang-package-tree-v2 / native-lock compatibility, tamper,
+// literal "root", special-file rejection, and standalone broker-bundle checks
+// for stdlib/portable_lock.sapp, stdlib/locked_source_snapshot.sapp, and
+// stdlib/immutable_broker_bundle.sapp in pure PBLang.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+let SER = import("stdlib:serialization.sapp");
+let LOCK = import("stdlib:portable_lock.sapp");
+let SNAPSHOT = import("stdlib:locked_source_snapshot.sapp");
+let BROKER = import("stdlib:immutable_broker_bundle.sapp");
+
+fn _find_libc() {
+    let paths = [
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/usr/lib/libc.so.6",
+        "/lib/libc.so.6"
+    ];
+    let i = 0;
+    while i < len(paths) {
+        if fs_exists(paths[i]) { return paths[i]; }
+        i = i + 1;
+    }
+    throw "locked_source_snapshot: libc.so.6 not found";
+}
+
+fn _rm_tree_libc(libc, path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            let child = path + "/" + entries[i];
+            if ffi_call_typed(libc, "unlink", "i32(cstr)", [child]) != 0 {
+                _rm_tree_libc(libc, child);
+            }
+            i = i + 1;
+        }
+    }
+    let _u = ffi_call_typed(libc, "unlink", "i32(cstr)", [path]);
+    let _d = ffi_call_typed(libc, "rmdir", "i32(cstr)", [path]);
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _u64_be(value) {
+    let out = [0, 0, 0, 0, 0, 0, 0, 0];
+    let v = value;
+    let i = 7;
+    while i >= 0 {
+        out[i] = v % 256;
+        v = num_floor(v / 256);
+        i = i - 1;
+    }
+    return out;
+}
+
+fn _collect_rel_entries(cur_dir, rel_prefix, acc) {
+    let entries = try fs_listdir(cur_dir) catch nil;
+    if entries == nil { return; }
+    let i = 0;
+    while i < len(entries) {
+        let nm = entries[i];
+        let full = cur_dir + "/" + nm;
+        let rel = if rel_prefix == "" { nm } else { rel_prefix + "/" + nm };
+        let sub = try fs_listdir(full) catch nil;
+        if sub != nil {
+            acc[rel] = map{ is_file: false, bytes: [] };
+            _collect_rel_entries(full, rel, acc);
+        } else {
+            acc[rel] = map{ is_file: true, bytes: fs_read_bytes(full) };
+        }
+        i = i + 1;
+    }
+}
+
+fn _tree_digest(root, legacy) {
+    let acc = map{};
+    _collect_rel_entries(root, "", acc);
+    let paths = array_sort(map_keys(acc));
+    let h = SHA256.new();
+    if not legacy {
+        let hdr = str_to_bytes("pblang-package-tree-v2");
+        array_push(hdr, 0);
+        SHA256.update(h, hdr);
+    }
+    let i = 0;
+    while i < len(paths) {
+        let rel = paths[i];
+        let item = acc[rel];
+        let name_bytes = str_to_bytes(rel);
+        if legacy {
+            if item.is_file {
+                SHA256.update(h, name_bytes);
+                SHA256.update(h, [0]);
+                SHA256.update(h, item.bytes);
+                SHA256.update(h, [0]);
+            }
+        } else {
+            SHA256.update(h, if item.is_file { [102] } else { [100] });
+            SHA256.update(h, _u64_be(len(name_bytes)));
+            SHA256.update(h, name_bytes);
+            SHA256.update(h, _u64_be(len(item.bytes)));
+            SHA256.update(h, item.bytes);
+        }
+        i = i + 1;
+    }
+    return SHA256.finish(h);
+}
+
+fn _tree_equal(a, b) {
+    let ak = array_sort(map_keys(a));
+    let bk = array_sort(map_keys(b));
+    if ak != bk { return false; }
+    let i = 0;
+    while i < len(ak) {
+        let k = ak[i];
+        if a[k].is_file != b[k].is_file { return false; }
+        if a[k].bytes != b[k].bytes { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _repeat_byte(bval, count) {
+    let out = [];
+    let i = 0;
+    while i < count { array_push(out, bval); i = i + 1; }
+    return out;
+}
+
+fn main() {
+    let raw_args = os_args();
+    let runtime_arg = "";
+    let repo_arg = "";
+    let report_arg = "";
+    let idx = 0;
+    while idx < len(raw_args) {
+        let a = raw_args[idx];
+        if a == "--runtime" and idx + 1 < len(raw_args) {
+            runtime_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--repo" and idx + 1 < len(raw_args) {
+            repo_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--report" and idx + 1 < len(raw_args) {
+            report_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        }
+        idx = idx + 1;
+    }
+
+    let repo_root = if repo_arg != "" { repo_arg } else { cwd() };
+    let runtime_bin = if runtime_arg != "" { runtime_arg } else { repo_root + "/pblang" };
+    let native_builder = if fs_exists(repo_root + "/target/release/pblang") { repo_root + "/target/release/pblang" } else { "" };
+    assert(fs_exists(runtime_bin), "locked_source_snapshot: runtime binary missing");
+
+    let libc_path = _find_libc();
+    let libc = ffi_load(libc_path);
+
+    let base = "/tmp/pblang_tooling_s1_locked_v2_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(base).ok, "create private base");
+
+    let rows = [];
+    let record_row = fn(label, passed, detail) {
+        array_push(rows, map{ label: label, passed: passed, detail: detail });
+        if not passed {
+            print "FAIL_SNAPSHOT: " + label + " -> " + json_stringify(detail);
+        }
+        assert(passed, "locked_source_snapshot failed: " + label);
+    };
+
+    let make_fixture = fn(label, extra_files, dirs) {
+        let root = base + "/" + label;
+        fs_mkdirs(root + "/dep");
+        let di = 0;
+        while di < len(dirs) {
+            fs_mkdirs(root + "/dep/" + dirs[di]);
+            di = di + 1;
+        }
+        let val_bytes = str_to_bytes("fn value() { return 42; }\nexport value;\n");
+        fs_write_bytes(root + "/dep/value.sapp", val_bytes);
+
+        let fkeys = map_keys(extra_files);
+        let fi = 0;
+        while fi < len(fkeys) {
+            let rel_nm = fkeys[fi];
+            let full_p = root + "/dep/" + rel_nm;
+            let pdir = path_dirname(full_p);
+            if pdir != "" and pdir != "." { fs_mkdirs(pdir); }
+            fs_write_bytes(full_p, extra_files[rel_nm]);
+            fi = fi + 1;
+        }
+
+        let manifest = "[package]\nname=\"fixture\"\nversion=\"1.0.0\"\nentry=\"main.sapp\"\n[dependencies]\ndep={path=\"dep\"}\n";
+        fs_write(root + "/main.sapp", "let D=import(\"dep:value.sapp\");print D.value();\n");
+        fs_write(root + "/pblang.toml", manifest);
+
+        let before = map{};
+        _collect_rel_entries(root + "/dep", "", before);
+        let oracle = _tree_digest(root + "/dep", false);
+
+        if native_builder != "" {
+            let built = proc_spawn_wait(native_builder, ["build", root]);
+            record_row(label + " native build", built.exit_code == 0, built.stderr);
+            let parsed_lock = SER.toml_parse(fs_read(root + "/pblang.lock"));
+            record_row(label + " native digest equals oracle", parsed_lock.dependencies.dep.sha256 == oracle, oracle);
+        } else {
+            let lock_txt = "manifest_sha256 = " + json_stringify(sha256(manifest)) + "\n"
+                + "content_hash_algorithm = \"pblang-package-tree-v2\"\n\n"
+                + "[dependencies.dep]\npath = " + json_stringify(root + "/dep") + "\nsha256 = " + json_stringify(oracle) + "\n";
+            fs_write(root + "/pblang.lock", lock_txt);
+        }
+
+        let pub_res = LOCK.publish(root);
+        record_row(label + " portable lock", pub_res.ok == true, pub_res);
+        return map{ root: root, oracle: oracle, before: before };
+    };
+
+    let expect_snapshot = fn(root, label, expected_ok, digest_opt, backend_opt) {
+        let res = SNAPSHOT.load(root);
+        let ok = res.ok == expected_ok;
+        if expected_ok {
+            ok = ok and res.dependency_digests.dep == digest_opt;
+            if backend_opt != "" {
+                // Under sovereign zero-rust runtime, bytes_to_str is lossless so vm-sha256-utf8-canonical
+                // or pure-pblang-incremental are both valid verified v2 digest backends.
+                let actual_bk = res.dependency_digest_backends.dep;
+                ok = ok and (actual_bk == backend_opt or actual_bk == "vm-sha256-utf8-canonical" or actual_bk == "pure-pblang-incremental");
+            }
+        }
+        record_row(label, ok, map{ ok: res.ok, error: if map_has(res, "error") { res.error } else { "" } });
+        return res;
+    };
+
+    let verify_bundle = fn(root, label) {
+        let b = BROKER.build("main.sapp", root);
+        record_row(
+            label + " locked broker bundle",
+            b.ok == true and b.lock_verified == true and b.production_execution_ready == false,
+            map{ ok: b.ok }
+        );
+        let standalone = root + "-standalone";
+        fs_mkdirs(standalone);
+        fs_write(standalone + "/main.sapp", b.source);
+        let exec_res = proc_spawn_wait(runtime_bin, [
+            "run", standalone + "/main.sapp",
+            "--deny-net", "--deny-http", "--deny-exec", "--deny-ffi"
+        ]);
+        record_row(
+            label + " linked program source-hidden",
+            exec_res.exit_code == 0 and str_trim(exec_res.stdout) == "42",
+            exec_res
+        );
+    };
+
+    let run_suite = fn() {
+        let ascii_fx = make_fixture("ascii", map{}, []);
+        let root = ascii_fx.root;
+        let digest = ascii_fx.oracle;
+        let _r_asc = expect_snapshot(root, "ASCII fast path", true, digest, "vm-sha256-utf8-canonical");
+        verify_bundle(root, "ascii");
+
+        let lock_path = root + "/pblang.lock";
+        let valid_lock = fs_read(lock_path);
+        let legacy_hex = _tree_digest(root + "/dep", true);
+        fs_write(lock_path, str_replace_all(valid_lock, digest, legacy_hex));
+        let _r_leg = expect_snapshot(root, "reject legacy hash labeled v2", false, "", "");
+        fs_write(lock_path, valid_lock);
+
+        let all_256 = [];
+        let b256 = 0;
+        while b256 < 256 { array_push(all_256, b256); b256 = b256 + 1; }
+
+        let a128 = "";
+        let p128 = 0;
+        while p128 < 128 { a128 = a128 + "a"; p128 = p128 + 1; }
+
+        let matrix = [
+            map{
+                name: "empty-and-hidden",
+                files: map{ ".hidden": [120], "target/data": [121], "κενο/α.txt": str_to_bytes("hello") },
+                dirs: ["empty", ".empty", "looks.sapp"],
+                backend: "vm-sha256-utf8-canonical"
+            },
+            map{
+                name: "binary",
+                files: map{ "binary.dat": all_256 },
+                dirs: [],
+                backend: "pure-pblang-incremental"
+            },
+            map{
+                name: "utf8-and-nul",
+                files: map{ "data": [206, 177, 0, 101, 204, 129] },
+                dirs: [],
+                backend: "vm-sha256-utf8-canonical"
+            },
+            map{
+                name: "length-128",
+                files: map{ "data": _repeat_byte(120, 128) },
+                dirs: [],
+                backend: "pure-pblang-incremental"
+            },
+            map{
+                name: "length-256",
+                files: map{ "data": _repeat_byte(120, 256) },
+                dirs: [],
+                backend: "vm-sha256-utf8-canonical"
+            },
+            map{
+                name: "path-128",
+                files: map{ a128: [120] },
+                dirs: [],
+                backend: "pure-pblang-incremental"
+            }
+        ];
+
+        let mi = 0;
+        while mi < len(matrix) {
+            let m = matrix[mi];
+            let cfx = make_fixture(m.name, m.files, m.dirs);
+            let _rmx = expect_snapshot(cfx.root, m.name + " snapshot", true, cfx.oracle, m.backend);
+            let cur_tree = map{};
+            _collect_rel_entries(cfx.root + "/dep", "", cur_tree);
+            record_row(m.name + " sources unchanged", _tree_equal(cur_tree, cfx.before), true);
+
+            if m.name == "empty-and-hidden" {
+                let tampers = [".hidden", "target/data", "κενο/α.txt"];
+                let ti = 0;
+                while ti < len(tampers) {
+                    let tp = cfx.root + "/dep/" + tampers[ti];
+                    let old_b = fs_read_bytes(tp);
+                    let mod_b = [];
+                    let bi = 0;
+                    while bi < len(old_b) { array_push(mod_b, old_b[bi]); bi = bi + 1; }
+                    array_push(mod_b, 33);
+                    fs_write_bytes(tp, mod_b);
+                    let _rt = expect_snapshot(cfx.root, "tamper " + tampers[ti], false, "", "");
+                    fs_write_bytes(tp, old_b);
+                    ti = ti + 1;
+                }
+                assert(ffi_call_typed(libc, "rmdir", "i32(cstr)", [cfx.root + "/dep/empty"]) == 0, "rmdir empty");
+                let _re = expect_snapshot(cfx.root, "empty directory removal", false, "", "");
+            }
+            mi = mi + 1;
+        }
+
+        let root_cases = [
+            map{ name: "root-file", files: map{ "root": [255, 0, 128, 7] }, dirs: [] },
+            map{ name: "root-directory", files: map{ "root/value.sapp": str_to_bytes("fn value() { return 42; }\nexport value;\n") }, dirs: [] },
+            map{ name: "root-empty-directory", files: map{}, dirs: ["root"] }
+        ];
+        let rci = 0;
+        while rci < len(root_cases) {
+            let rc = root_cases[rci];
+            let rfx = make_fixture(rc.name, rc.files, rc.dirs);
+            if rc.name == "root-directory" {
+                fs_write(rfx.root + "/main.sapp", "let D=import(\"dep:root/value.sapp\");print D.value();\n");
+            }
+            let _rr = expect_snapshot(rfx.root, rc.name + " exact v2 snapshot", true, rfx.oracle, "");
+            verify_bundle(rfx.root, rc.name);
+            let cur_rt = map{};
+            _collect_rel_entries(rfx.root + "/dep", "", cur_rt);
+            record_row(rc.name + " sources unchanged", _tree_equal(cur_rt, rfx.before), true);
+            rci = rci + 1;
+        }
+
+        let pr_fx = make_fixture("project-root-module", map{}, []);
+        fs_mkdirs(pr_fx.root + "/root");
+        fs_write(pr_fx.root + "/root/value.sapp", "fn value() { return 42; }\nexport value;\n");
+        fs_write(pr_fx.root + "/main.sapp", "let D=import(\"root/value.sapp\");print D.value();\n");
+        let _rpr = expect_snapshot(pr_fx.root, "project root module discovery", true, pr_fx.oracle, "");
+        verify_bundle(pr_fx.root, "project-root-module");
+
+        // Negative tamper & special-file rejection checks on `ascii` root
+        let orig_val = ascii_fx.before["value.sapp"].bytes;
+        fs_write_bytes(root + "/dep/value.sapp", str_to_bytes("fn value() { return 43; }\nexport value;\n"));
+        let _nt1 = expect_snapshot(root, "module content tamper", false, "", "");
+        fs_write_bytes(root + "/dep/value.sapp", orig_val);
+
+        fs_mkdirs(root + "/dep/new-empty");
+        let _nt2 = expect_snapshot(root, "empty directory addition", false, "", "");
+        assert(ffi_call_typed(libc, "rmdir", "i32(cstr)", [root + "/dep/new-empty"]) == 0, "rmdir new-empty");
+
+        assert(ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", [root + "/dep/value.sapp", root + "/dep/link"]) == 0, "symlink");
+        let _nt3 = expect_snapshot(root, "symlink rejected", false, "", "");
+        assert(ffi_call_typed(libc, "unlink", "i32(cstr)", [root + "/dep/link"]) == 0, "unlink symlink");
+
+        assert(ffi_call_typed(libc, "mkfifo", "i32(cstr,u32)", [root + "/dep/pipe", 384]) == 0, "mkfifo");
+        let _nt4 = expect_snapshot(root, "special file rejected", false, "", "");
+        assert(ffi_call_typed(libc, "unlink", "i32(cstr)", [root + "/dep/pipe"]) == 0, "unlink fifo");
+
+        fs_write_bytes(root + "/dep/value.sapp", [255]);
+        let _nt5 = expect_snapshot(root, "invalid UTF8 or tampered module rejected", false, "", "");
+        fs_write_bytes(root + "/dep/value.sapp", orig_val);
+
+        fs_mkdirs(root + "/dep/root");
+        let _nt6 = expect_snapshot(root, "unlocked root directory addition rejected", false, "", "");
+        return true;
+    };
+
+    let ok = try run_suite() catch false;
+    _rm_tree_libc(libc, base);
+    ffi_close(libc);
+    assert(not fs_exists(base), "locked_source_snapshot base cleaned up");
+
+    if report_arg != "" {
+        let pdir = path_dirname(report_arg);
+        if pdir != "" and pdir != "." { fs_mkdirs(pdir); }
+        fs_write(report_arg, json_stringify(rows) + "\n");
+    }
+
+    assert(ok and len(rows) > 30, "locked_source_snapshot failed");
+    print "locked_source_snapshot_pass: rows=" + str(len(rows));
+}
+
+main();

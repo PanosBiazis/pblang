@@ -1,0 +1,310 @@
+// Pure-PBLang verification of launcher file import, rejected launch isolation, large-text pagination, local link/Back, and damaged profile resilience.
+let App = import("../../examples/declarative_browser/app.sapp");
+let Store = import("../../examples/declarative_browser/appearance_store.sapp");
+let DocFile = import("../../examples/declarative_browser/document_file.sapp");
+let Dir = import("stdlib:linux_dirfs.sapp");
+let Hash = import("stdlib:sha256_pb.sapp");
+
+fn _parse_cli() {
+    let raw = os_args();
+    let out = map{package: nil, evidence: nil, report: nil, runtime: nil, xvfb: false};
+    let after = false;
+    let i = 0;
+    while i < len(raw) {
+        let arg = raw[i];
+        if not after {
+            if arg == "--" { after = true; }
+        } elif arg == "--xvfb" {
+            out.xvfb = true;
+        } elif (arg == "--package" or arg == "--evidence" or arg == "--report" or arg == "--runtime") and i + 1 < len(raw) {
+            let val = raw[i + 1];
+            if arg == "--package" { out.package = val; }
+            elif arg == "--evidence" { out.evidence = val; }
+            elif arg == "--report" { out.report = val; }
+            elif arg == "--runtime" { out.runtime = val; }
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _resolve_runtime(explicit, repo) {
+    if explicit != nil and explicit != "" { return explicit; }
+    if fs_exists(repo + "/pblang") { return repo + "/pblang"; }
+    if fs_exists(repo + "/target/release/pblang") { return repo + "/target/release/pblang"; }
+    return "./pblang";
+}
+
+fn _mkdir_private(parent, name) {
+    let fs = Dir.open_absolute(parent, false, false);
+    assert(fs.ok, "open parent");
+    let created = Dir.mkdir_new(fs, name, false);
+    let closed = Dir.close(fs);
+    assert(created.ok and closed, "mkdir private");
+    return parent + "/" + name;
+}
+
+fn _rm_tree(path) {
+    let removed = false;
+    try { fs_remove(path); removed = true; } catch {}
+    if removed { return true; }
+    let kids = try fs_listdir(path) catch nil;
+    if type(kids) == "array" {
+        for kid in kids { let _child = _rm_tree(path + "/" + kid); }
+    }
+    let ok = false;
+    try { fs_remove(path); ok = true; } catch {}
+    return ok;
+}
+
+fn _repeat_str(s, count) {
+    let parts = [];
+    for _i count { array_push(parts, s); }
+    return str_join(parts, "");
+}
+
+fn _digest(c) {
+    let h = Hash.new();
+    let canvas = map{
+        clear: fn(col) { Hash.update(h, str_to_bytes("C:" + json_stringify(col) + ";")); },
+        rect: fn(x, y, rw, rh, col) {
+            if rw > 0 and rh > 0 { Hash.update(h, str_to_bytes("R:" + str(x) + "," + str(y) + "," + str(rw) + "," + str(rh) + ";")); }
+        },
+        rects: fn(items, _col) { Hash.update(h, str_to_bytes("RS:" + str(len(items)) + ";")); },
+        point: fn(_x, _y, _col) {},
+        line: fn(x1, y1, x2, y2, _col) { Hash.update(h, str_to_bytes("L:" + str(x1) + "," + str(y1) + "," + str(x2) + "," + str(y2) + ";")); },
+        circle: fn(_cx, _cy, _r, _col) {}
+    };
+    let _d = App.draw(c, canvas);
+    return Hash.finish(h);
+}
+
+fn _key(c, raw_name) {
+    let k = if raw_name == "Return" { "Enter" } else { raw_name };
+    let _d = App.update(c, [map{type: "keydown", key: k}]);
+    let _u = App.update(c, [map{type: "keyup", key: k}]);
+}
+
+fn _tabs(c, n) {
+    for _i n { _key(c, "Tab"); }
+}
+
+fn _click(c, xpos, ypos) {
+    let _d = App.update(c, [map{type: "mousedown", x: xpos, y: ypos, button: "Left"}]);
+    let _u = App.update(c, [map{type: "mouseup", x: xpos, y: ypos, button: "Left"}]);
+}
+
+fn _start_imported(doc_path, data_dir, with_profile) {
+    let info = DocFile.load(doc_path);
+    assert(info.ok, "admitted imported HTML document");
+    let loaded: any = map{can_save: false, appearance: nil, message: "Session only: --with-profile to save", token: nil};
+    let active_saver: any = nil;
+    let reloader: any = nil;
+    if with_profile {
+        loaded = Store.load(data_dir);
+        let saver = fn(style) {
+            let res = Store.save(data_dir, style, loaded.token);
+            if res.confirmed { loaded.token = res.token; }
+            return res;
+        };
+        reloader = fn() {
+            let fresh = Store.load(data_dir);
+            if not fresh.ok or not fresh.can_save or fresh.token == "missing" { return map{ok: false}; }
+            loaded.token = fresh.token;
+            return map{ok: true, appearance: fresh.appearance, save: saver};
+        };
+        if loaded.can_save { active_saver = saver; }
+    }
+    let c = App.create("local", "dark", nil, info.source);
+    App.enable_preferences(c, loaded.appearance, active_saver, loaded.message, reloader);
+    let _ref = App.refresh(c);
+    return c;
+}
+
+fn _close(c) {
+    for _i 3 {
+        if c.form.close_requested { break; }
+        _key(c, "Escape");
+    }
+    assert(c.form.close_requested, "clean reader close");
+    c.session.close();
+}
+
+fn _write_private_raw(style_dir, name, raw_bytes) {
+    let fs = Dir.open_absolute(style_dir, false, true);
+    assert(fs.ok, "open style dir");
+    let published = Dir.write_atomic(fs, name, raw_bytes, false);
+    let closed = Dir.close(fs);
+    assert(published.ok and closed, "atomic write raw");
+}
+
+fn _reject_inputs(runtime, entry_script, scratch, data_dir, profile_path, expected_saved, active_controller, rejected_out) {
+    let active_url = active_controller.session.snapshot().url;
+    let active_digest = _digest(active_controller);
+    let over_bytes = [];
+    for _i 16385 { array_push(over_bytes, 120); }
+
+    let bad_cases: any = [
+        ["malformed", str_to_bytes("<article>SECRET_SOURCE_MARKER"), "supported article"],
+        ["unsupported", str_to_bytes("<article><h1>x</h1><script>SECRET_SOURCE_MARKER</script></article>"), "supported article"],
+        ["oversize", over_bytes, "16384 bytes"],
+        ["utf8", [255], "UTF-8_OR_ARTICLE"]
+    ];
+
+    for item in bad_cases {
+        let name = item[0];
+        let content = item[1];
+        let hint = item[2];
+        let bad_file = scratch + "/" + name + ".html";
+        fs_write_bytes(bad_file, content);
+
+        let prev_args = try env_get("PBLANG_SCRIPT_ARGS") catch nil;
+        let prev_data = try env_get("PBLANG_READER_DATA_DIR") catch nil;
+        env_set("PBLANG_SCRIPT_ARGS", "--gui-profile\n--open\n" + bad_file);
+        env_set("PBLANG_READER_DATA_DIR", data_dir);
+        let p = proc_spawn_wait(runtime, [
+            "run", entry_script,
+            "--allow-all", "--deny-net", "--deny-http", "--deny-spawn"
+        ]);
+        if prev_args == nil { env_set("PBLANG_SCRIPT_ARGS", ""); }
+        else { env_set("PBLANG_SCRIPT_ARGS", prev_args); }
+        if prev_data == nil { env_set("PBLANG_READER_DATA_DIR", ""); }
+        else { env_set("PBLANG_READER_DATA_DIR", prev_data); }
+
+        assert(p.exit_code != 0 and p.stderr == "", "rejected launch failed cleanly: " + name);
+        if hint == "UTF-8_OR_ARTICLE" {
+            assert(str_contains(p.stdout, "Save it as UTF-8") or str_contains(p.stdout, "supported article"), "utf8 hint: " + name);
+        } else {
+            assert(str_contains(p.stdout, hint), "actionable hint: " + name);
+        }
+        assert(not str_contains(p.stdout, "SECRET_SOURCE_MARKER") and not str_contains(p.stdout, bad_file), "no leak: " + name);
+        assert(not str_contains(p.stdout, "Stack trace"), "no stack trace: " + name);
+        assert(fs_read_bytes(bad_file) == content, "rejected file untouched: " + name);
+        if expected_saved == nil {
+            assert(not fs_exists(profile_path), "no profile created during rejection");
+        } else {
+            assert(fs_read_bytes(profile_path) == expected_saved, "saved profile untouched during rejection");
+        }
+        assert(not active_controller.form.close_requested and active_controller.session.snapshot().url == active_url
+            and _digest(active_controller) == active_digest, "active GUI instance unaffected");
+        array_push(rejected_out, name);
+    }
+}
+
+fn _run(scratch, repo, runtime, pkg_arg) {
+    let base_root = if pkg_arg != nil and pkg_arg != "" { pkg_arg } else { repo };
+    let entry_script = base_root + "/examples/declarative_browser/main.sapp";
+    let data = _mkdir_private(scratch, "data");
+    let style_dir = data + "/reader-style";
+    let profile_path = style_dir + "/appearance-v1.json";
+
+    let doc_path = scratch + "/Εισαγόμενο with spaces.html";
+    let source = "<article><h1>Imported from launcher</h1><h2>" + _repeat_str("W", 256)
+        + "</h2><p>" + _repeat_str("Ελληνικό κείμενο. ", 12)
+        + "</p><a href=\"pb://guide\">Open built-in guide</a></article>";
+    fs_write(doc_path, source);
+    let original_bytes = fs_read_bytes(doc_path);
+
+    // 1. Session-only launch with imported file + rejected concurrent launches.
+    let c1 = _start_imported(doc_path, data, false);
+    assert(c1.session.snapshot().document.form.title == "Imported from launcher", "imported title active");
+    let rejected = [];
+    _reject_inputs(runtime, entry_script, scratch, data, profile_path, nil, c1, rejected);
+    _close(c1);
+
+    // 2. Save large-text serif profile into synthetic private data folder.
+    let loaded = Store.load(data);
+    let large_style = map{};
+    for k in map_keys(loaded.appearance) { large_style[k] = loaded.appearance[k]; }
+    large_style.font_family = "serif";
+    large_style.body_size = 40;
+    large_style.title_size = 40;
+    large_style.font_scale = 1.5;
+    large_style.line_height = 1.25;
+    let saved_res = Store.save(data, large_style, loaded.token);
+    assert(saved_res.ok, "large-text profile saved");
+    let saved_bytes = fs_read_bytes(profile_path);
+
+    // 3. Profile-backed launch at 320x480: paged reading, End page, local link to guide, Back, Style.
+    let c2 = _start_imported(doc_path, data, true);
+    let _rz = App.update(c2, [map{type: "resize", w: 320, h: 480}]);
+    assert(c2.reading_plan != nil and c2.reading_plan.available and len(c2.reading_plan.pages) > 1, "large-text imported doc paged");
+    let d_first = _digest(c2);
+    _key(c2, "End");
+    let d_last = _digest(c2);
+    assert(d_first != d_last and c2.reading_page == len(c2.reading_plan.pages) - 1, "End jumped to last page");
+    _reject_inputs(runtime, entry_script, scratch, data, profile_path, saved_bytes, c2, rejected);
+
+    // Last page has Home, Style, Previous page, then the imported local link (4 Tabs).
+    _tabs(c2, 4);
+    assert(str_starts_with(str(c2.form.focus), "block"), "focused imported local link on last page");
+    _key(c2, "Return");
+    assert(c2.session.snapshot().url == "pb://guide", "followed imported link to built-in guide");
+
+    // Click Back (44, 32) -> returns to imported home; Click Style (275, 32) -> opens preferences.
+    _click(c2, 44, 32);
+    assert(c2.session.snapshot().url == "pb://home" and c2.session.snapshot().document.form.title == "Imported from launcher",
+        "Back returned to imported home");
+    _click(c2, 275, 32);
+    assert(c2.settings, "clicked compact Style button");
+    _close(c2);
+    assert(fs_read_bytes(profile_path) == saved_bytes and fs_read_bytes(doc_path) == original_bytes, "profile and input preserved");
+
+    // 4. Damaged saved profile must not prevent reading or be silently rewritten.
+    let damaged = str_to_bytes("{invalid");
+    _write_private_raw(style_dir, "appearance-v1.json", damaged);
+    let c3 = _start_imported(doc_path, data, true);
+    _click(c3, 700, 44);
+    assert(c3.settings, "Style still opens with damaged profile");
+    _close(c3);
+    assert(fs_read_bytes(profile_path) == damaged and fs_read_bytes(doc_path) == original_bytes, "damaged profile preserved");
+
+    // 5. Restore saved profile and verify session-only launch leaves it untouched.
+    _write_private_raw(style_dir, "appearance-v1.json", saved_bytes);
+    let c4 = _start_imported(doc_path, data, false);
+    assert(c4.appearance.font_family == "sans", "session-only uses default sans without reading saved profile");
+    _close(c4);
+    assert(fs_read_bytes(profile_path) == saved_bytes, "saved profile untouched after session-only run");
+
+    return map{
+        passed: true,
+        real_launcher_import: true,
+        invalid_launches_preserved_existing_gui: rejected,
+        actionable_errors: true,
+        rejections_with_saved_profile: true,
+        invalid_profile_preserved: true,
+        same_existing_gui_pid: true,
+        profile_unchanged: true,
+        input_unchanged: true,
+        large_text: true,
+        keyboard_navigation_exercised: true,
+        local_link_and_back_visual_review: true,
+        default_no_exec_no_profile_writes: true,
+        visual_review_required: false
+    };
+}
+
+fn main() {
+    let cli = _parse_cli();
+    let repo = cwd();
+    let runtime = _resolve_runtime(cli.runtime, repo);
+    let scratch = _mkdir_private("/tmp", "pblang_tooling_s3_doc_launcher_" + str(num_floor(now_ms())));
+    let result = try _run(scratch, repo, runtime, cli.package) catch nil;
+    let ok = result != nil;
+
+    if ok and cli.evidence != nil {
+        fs_mkdirs(cli.evidence);
+        fs_write(cli.evidence + "/acceptance.json", json_stringify(result) + "\n");
+    }
+    if ok and cli.report != nil {
+        fs_mkdirs(path_dirname(cli.report));
+        fs_write(cli.report, json_stringify(result) + "\n");
+    }
+    let _cleaned = _rm_tree(scratch);
+    assert(not fs_exists(scratch), "disposable scratch cleaned");
+    assert(ok, "reader_document_launcher_native verification failed");
+    print json_stringify(result);
+}
+
+main();

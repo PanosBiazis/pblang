@@ -1,0 +1,212 @@
+// Contract tests for tests/tooling/selfhost_cost_summary.sapp:
+// Invalid, incomplete, reordered, failed, or non-finite measurements must be rejected.
+
+let COST = import(cwd() + "/tests/tooling/selfhost_cost_summary.sapp");
+
+fn _expect_throws(fn_call, label) {
+    let threw = false;
+    try {
+        fn_call();
+    } catch {
+        threw = true;
+    }
+    assert(threw, "expected rejection: " + label);
+}
+
+fn _rm_rf(target) {
+    if not fs_exists(target) { return; }
+    let entries = try fs_listdir(target) catch nil;
+    if entries != nil {
+        for name in entries {
+            _rm_rf(target + "/" + name);
+        }
+    }
+    let _ok = try fs_remove(target) catch false;
+}
+
+fn test_ratios_and_no_causal_claim() {
+    let result = COST.summarize(COST.build_sample_receipt(false), false);
+    assert(result.summary["cpu_s"].paired_median_change_percent == 100, "paired_median_change_percent == 100");
+    assert(result.summary["cpu_s"].median_ratio_change_percent == 100, "median_ratio_change_percent == 100");
+    assert(result.causal_attribution == false, "causal_attribution must be false");
+    assert(result.speedup_established == false, "speedup_established must be false");
+    return true;
+}
+
+fn test_warmups_excluded_but_validated() {
+    let data = COST.build_sample_receipt(false);
+    for i 4 {
+        let row = data.rows[i];
+        row["cpu_s"] = 4;
+        row["cpu_user_s"] = 3;
+        row["cpu_system_s"] = 1;
+        row["wall_s"] = 4;
+    }
+    let res = COST.summarize(data, false);
+    assert(res.summary["cpu_s"].baseline_median == 1, "warmups excluded from baseline_median");
+
+    data.rows[0]["exit"] = 1;
+    _expect_throws(fn() {
+        let _r = COST.summarize(data, false);
+    }, "failed warmup row exit=1 rejected");
+    return true;
+}
+
+fn test_incomplete_reordered_or_failed_receipts_rejected() {
+    // 1. Popped last row
+    _expect_throws(fn() {
+        let d = COST.build_sample_receipt(false);
+        let _last = pop(d.rows);
+        let _r = COST.summarize(d, false);
+    }, "25 rows rejected");
+
+    // 2. Reversed rows
+    _expect_throws(fn() {
+        let d = COST.build_sample_receipt(false);
+        let rev = [];
+        let idx = len(d.rows) - 1;
+        while idx >= 0 {
+            push(rev, d.rows[idx]);
+            idx = idx - 1;
+        }
+        d["rows"] = rev;
+        let _r = COST.summarize(d, false);
+    }, "reversed pair order rejected");
+
+    // 3. passed=false
+    _expect_throws(fn() {
+        let d = COST.build_sample_receipt(false);
+        d["passed"] = false;
+        let _r = COST.summarize(d, false);
+    }, "passed=false rejected");
+
+    // 4. Changed measurement limits
+    _expect_throws(fn() {
+        let d = COST.build_sample_receipt(false);
+        d["limits"] = map{ group_s: 60, sample_s: 5 };
+        let _r = COST.summarize(d, false);
+    }, "changed limits rejected");
+
+    // 5. Wrong fixture_sha256
+    _expect_throws(fn() {
+        let d = COST.build_sample_receipt(false);
+        d["fixture_sha256"] = str_repeat("0", 64);
+        let _r = COST.summarize(d, false);
+    }, "wrong fixture_sha256 rejected");
+
+    // 6. Measured row marked warmup=true
+    _expect_throws(fn() {
+        let d = COST.build_sample_receipt(false);
+        d.rows[5]["warmup"] = true;
+        let _r = COST.summarize(d, false);
+    }, "measured row marked warmup rejected");
+
+    // 7. timed_out=true
+    _expect_throws(fn() {
+        let d = COST.build_sample_receipt(false);
+        d.rows[5]["timed_out"] = true;
+        let _r = COST.summarize(d, false);
+    }, "timed_out=true rejected");
+
+    // 8. owned_group_remaining=true
+    _expect_throws(fn() {
+        let d = COST.build_sample_receipt(false);
+        d.rows[5]["owned_group_remaining"] = true;
+        let _r = COST.summarize(d, false);
+    }, "owned_group_remaining=true rejected");
+
+    // 9. NaN cpu_s
+    _expect_throws(fn() {
+        let d = COST.build_sample_receipt(false);
+        d.rows[5]["cpu_s"] = num_sqrt(0 - 1);
+        let _r = COST.summarize(d, false);
+    }, "NaN cpu_s rejected");
+
+    // 10. CPU accounting mismatch
+    _expect_throws(fn() {
+        let d = COST.build_sample_receipt(false);
+        d.rows[5]["cpu_user_s"] = 90;
+        let _r = COST.summarize(d, false);
+    }, "cpu_user_s mismatch rejected");
+
+    // 11. Boolean maxrss_kib
+    _expect_throws(fn() {
+        let d = COST.build_sample_receipt(false);
+        d.rows[5]["maxrss_kib"] = true;
+        let _r = COST.summarize(d, false);
+    }, "boolean maxrss_kib rejected");
+
+    return 11;
+}
+
+fn test_stage_fixture_is_separate_and_finite() {
+    let data = COST.build_sample_receipt(true);
+    assert(data.fixture_sha256 == COST.STAGE_FIXTURE, "stage fixture sha");
+    let result = COST.summarize(data, true);
+    assert(result.stages["baseline"].median_wall_ms["imports"] == 800, "baseline stage imports == 800");
+
+    // Stage fixture must be rejected when stages=false
+    _expect_throws(fn() {
+        let _r = COST.summarize(data, false);
+    }, "stage fixture rejected when stages=false");
+
+    let bad_stages = [
+        [1, 2],
+        [1, 0 - 1, 2],
+        [num_exp(1000), 1, 2],
+        [2000, 1, 2]
+    ];
+    for values in bad_stages {
+        _expect_throws(fn() {
+            let broken = COST.build_sample_receipt(true);
+            broken.rows[0]["stage_ms"] = values;
+            let _r = COST.summarize(broken, true);
+        }, "invalid stage_ms rejected");
+    }
+    return len(bad_stages);
+}
+
+fn test_cli_roundtrip() {
+    let scratch = "/tmp/pblang_tooling_s2_test_cost_" + str(now_ms());
+    fs_mkdirs(scratch);
+    let receipt_file = scratch + "/receipt.json";
+    let err_msg = "";
+    try {
+        fs_write(receipt_file, json_stringify(COST.build_sample_receipt(false)));
+        let runtime = cwd() + "/pblang";
+        let res = proc_spawn_wait(runtime, [
+            "run",
+            cwd() + "/tests/tooling/selfhost_cost_summary.sapp",
+            "--allow-all",
+            "--",
+            "--receipt",
+            receipt_file
+        ]);
+        assert(res.exit_code == 0, "CLI receipt run exited 0");
+        let parsed = json_parse(str_trim(res.stdout));
+        assert(parsed.measured_invocations == 22, "CLI measured_invocations == 22");
+        assert(len(parsed.input_sha256) == 64, "CLI input_sha256 populated");
+    } catch e {
+        err_msg = str(e);
+    }
+    _rm_rf(scratch);
+    if err_msg != "" {
+        throw err_msg;
+    }
+    return true;
+}
+
+let ok1 = test_ratios_and_no_causal_claim();
+let ok2 = test_warmups_excluded_but_validated();
+let rejected_count = test_incomplete_reordered_or_failed_receipts_rejected();
+let stage_bad_count = test_stage_fixture_is_separate_and_finite();
+let ok5 = test_cli_roundtrip();
+
+print json_stringify(map{
+    runner: "tests/tooling/test_selfhost_cost_summary.sapp",
+    language: "PBLang",
+    passed: ok1 and ok2 and ok5 and rejected_count == 11 and stage_bad_count == 4,
+    suites: 5,
+    rejected_mutations: rejected_count,
+    rejected_stage_shapes: stage_bad_count
+});

@@ -1,0 +1,205 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+//
+// scripts/bench_bootstrap.sapp — Pure-PBLang Toolchain Size, Native Compile Determinism & RSS Benchmark
+//
+// Replaces scripts/bench_bootstrap.sh. Measures:
+//   1. Interpreter / VM binary size and peak RSS running bench_prog.sapp
+//   2. 3x native compiled executables (`pblang compile`), determinism check, size & peak RSS
+//   3. Native backend probe (`ctranspiler`, `cranelift`, `--llvm`)
+// Writes full Markdown report to stdout and `bench_bootstrap_result.md`.
+
+fn _find_toolchain_bin(repo_dir: string) {
+    let force_cargo = env_get("PBLANG_FORCE_CARGO") == "1";
+    let rust_bin = repo_dir + "/target/release/pblang";
+    if force_cargo and fs_exists(repo_dir + "/Cargo.toml") {
+        eprint("Building the toolchain with `cargo build --release`...\n");
+        try proc_spawn_wait("cargo", ["build", "--release", "-p", "pblang"]) catch nil;
+    }
+    if fs_exists(rust_bin) { return rust_bin; }
+    if fs_exists(repo_dir + "/pblang") { return repo_dir + "/pblang"; }
+    return "pblang";
+}
+
+fn _file_size(path: string) {
+    if (try fs_exists(path) catch false) != true { return 0; }
+    let raw = try fs_read_bytes(path) catch [];
+    return len(raw);
+}
+
+fn _human_bytes(b: int) {
+    if b < 1024 { return str(b) + " B"; }
+    if b < 1048576 {
+        let tenths = num_floor((b * 10) / 1024);
+        return str(num_floor(tenths / 10)) + "." + str(tenths % 10) + " KiB";
+    }
+    if b < 1073741824 {
+        let tenths = num_floor((b * 10) / 1048576);
+        return str(num_floor(tenths / 10)) + "." + str(tenths % 10) + " MiB";
+    }
+    let tenths = num_floor((b * 10) / 1073741824);
+    return str(num_floor(tenths / 10)) + "." + str(tenths % 10) + " GiB";
+}
+
+fn _parse_last_int(line: string) {
+    let trimmed = str_trim(line);
+    let i = len(trimmed) - 1;
+    while i >= 0 {
+        let c = strcharcodeat(trimmed, i);
+        if c < 48 or c > 57 { break; }
+        i = i - 1;
+    }
+    let num_str = str_slice(trimmed, i + 1, len(trimmed));
+    if len(num_str) == 0 { return 0; }
+    let acc = 0;
+    let k = 0;
+    while k < len(num_str) {
+        acc = acc * 10 + (strcharcodeat(num_str, k) - 48);
+        k = k + 1;
+    }
+    return acc;
+}
+
+fn _peak_rss_kib(bin: string, args: any) {
+    if fs_exists("/usr/bin/time") {
+        let t_args = ["-v", bin];
+        let i = 0;
+        while i < len(args) {
+            array_push(t_args, args[i]);
+            i = i + 1;
+        }
+        let r = try proc_spawn_wait("/usr/bin/time", t_args) catch map{ exit_code: 1, stderr: "" };
+        let lines = str_split(str_replace_all(str(r.stderr), "\r\n", "\n"), "\n");
+        let j = 0;
+        while j < len(lines) {
+            if str_contains(lines[j], "Maximum resident set size") {
+                return _parse_last_int(lines[j]);
+            }
+            j = j + 1;
+        }
+    }
+    let _ = try proc_spawn_wait(bin, args) catch nil;
+    return 0;
+}
+
+fn _cleanup_dir(work: string) {
+    let names = try fs_listdir(work) catch [];
+    if is_array(names) {
+        let i = 0;
+        while i < len(names) {
+            try fs_remove(work + "/" + names[i]) catch nil;
+            i = i + 1;
+        }
+    }
+    try fs_remove(work) catch nil;
+}
+
+let repo_dir = cwd();
+let bin_path = _find_toolchain_bin(repo_dir);
+let work = "/tmp/pb_bench_bootstrap_" + str(num_floor(now_ms()));
+fs_mkdirs(work);
+let result_md_path = repo_dir + "/bench_bootstrap_result.md";
+
+let prog_path = work + "/bench_prog.sapp";
+let prog_src = "// A small, deterministic workload: recursion + a loop + string building, no I/O or capabilities.\n"
+    + "fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }\n\n"
+    + "let total = 0;\nlet i = 0;\n"
+    + "while i < 25 { total = total + fib(i); i = i + 1; }\n\n"
+    + "let s = \"\";\nlet k = 0;\n"
+    + "while k < 200 { s = s + str(k % 10); k = k + 1; }\n\n"
+    + "print \"fib_sum(0..24)=\" + str(total) + \" len(s)=\" + str(len(s));\n";
+fs_write(prog_path, prog_src);
+
+println("# pblang bootstrap / executable benchmark\n");
+println("Target program: `bench_prog.sapp` (recursion + loop + string build, no I/O).\n");
+println("## 1x toolchain runtime (interpret)");
+
+let host_size = _file_size(bin_path);
+let host_rss = _peak_rss_kib(bin_path, ["run", prog_path]);
+println("- toolchain binary: `" + bin_path + "`");
+println("- runs the program **interpreted** (`pblang run`)\n");
+
+println("## 3x with pblang (native C-transpiler: `pblang compile`)\n");
+let p_sizes = [0, 0, 0, 0];
+let p_rss = [0, 0, 0, 0];
+let n = 1;
+while n <= 3 {
+    let exe = work + "/bench_pblang_" + str(n);
+    let cr = try proc_spawn_wait(bin_path, ["compile", prog_path, "--out", exe]) catch map{ exit_code: 1 };
+    if cr.exit_code == 0 and fs_exists(exe) {
+        p_sizes[n] = _file_size(exe);
+        p_rss[n] = _peak_rss_kib(exe, []);
+    } else {
+        eprint("  build #" + str(n) + " FAILED\n");
+    }
+    n = n + 1;
+}
+
+let report = [];
+array_push(report, "## Comparison");
+array_push(report, "");
+array_push(report, "| # | Build | Executable (bytes) | Executable (human) | Peak RSS (KiB) |");
+array_push(report, "|---|-------|-------------------:|-------------------:|---------------:|");
+array_push(report, "| 0 | Toolchain runtime (interpret) | " + str(host_size) + " | " + _human_bytes(host_size) + " | " + str(host_rss) + " |");
+n = 1;
+while n <= 3 {
+    array_push(report, "| " + str(n) + " | pblang: `compile` native exe #" + str(n) + " | " + str(p_sizes[n]) + " | " + _human_bytes(p_sizes[n]) + " | " + str(p_rss[n]) + " |");
+    n = n + 1;
+}
+array_push(report, "");
+
+if p_sizes[1] == p_sizes[2] and p_sizes[2] == p_sizes[3] {
+    array_push(report, "- **Determinism:** all three pblang builds produced byte-identical executable sizes (" + str(p_sizes[1]) + " bytes).");
+} else {
+    array_push(report, "- **Determinism:** pblang executable sizes varied: " + str(p_sizes[1]) + " / " + str(p_sizes[2]) + " / " + str(p_sizes[3]) + " bytes.");
+}
+if p_sizes[1] > 0 and host_size > 0 {
+    let d_sz = if p_sizes[1] > 0 { p_sizes[1] } else { 1 };
+    array_push(report, "- **On-disk:** the pblang-compiled native exe is ~" + str(num_floor(host_size / d_sz)) + "x smaller than the toolchain binary.");
+}
+if p_rss[1] > 0 and host_rss > 0 {
+    let d_rss = if p_rss[1] > 0 { p_rss[1] } else { 1 };
+    array_push(report, "- **In RAM:** the pblang-compiled native exe peaks at ~" + str(num_floor(host_rss / d_rss)) + "x less RSS than the interpreter.");
+}
+
+array_push(report, "");
+array_push(report, "## Native backend probe (same program, each `--backend`)");
+array_push(report, "");
+array_push(report, "| Backend flag | Path actually used | Exe (bytes) | Peak RSS (KiB) |");
+array_push(report, "|--------------|--------------------|------------:|---------------:|");
+
+let probes = [
+    map{ label: "ctranspiler", flags: ["--backend", "ctranspiler"] },
+    map{ label: "cranelift", flags: ["--backend", "cranelift"] },
+    map{ label: "llvm", flags: ["--llvm"] }
+];
+let pi = 0;
+while pi < len(probes) {
+    let pr = probes[pi];
+    let exe = work + "/probe_" + pr.label;
+    let c_args = ["compile", prog_path, "--out", exe];
+    let fi = 0;
+    while fi < len(pr.flags) {
+        array_push(c_args, pr.flags[fi]);
+        fi = fi + 1;
+    }
+    let out_res = try proc_spawn_wait(bin_path, c_args) catch map{ exit_code: 1, stdout: "", stderr: "" };
+    let combined = str_lower(str(out_res.stdout) + "\n" + str(out_res.stderr));
+    let via = "C99";
+    if str_contains(combined, "via llvm") { via = "LLVM"; }
+    if str_contains(combined, "via cranelift") { via = "Cranelift"; }
+    if str_contains(combined, "falling back") { via = "C99 (fell back)"; }
+    let sz = if fs_exists(exe) { _file_size(exe) } else { 0 };
+    let rss = if sz > 0 { _peak_rss_kib(exe, []) } else { 0 };
+    array_push(report, "| " + pr.label + " | " + via + " | " + str(sz) + " | " + str(rss) + " |");
+    pi = pi + 1;
+}
+
+array_push(report, "");
+array_push(report, "> A \"fell back\" row means that native backend errored on this program/toolchain and the");
+array_push(report, "> compiler transparently used the C99 path instead.");
+
+let final_md = str_join(report, "\n") + "\n";
+print(final_md);
+fs_write(result_md_path, final_md);
+_cleanup_dir(work);
+println("\n(Full table written to " + result_md_path + ")");

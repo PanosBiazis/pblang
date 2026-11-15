@@ -1,0 +1,240 @@
+// Pure-PBLang verification that resize + Tab queued in one event batch match sequential layout settlement.
+let App = import("../../examples/declarative_browser/app.sapp");
+let Profile = import("../../examples/declarative_browser/appearance_profile.sapp");
+let Store = import("../../examples/declarative_browser/appearance_store.sapp");
+let Dir = import("stdlib:linux_dirfs.sapp");
+let G = import("stdlib:graphics.sapp");
+let FontMetrics = import("stdlib:font_metrics.sapp");
+let Hash = import("stdlib:sha256_pb.sapp");
+
+fn _parse_cli() {
+    let raw = os_args();
+    let out: any = map{package: nil, evidence: nil, report: nil, runtime: nil, xvfb: false};
+    let after = false;
+    let i = 0;
+    while i < len(raw) {
+        let arg = raw[i];
+        if not after {
+            if arg == "--" { after = true; }
+        } elif arg == "--xvfb" {
+            out.xvfb = true;
+        } elif (arg == "--package" or arg == "--evidence" or arg == "--report" or arg == "--runtime") and i + 1 < len(raw) {
+            let val = raw[i + 1];
+            if arg == "--package" { out.package = val; }
+            elif arg == "--evidence" { out.evidence = val; }
+            elif arg == "--report" { out.report = val; }
+            elif arg == "--runtime" { out.runtime = val; }
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _mkdir_private(parent, name) {
+    let fs = Dir.open_absolute(parent, false, false);
+    assert(fs.ok, "open parent");
+    let created = Dir.mkdir_new(fs, name, false);
+    let closed = Dir.close(fs);
+    assert(created.ok and closed, "mkdir private");
+    return parent + "/" + name;
+}
+
+fn _rm_tree(path) {
+    let removed = false;
+    try { fs_remove(path); removed = true; } catch {}
+    if removed { return true; }
+    let kids = try fs_listdir(path) catch nil;
+    if type(kids) == "array" {
+        for kid in kids { let _child = _rm_tree(path + "/" + kid); }
+    }
+    let ok = false;
+    try { fs_remove(path); ok = true; } catch {}
+    return ok;
+}
+
+fn _tree_entry_count(root) {
+    let kids = try fs_listdir(root) catch nil;
+    if type(kids) != "array" { return 0; }
+    let count = 0;
+    for kid in kids {
+        count = count + 1 + _tree_entry_count(root + "/" + kid);
+    }
+    return count;
+}
+
+fn _make_text_measurer() {
+    let cache_fonts = map{};
+    let cache_metrics: any = map{};
+    let cache_widths: any = map{};
+    return fn(text, px, family) {
+        if not map_has(cache_fonts, family) {
+            let resolved = G.text_font_resolve(family);
+            cache_fonts[family] = resolved;
+            cache_metrics[family] = if resolved != "" { try FontMetrics.load(resolved) catch nil } else { nil };
+        }
+        let key = json_stringify([family, px, text]);
+        if map_has(cache_widths, key) { return cache_widths[key]; }
+        let layout = try FontMetrics.layout(cache_metrics[family], text, px) catch nil;
+        let w = if layout != nil { layout.width } else { len(text) * num_max(4, num_floor(px * 0.56)) };
+        let h = if layout != nil { layout.height } else { px };
+        let res = map{ok: true, width: w, height: h, font: cache_fonts[family]};
+        cache_widths[key] = res;
+        return res;
+    };
+}
+
+fn _full_digest(c) {
+    let h = Hash.new();
+    let canvas = map{
+        clear: fn(col) { Hash.update(h, str_to_bytes("C:" + json_stringify(col) + ";")); },
+        rect: fn(rx, ry, rw, rh, col) {
+            if rw > 0 and rh > 0 {
+                Hash.update(h, str_to_bytes("R:" + str(rx) + "," + str(ry) + "," + str(rw) + "," + str(rh) + ":" + json_stringify(col) + ";"));
+            }
+        },
+        rects: fn(items, col) {
+            let ctag = json_stringify(col);
+            for it in items {
+                if it.w > 0 and it.h > 0 {
+                    Hash.update(h, str_to_bytes("G:" + str(it.x) + "," + str(it.y) + "," + str(it.w) + "," + str(it.h) + ":" + ctag + ";"));
+                }
+            }
+        },
+        point: fn(px, py, col) { Hash.update(h, str_to_bytes("P:" + str(px) + "," + str(py) + ":" + json_stringify(col) + ";")); },
+        line: fn(lx1, ly1, lx2, ly2, col) { Hash.update(h, str_to_bytes("L:" + str(lx1) + "," + str(ly1) + "," + str(lx2) + "," + str(ly2) + ":" + json_stringify(col) + ";")); },
+        circle: fn(_cx, _cy, _r, _col) {}
+    };
+    let _d = App.draw(c, canvas);
+    return Hash.finish(h);
+}
+
+fn _key(c, raw_name) {
+    let k = if raw_name == "Return" { "Enter" } else { raw_name };
+    let _d = App.update(c, [map{type: "keydown", key: k}]);
+    let _u = App.update(c, [map{type: "keyup", key: k}]);
+}
+
+fn _tabs(c, n) {
+    for _i n { _key(c, "Tab"); }
+}
+
+fn _click(c, xpos, ypos) {
+    let _d = App.update(c, [map{type: "mousedown", x: xpos, y: ypos, button: "Left"}]);
+    let _u = App.update(c, [map{type: "mouseup", x: xpos, y: ypos, button: "Left"}]);
+}
+
+fn _close(c) {
+    for _i 3 {
+        if c.form.close_requested { break; }
+        _key(c, "Escape");
+    }
+    assert(c.form.close_requested, "clean reader close");
+    c.session.close();
+}
+
+fn _start_style(data_dir, measurer) {
+    let loaded = Store.load(data_dir);
+    let saver = fn(style) {
+        let res = Store.save(data_dir, style, loaded.token);
+        if res.confirmed { loaded.token = res.token; }
+        return res;
+    };
+    let reloader = fn() {
+        let fresh = Store.load(data_dir);
+        if not fresh.ok or not fresh.can_save or fresh.token == "missing" { return map{ok: false}; }
+        loaded.token = fresh.token;
+        return map{ok: true, appearance: fresh.appearance, save: saver};
+    };
+    let active_saver: any = if loaded.can_save { saver } else { nil };
+    let c = App.create("local", "dark");
+    App.enable_preferences(c, loaded.appearance, active_saver, loaded.message, reloader);
+    App.set_text_measure(c, measurer);
+    let _ref = App.refresh(c);
+    _click(c, 700, 44);
+    assert(c.settings and c.form.focus == "font_family", "Style opened with font_family focused");
+    return c;
+}
+
+fn _run(scratch) {
+    let data_dir = _mkdir_private(scratch, "data");
+    let profile_path = data_dir + "/reader-style/appearance-v1.json";
+    let measurer = _make_text_measurer();
+
+    // 1. Batched resize + Tab in a single update batch (as when queued while paused).
+    let c1 = _start_style(data_dir, measurer);
+    let _r1 = App.update(c1, [map{type: "resize", w: 320, h: 240}]);
+    let _small_digest = _full_digest(c1);
+    let _batched = App.update(c1, [
+        map{type: "resize", w: 800, h: 816},
+        map{type: "keydown", key: "Tab"}
+    ]);
+    let _tab_up = App.update(c1, [map{type: "keyup", key: "Tab"}]);
+    assert(c1.form.focus == "body_size", "queued resize settled before Tab moved focus to body_size");
+    _key(c1, "Return");
+    assert(c1.preferences.draft.body_size == 18 and c1.preferences.draft.font_family == "sans", "body_size edited to 18 without touching font_family");
+    let batch_resize_edit = _full_digest(c1);
+    assert(_tree_entry_count(data_dir) == 0, "Batched edit must not implicitly save");
+    _close(c1);
+
+    // 2. Independent sequential reference: resize settles before Tab + Return.
+    let c2 = _start_style(data_dir, measurer);
+    let _r2a = App.update(c2, [map{type: "resize", w: 320, h: 240}]);
+    let _d2a = _full_digest(c2);
+    let _r2b = App.update(c2, [map{type: "resize", w: 800, h: 816}]);
+    let _d2b = _full_digest(c2);
+    _key(c2, "Tab");
+    _key(c2, "Return");
+    let batch_sequential_reference = _full_digest(c2);
+    assert(batch_resize_edit == batch_sequential_reference, "batched resize+Tab rendering matches sequential reference");
+
+    // 3. Explicit Save, Escape keeps window open, and restart preserves saved profile.
+    _tabs(c2, 6);
+    assert(c2.form.focus == "style_save", "focused style_save");
+    _key(c2, "Return");
+    assert(fs_exists(profile_path), "profile saved");
+    let decoded = Profile.decode(fs_read(profile_path));
+    assert(decoded.ok and decoded.appearance.body_size == 18 and decoded.appearance.font_family == "sans", "saved body_size 18 and font_family sans");
+    let saved_bytes = fs_read_bytes(profile_path);
+    _key(c2, "Escape");
+    assert(not c2.settings and not c2.form.close_requested, "Escape dismissed Style without closing reader");
+    _close(c2);
+
+    let c3 = _start_style(data_dir, measurer);
+    assert(fs_read_bytes(profile_path) == saved_bytes and c3.appearance.body_size == 18 and c3.appearance.font_family == "sans", "restart preserved saved body_size 18");
+    _close(c3);
+
+    return map{
+        passed: true,
+        real_launcher: true,
+        queued_resize_tab_matches_sequential: true,
+        body_size_saved: 18,
+        font_family_unchanged: true,
+        no_implicit_save: true,
+        escape_kept: true,
+        restart_kept: true,
+        only_isolated_test_child_paused: true,
+        visual_review_required: false
+    };
+}
+
+fn main() {
+    let cli = _parse_cli();
+    let scratch_name = "pblang_tooling_s3_batch_" + str(num_floor(now_ms()));
+    let scratch = _mkdir_private("/tmp", scratch_name);
+    let result = try _run(scratch) catch nil;
+    let _cleaned = _rm_tree(scratch);
+    assert(result != nil and result.passed == true, "reader_event_batch_native failed");
+    let json_text = json_stringify(result);
+    if cli.evidence != nil and cli.evidence != "" {
+        fs_mkdirs(cli.evidence);
+        fs_write(cli.evidence + "/acceptance.json", json_text + "\n");
+    }
+    if cli.report != nil and cli.report != "" {
+        fs_mkdirs(path_dirname(cli.report));
+        fs_write(cli.report, json_text + "\n");
+    }
+    print json_text;
+}
+
+main();

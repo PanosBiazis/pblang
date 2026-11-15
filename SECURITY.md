@@ -1,31 +1,35 @@
-# Security & Privacy Policy (`PBLang 2.7.0`)
+# Security & Privacy Policy (`PBLang 5.1.0`)
 
 ## Supported Versions
 
 | Version | Channel | Supported | Security Updates |
 | :--- | :--- | :--- | :--- |
-| **`2.7.x`** | **`stable`** | ✅ **Yes** | Active support — Sovereign Zero-Rust Host VM, `CIC` Trusted Proof Kernel, Decidable `CAD`/`Presburger`, Native `SIMD+OpenCL` HPC, `MSC2020` Mathematics & Universal `64/32/16/8-bit` Toolchain |
-| `2.0.x – 2.6.x` | `maintenance` | ✅ Yes | Sovereign Zero-Rust `2.x` series; upgrade to `2.7.0` recommended |
-| `1.4.x – 1.5.x` | `maintenance` | ⚠️ Security fixes only | Legacy transition series; upgrade to `2.7.0` recommended |
-| `1.0.x – 1.3.x` | `legacy` | ❌ No | Superseded by `2.7.0` |
-| `< 1.0.0` | `alpha` / `beta` | ❌ No | Unsupported historical snapshots |
+| **`5.1.x`** | **`stable`** | ✅ **Yes** | Active support — 100% Pure-`PBLang` (`.sapp`) Sovereign Microkernel (`VAL_I64`, `64 KiB` Slab/`@region` GC, CSPRNG `SipHash-1-3`, `OBJ_PTR`, Win32 Wide `UTF-16LE`, `AF_UNIX`/`Landlock`), Zero-OpenSSL `TLS 1.3` + Hybrid PQC `X25519MLKEM768` + `QUIC`, `@constant_time`/`@zeroize` Verifier, Linear `PikeVM` Anti-ReDoS Regex, Bomb-Proof `DEFLATE`/`Zstd`/`ZIP64`, Live `TPM 2.0`/`PKCS#11`/`FIDO2`, `CycloneDX 1.5` SBOM & Universal `64/32/16/8-bit` Toolchain |
+| `5.0.x` | `maintenance` | ✅ Yes | Sovereign `5.0` series; upgrade to `5.1.0` (100% pure-`.sapp` microkernel & universal device assets) recommended |
+| `4.0.x – 4.2.x` | `maintenance` | ⚠️ Security fixes only | `4.x` Dual-Lock / Closed-Shield series; upgrade to `5.1.0` recommended |
+| `2.0.x – 3.0.x` | `legacy` | ❌ No | Superseded by `5.1.0` |
+| `< 2.0.0` | `legacy` | ❌ No | Unsupported historical series |
 
 ---
 
-## Built-In Security Architecture
+## Built-In Security Architecture (`PBLang 5.1.0`)
 
-PBLang `2.7.0` is engineered around **Zero-Trust Capability Isolation**, **Trusted De Bruijn `CIC` Formal Verification & Workstation-Only HPC Mesh Policy**, **Hardware- & Complexity-Adaptive Symbolic/Exact Computation (`AdaptiveMathGovernor`)**, **Post-Quantum Cryptography**, and **By-Default Hardening**:
+PBLang `5.1.0` is engineered around **100% Pure-PBLang Sovereign Auditable Subsystems**, **Zero-Trust Capability Isolation**, **Unprivileged OS Kernel Sandboxing**, **Constant-Time & Post-Quantum Cryptography**, and **By-Default Supply-Chain & Public Privacy Hardening**:
 
-1. **Capability-Gated Execution Sandbox (`--sandbox`, `--deny-*`, `--allow-*`)**:
-   - `pblang run script.sapp --sandbox` permits canonicalized, symlink-free `stdlib:...` imports from the trusted standard library while denying ambient file system (`--deny-fs`), network (`--deny-net`), HTTP (`--deny-http`), SQLite, subprocess (`--deny-exec`), environment, and native FFI (`--deny-ffi`) operations unless explicitly granted (`--allow-fs`, `--allow-net`, `--allow-http`, `--allow-exec`, `--allow-ffi`, `--ffi-lib`, `--ffi-symbol`).
-2. **Default-On Static Taint, Unicode & Supply-Chain Analysis (`tools/pbsecure.sapp`, `stdlib/parseltongue.sapp`, `stdlib/manifest_validate.sapp`)**:
-   - Interprocedural taint and sink verification blocks command injection, path traversal, SSRF (including `169.254.169.254` cloud-metadata blocking), Trojan Source Unicode Bidi overrides (`CVE-2021-42574`), and install-hook supply-chain execution (`pblang-package-tree-v2` portable relative lockfiles).
-3. **Post-Quantum & Modern Cryptography (`stdlib/pqc_mlkem768.sapp`, `stdlib/tls.sapp`)**:
-   - Pure-PBLang NIST FIPS 202 `SHA-3`/`SHAKE` and FIPS 203 `ML-KEM-768` lattice key encapsulation (`stdlib/pqc_mlkem768.sapp`), OpenSSL TLS 1.2/1.3 & Windows `WinHTTP` HTTPS (`runtime_stage3/zr_net_http_tls.h`, `stdlib/tls.sapp`), RFC 8032 `Ed25519` (`stdlib/ed25519_verify.sapp`), RFC 8439 `ChaCha20` (`stdlib/chacha20.sapp`), OpenBSD `$2b$` Bcrypt (`stdlib/password_bcrypt.sapp`), RFC 7636 PKCE OIDC/SSO (`stdlib/oidc_sso.sapp`), and AES-256-GCM authenticated archives (`stdlib/secure_archive.sapp`).
-4. **A+ Web Security Headers & Descriptor-Anchored Linux I/O**:
-   - `stdlib/http_server.sapp` and `stdlib/modern_ui_web.sapp` enforce strict Content-Security-Policy (`CSP`), `Strict-Transport-Security` (`HSTS`), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and CSRF token verification; `stdlib/secure_file.sapp` and `stdlib/linux_dirfs.sapp` prevent symlink/TOCTOU path escapes via `openat`/`O_NOFOLLOW`.
-5. **Automated Public Release Hygiene & Privacy Gate (`stdlib/public_release_audit.sapp`, `stdlib/smart_updater.sapp`)**:
-   - Pre-release and `pblang update` structural scanning blocks local workstation paths, RFC1918 LAN IPs, private keys, and credential tokens from entering lockfiles or published artifacts.
+1. **Capability-Gated Execution & Unprivileged OS Kernel Sandbox (`--sandbox`, `stdlib/vm/sovereign_pure_microkernel.sapp`, `stdlib/concurrency/green_fibers_doh_sandbox.sapp`)**:
+   - `pblang run script.sapp --sandbox` permits canonicalized, symlink-free `stdlib:...` imports while denying ambient file system (`--deny-fs`), network (`--deny-net`), HTTP (`--deny-http`), SQLite, subprocess (`--deny-exec`), environment, and native FFI (`--deny-ffi`) capabilities unless explicitly granted.
+   - Unprivileged kernel sandboxing compiles and probes Linux `Landlock` (`LANDLOCK_CREATE_RULESET_VERSION`), `Seccomp-BPF` syscall filters, `PR_SET_NO_NEW_PRIVS`, and Windows `JobObject` process isolation.
+2. **Cryptographic Anti-HashDoS, Linear-Time Anti-ReDoS & Bomb-Proof Archives**:
+   - Dynamic maps in `stdlib/vm/sovereign_pure_microkernel.sapp` use per-process `128-bit` CSPRNG-seeded **`SipHash-1-3` / `SipHash-2-4`**, neutralizing collision-flooding HashDoS attacks.
+   - `stdlib/text/pikevm_linear_regex.sapp` guarantees strict `O(M * N)` Thompson NFA / `PikeVM` matching with zero catastrophic backtracking.
+   - `stdlib/compression/deflate_gzip_zstd_lz4_archive.sapp` enforces strict decompression-bomb byte ceilings and blocks `Zip-Slip` (`../` and symlink escapes) before extraction.
+3. **Compile-Time `@constant_time` / `@zeroize` Verifier & Zero-OpenSSL Hybrid Post-Quantum TLS 1.3 (`stdlib/security/ct_zeroize_stdlib_index.sapp`, `stdlib/net/zero_openssl_tls13_pqc_quic.sapp`)**:
+   - Static AST/IR verification rejects secret-dependent branches, table lookups, and variable-time divisions inside `@constant_time` functions and verifies `@zeroize` buffer wiping on every exit path.
+   - Pure-PBLang `TLS 1.3` (`RFC 8446`) and `QUIC` (`RFC 9000/9001`) implement hybrid post-quantum key exchange (`X25519MLKEM768`: NIST `FIPS 203` `ML-KEM-768` + `X25519`), `FIPS 204` `ML-DSA`, `ChaCha20-Poly1305`, `Ed25519`, `FIDO2 / WebAuthn CTAP2`, Hardware `TPM 2.0`, and `PKCS#11 v3.2` non-extractable HSM session policies (`CKA_EXTRACTABLE = false`).
+4. **Unicode `UTS #39` Anti-Spoofing & Taint-Safe Polyglot/Web/DB Surfaces (`stdlib/text/unicode16_greek_sovereign.sapp`, `tools/pbsecure.sapp`)**:
+   - Detects `CVE-2021-42574` Trojan Source Bidi overrides and `UTS #39` Cyrillic/Greek/Latin mixed-script homoglyph spoofing, enforces parameterized SQL/PBDB queries, and sets `A+` HTTP security headers (`CSP`, `HSTS`, `X-Frame-Options: DENY`, `nosniff`, CSRF tokens).
+5. **Signed Lockfiles, `CycloneDX 1.5` / `SPDX 2.3` SBOM & Pure-PBLang Public Privacy Gate (`stdlib/devtools/pkg_init_bench_sbom.sapp`, `tools/ci_docs_privacy_audit.sapp`)**:
+   - Every release produces verifiable `SHA256SUMS.txt` and `CycloneDX 1.5` SBOM manifests, while `tools/ci_docs_privacy_audit.sapp` blocks local workstation paths, RFC1918 LAN IPs, private keys, and credentials across all tracked sources and release archives.
 
 ---
 

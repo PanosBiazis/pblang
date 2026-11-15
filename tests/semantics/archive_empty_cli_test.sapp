@@ -1,0 +1,339 @@
+// Pure PBLang zero-byte STORE acceptance, complete validation, and narrow FFI resource boundary test
+// (replaces tests/semantics/archive_empty_cli_test.py).
+
+let OS = import("stdlib:os.sapp");
+let F = import("stdlib:flate.sapp");
+
+fn _resolve_runtime(cli) {
+    let rt = "./pblang";
+    if len(cli) > 0 and cli[0] != "" { rt = cli[0]; }
+    if str_starts_with(rt, "/") { return rt; }
+    if str_starts_with(rt, "./") { rt = str_slice(rt, 2, len(rt)); }
+    return OS.cwd() + "/" + rt;
+}
+
+fn _push_u16(out, v) {
+    array_push(out, bit_and(v, 255));
+    array_push(out, bit_and(bit_shr(v, 8), 255));
+}
+
+fn _push_u32(out, v) {
+    array_push(out, bit_and(v, 255));
+    array_push(out, bit_and(bit_shr(v, 8), 255));
+    array_push(out, bit_and(bit_shr(v, 16), 255));
+    array_push(out, bit_and(bit_shr(v, 24), 255));
+}
+
+fn _push_all(out, arr) {
+    let i = 0;
+    while i < len(arr) { array_push(out, arr[i]); i = i + 1; }
+}
+
+fn _wbits(w, val, nbits) {
+    let i = 0;
+    while i < nbits {
+        let bit = bit_and(bit_shr(val, i), 1);
+        w.acc = bit_or(w.acc, bit_shl(bit, w.nb));
+        w.nb = w.nb + 1;
+        if w.nb == 8 {
+            array_push(w.out, w.acc);
+            w.acc = 0;
+            w.nb = 0;
+        }
+        i = i + 1;
+    }
+}
+
+fn _whuff_msb(w, code, nbits) {
+    let i = nbits - 1;
+    while i >= 0 {
+        let bit = bit_and(bit_shr(code, i), 1);
+        w.acc = bit_or(w.acc, bit_shl(bit, w.nb));
+        w.nb = w.nb + 1;
+        if w.nb == 8 {
+            array_push(w.out, w.acc);
+            w.acc = 0;
+            w.nb = 0;
+        }
+        i = i - 1;
+    }
+}
+
+fn _deflate_repeat_x(total_len) {
+    let w = map{out: [], acc: 0, nb: 0};
+    _wbits(w, 1, 1); // BFINAL=1
+    _wbits(w, 1, 2); // BTYPE=01 (fixed Huffman)
+    if total_len > 0 {
+        _whuff_msb(w, 48 + 120, 8); // literal 'x' (120)
+        let rem = total_len - 1;
+        while rem >= 258 {
+            _whuff_msb(w, 192 + 5, 8); // symbol 285 = length 258
+            _whuff_msb(w, 0, 5);       // distance symbol 0 = dist 1
+            rem = rem - 258;
+        }
+        while rem > 0 {
+            _whuff_msb(w, 48 + 120, 8);
+            rem = rem - 1;
+        }
+    }
+    _whuff_msb(w, 0, 7); // EOB symbol 256
+    if w.nb > 0 { array_push(w.out, w.acc); }
+    return w.out;
+}
+
+fn _crc32_repeat_x(total_len) {
+    let tbl = [];
+    let n = 0;
+    while n < 256 {
+        let c = n;
+        let k = 0;
+        while k < 8 {
+            if bit_and(c, 1) == 1 { c = bit_xor(bit_shr(c, 1), 3988292384); }
+            else { c = bit_shr(c, 1); }
+            k = k + 1;
+        }
+        array_push(tbl, c);
+        n = n + 1;
+    }
+    let crc = 4294967295;
+    let i = 0;
+    while i < total_len {
+        crc = bit_xor(bit_shr(crc, 8), tbl[bit_and(bit_xor(crc, 120), 255)]);
+        i = i + 1;
+    }
+    return bit_xor(crc, 4294967295);
+}
+
+// rows: array of map{name, data, method?, mode?, payload_override?, size_override?, crc_override?}
+fn _raw_zip(rows) {
+    let out = [];
+    let centrals = [];
+    let offsets = [];
+    let i = 0;
+    while i < len(rows) {
+        let r = rows[i];
+        let name = r.name;
+        let nameb = str_to_bytes(name);
+        let data = [];
+        if map_has(r, "data") {
+            if type(r.data) == "string" { data = str_to_bytes(r.data); }
+            else { data = r.data; }
+        }
+        let method = try r.method catch 0;
+        let payload = data;
+        let orig_size = len(data);
+        let crc = 0;
+        if map_has(r, "payload_override") {
+            payload = r.payload_override;
+            orig_size = r.size_override;
+            crc = r.crc_override;
+        } else {
+            crc = F.crc32(data);
+            if method == 8 {
+                if len(data) == 0 {
+                    payload = [3, 0]; // empty fixed-Huffman block
+                } else {
+                    payload = F.deflate_fast(data);
+                }
+            }
+        }
+        let mode = try r.mode catch (if str_ends_with(name, "/") { 16877 } else { 33188 });
+        let offset = len(out);
+        array_push(offsets, offset);
+        _push_all(out, [80, 75, 3, 4, 20, 0, 0, 0]);
+        _push_u16(out, method);
+        _push_u32(out, 0);
+        _push_u32(out, crc);
+        _push_u32(out, len(payload));
+        _push_u32(out, orig_size);
+        _push_u16(out, len(nameb));
+        _push_u16(out, 0);
+        _push_all(out, nameb);
+        _push_all(out, payload);
+
+        let c = [80, 75, 1, 2, 20, 3, 20, 0, 0, 0];
+        _push_u16(c, method);
+        _push_u32(c, 0);
+        _push_u32(c, crc);
+        _push_u32(c, len(payload));
+        _push_u32(c, orig_size);
+        _push_u16(c, len(nameb));
+        _push_u16(c, 0);
+        _push_u16(c, 0);
+        _push_u16(c, 0);
+        _push_u16(c, 0);
+        _push_u32(c, mode * 65536);
+        _push_u32(c, offset);
+        _push_all(c, nameb);
+        array_push(centrals, c);
+        i = i + 1;
+    }
+    let cd_off = len(out);
+    i = 0;
+    while i < len(centrals) { _push_all(out, centrals[i]); i = i + 1; }
+    let cd_size = len(out) - cd_off;
+    _push_all(out, [80, 75, 5, 6, 0, 0, 0, 0]);
+    _push_u16(out, len(rows));
+    _push_u16(out, len(rows));
+    _push_u32(out, cd_size);
+    _push_u32(out, cd_off);
+    _push_u16(out, 0);
+    return map{bytes: out, offsets: offsets, cd_off: cd_off};
+}
+
+fn _stat_info(path) {
+    let r = proc_spawn_wait("/usr/bin/stat", ["-c", "%a %i %Y %F", path]);
+    assert(r.exit_code == 0, "stat failed for " + path + ": " + r.stderr);
+    let parts = str_split(str_trim(r.stdout), " ");
+    return map{mode: parts[0], ino: parts[1], mtime: parts[2], kind: parts[3]};
+}
+
+fn _clone_bytes(arr) {
+    return slice(arr, 0, len(arr));
+}
+
+fn main() {
+    // Self-check _deflate_repeat_x against F.inflate
+    let sample_def = _deflate_repeat_x(600);
+    assert(len(F.inflate(sample_def, 600, true)) == 600, "deflate_repeat_x self-check");
+
+    let cli = OS.script_args();
+    let runtime = _resolve_runtime(cli);
+    let repo = OS.cwd();
+
+    let symbols = ["free", "close", "strdup", "openat", "getpid", "dup", "memfd_create", "sendfile", "lseek", "fchmod", "fcntl", "fsync"];
+    let flags = ["--deny-net", "--deny-http", "--deny-spawn", "--deny-gfx", "--deny-sqlite", "--allow-exec", "--ffi-lib=/usr/lib/x86_64-linux-gnu/libc.so.6"];
+    let si = 0;
+    while si < len(symbols) {
+        array_push(flags, "--ffi-symbol=" + symbols[si]);
+        si = si + 1;
+    }
+
+    let mk = proc_spawn_wait("/usr/bin/mktemp", ["-d", "/tmp/archive-empty-XXXXXX"]);
+    assert(mk.exit_code == 0, "mktemp failed: " + mk.stderr);
+    let root = str_trim(mk.stdout);
+    let checks = [];
+
+    let run_case = fn(label, data_bytes, is_oversize_str, ok, name, custom_dest) {
+        let src = root + "/input.zip";
+        if is_oversize_str {
+            fs_write(src, str_repeat("x", 4194305));
+        } else {
+            fs_write_bytes(src, data_bytes);
+        }
+        let dst = if custom_dest != nil { custom_dest } else { root + "/" + label };
+        let cmd_args = ["PATH=/usr/bin:/bin", "LANG=C.UTF-8", runtime, "run", repo + "/tools/archive_extract.sapp"];
+        let k = 0;
+        while k < len(flags) { array_push(cmd_args, flags[k]); k = k + 1; }
+        array_push(cmd_args, "--");
+        array_push(cmd_args, "--extract");
+        array_push(cmd_args, src);
+        array_push(cmd_args, name);
+        array_push(cmd_args, dst);
+        let p = proc_spawn_wait("/usr/bin/env", cmd_args);
+        let want_ec = if ok { 0 } else { 1 };
+        if p.exit_code != want_ec or p.stderr != "" {
+            proc_spawn_wait("/bin/rm", ["-rf", "--", root]);
+            error("case " + label + " unexpected exit/stderr: ec=" + str(p.exit_code) + " out=" + p.stdout + " err=" + p.stderr);
+        }
+        let r = json_parse(p.stdout);
+        assert(r["ok"] == ok and not str_contains(p.stdout, root), "json ok / root redaction: " + label);
+        if not is_oversize_str {
+            assert(fs_read_bytes(src) == data_bytes, "source preserved: " + label);
+        }
+        if ok {
+            assert(fs_exists(dst) and len(fs_read_bytes(dst)) == 0, "empty file created: " + label);
+            let st = _stat_info(dst);
+            assert(st.mode == "600" and st.kind == "regular" and r["durability_verified"] == true, "0600 + durability: " + label);
+        } elif custom_dest == nil {
+            assert(not fs_exists(dst) and r["publication_attempted"] == false, "no dst or publication: " + label);
+        }
+        array_push(checks, label);
+        return map{r: r, dst: dst};
+    };
+
+    let good_info = _raw_zip([
+        map{name: "empty", data: "", method: 0},
+        map{name: "later", data: "valid", method: 0}
+    ]);
+    let good = good_info.bytes;
+    let later_off = good_info.offsets[1];
+    let central_off = good_info.cd_off;
+
+    let res0 = run_case("zero-no-copy-grants", good, false, true, "empty", nil);
+    let dst0 = res0.dst;
+    let before_st = _stat_info(dst0);
+    run_case("zero-collision", good, false, false, "empty", dst0);
+    let after_st = _stat_info(dst0);
+    assert(after_st.ino == before_st.ino and after_st.mtime == before_st.mtime and len(fs_read_bytes(dst0)) == 0, "zero-collision preserved destination");
+
+    let corrupt = _clone_bytes(good);
+    corrupt[later_off + 30 + len("later")] = bit_xor(corrupt[later_off + 30 + len("later")], 1);
+    run_case("unselected-crc", corrupt, false, false, "empty", nil);
+
+    let bad_crc = _clone_bytes(good);
+    bad_crc[14] = 1;
+    bad_crc[central_off + 16] = 1;
+    run_case("empty-crc", bad_crc, false, false, "empty", nil);
+
+    run_case("truncated", slice(good, 0, len(good) - 1), false, false, "empty", nil);
+    run_case("oversized-input", [], true, false, "empty", nil);
+
+    let bad_names = [
+        map{label: "traversal", name: "../escape"},
+        map{label: "case-collision", name: "EMPTY"},
+        map{label: "ancestor", name: "empty/child"}
+    ];
+    let bi = 0;
+    while bi < len(bad_names) {
+        let item = bad_names[bi];
+        let z = _raw_zip([
+            map{name: "empty", data: "", method: 0},
+            map{name: item.name, data: "bad", method: 0}
+        ]);
+        run_case(item.label, z.bytes, false, false, "empty", nil);
+        bi = bi + 1;
+    }
+
+    // 0o120777 == 41471
+    let sym_zip = _raw_zip([map{name: "empty", data: "", method: 0, mode: 41471}]);
+    run_case("empty-symlink", sym_zip.bytes, false, false, "empty", nil);
+
+    let dir_zip = _raw_zip([map{name: "empty/", data: "", method: 0}]);
+    run_case("directory", dir_zip.bytes, false, false, "empty/", nil);
+
+    let def_empty = _raw_zip([map{name: "empty", data: "", method: 8}]);
+    run_case("empty-deflate", def_empty.bytes, false, false, "empty", nil);
+
+    let big_payload = _deflate_repeat_x(1048577);
+    let big_crc = _crc32_repeat_x(1048577);
+    let exp_lim = _raw_zip([
+        map{name: "empty", data: "", method: 0},
+        map{name: "later", data: "", method: 8, payload_override: big_payload, size_override: 1048577, crc_override: big_crc}
+    ]);
+    run_case("unselected-expanded-limit", exp_lim.bytes, false, false, "empty", nil);
+
+    let many_rows = [map{name: "empty", data: "", method: 0}];
+    let mi = 0;
+    while mi < 256 {
+        array_push(many_rows, map{name: "f" + str(mi), data: "", method: 0});
+        mi = mi + 1;
+    }
+    let many_zip = _raw_zip(many_rows);
+    run_case("entry-limit", many_zip.bytes, false, false, "empty", nil);
+
+    let encrypted = _clone_bytes(good);
+    encrypted[6] = bit_or(encrypted[6], 1);
+    encrypted[central_off + 8] = bit_or(encrypted[central_off + 8], 1);
+    run_case("encrypted-empty", encrypted, false, false, "empty", nil);
+
+    proc_spawn_wait("/bin/rm", ["-rf", "--", root]);
+    print(json_stringify(map{
+        passed: checks,
+        count: len(checks),
+        copy_ffi_symbols_denied: ["calloc", "pread", "write"],
+        profile_symbols: symbols
+    }));
+}
+
+main();

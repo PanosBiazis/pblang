@@ -1,0 +1,363 @@
+// Focused metadata admission verification through the real
+// stdlib/portable_lock.sapp, stdlib/locked_source_snapshot.sapp, and
+// stdlib/immutable_broker_bundle.sapp APIs in pure PBLang.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let SER = import("stdlib:serialization.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _find_libc() {
+    let paths = [
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/usr/lib/libc.so.6",
+        "/lib/libc.so.6"
+    ];
+    let i = 0;
+    while i < len(paths) {
+        if fs_exists(paths[i]) { return paths[i]; }
+        i = i + 1;
+    }
+    throw "snapshot_lock_admission: libc.so.6 not found";
+}
+
+fn _rm_tree_libc(libc, path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            let child = path + "/" + entries[i];
+            if ffi_call_typed(libc, "unlink", "i32(cstr)", [child]) != 0 {
+                _rm_tree_libc(libc, child);
+            }
+            i = i + 1;
+        }
+    }
+    let _u = ffi_call_typed(libc, "unlink", "i32(cstr)", [path]);
+    let _d = ffi_call_typed(libc, "rmdir", "i32(cstr)", [path]);
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _copy_tree(src, dst) {
+    fs_mkdirs(dst);
+    let entries = fs_listdir(src);
+    let i = 0;
+    while i < len(entries) {
+        let nm = entries[i];
+        let s = src + "/" + nm;
+        let d = dst + "/" + nm;
+        let sub = try fs_listdir(s) catch nil;
+        if sub != nil {
+            _copy_tree(s, d);
+        } else {
+            fs_write_bytes(d, fs_read_bytes(s));
+        }
+        i = i + 1;
+    }
+}
+
+fn _snapshot_files(cur_dir, rel_prefix, acc) {
+    let entries = try fs_listdir(cur_dir) catch nil;
+    if entries == nil { return; }
+    let sorted = array_sort(entries);
+    let i = 0;
+    while i < len(sorted) {
+        let nm = sorted[i];
+        let full = cur_dir + "/" + nm;
+        let rel = if rel_prefix == "" { nm } else { rel_prefix + "/" + nm };
+        let sub = try fs_listdir(full) catch nil;
+        if sub != nil {
+            _snapshot_files(full, rel, acc);
+        } else {
+            acc[rel] = SHA256.sha256_hex_bytes(fs_read_bytes(full));
+        }
+        i = i + 1;
+    }
+}
+
+fn _maps_equal(a, b) {
+    let ak = array_sort(map_keys(a));
+    let bk = array_sort(map_keys(b));
+    if ak != bk { return false; }
+    let i = 0;
+    while i < len(ak) {
+        let k = ak[i];
+        if a[k] != b[k] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _replace_first(text, needle, replacement) {
+    let pos = str_index_of(text, needle);
+    if pos < 0 { return text; }
+    return str_slice(text, 0, pos) + replacement + str_slice(text, pos + len(needle), len(text));
+}
+
+fn _last_json_object(stdout_txt) {
+    let lines = str_split(stdout_txt, "\n");
+    let last_line = "";
+    let i = 0;
+    while i < len(lines) {
+        let ln = str_trim(lines[i]);
+        if str_starts_with(ln, "{") {
+            last_line = ln;
+        }
+        i = i + 1;
+    }
+    if last_line == "" { return nil; }
+    return try json_parse(last_line) catch nil;
+}
+
+fn main() {
+    let raw_args = os_args();
+    let runtime_arg = "";
+    let repo_arg = "";
+    let report_arg = "";
+    let baseline_arg = "";
+    let idx = 0;
+    while idx < len(raw_args) {
+        let a = raw_args[idx];
+        if a == "--runtime" and idx + 1 < len(raw_args) {
+            runtime_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--repo" and idx + 1 < len(raw_args) {
+            repo_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--report" and idx + 1 < len(raw_args) {
+            report_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--baseline" and idx + 1 < len(raw_args) {
+            baseline_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        }
+        idx = idx + 1;
+    }
+
+    let repo = if repo_arg != "" { repo_arg } else { cwd() };
+    let binary = if runtime_arg != "" {
+        runtime_arg
+    } elif fs_exists(repo + "/target/release/pblang") {
+        repo + "/target/release/pblang"
+    } else {
+        repo + "/pblang"
+    };
+    assert(fs_exists(binary), "snapshot_lock_admission: runtime binary missing");
+
+    let libc_path = _find_libc();
+    let libc = ffi_load(libc_path);
+
+    let base = "/tmp/pblang_tooling_s1_lock_adm_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(base).ok, "create private base");
+
+    let rows = [];
+    let record_row = fn(label, passed, detail) {
+        array_push(rows, map{ label: label, passed: passed, detail: detail });
+        if report_arg != "" {
+            fs_write(report_arg, json_stringify(rows) + "\n");
+        }
+        if not passed {
+            print "FAIL_LOCK_ADMISSION: " + label + " -> " + json_stringify(detail);
+            _rm_tree_libc(libc, base);
+        }
+        assert(passed, "snapshot_lock_admission failed: " + label);
+    };
+
+    // Clean any interrupted run directory with our prefix
+    let tmp_entries = try fs_listdir("/tmp") catch [];
+    let ti = 0;
+    while ti < len(tmp_entries) {
+        if str_starts_with(tmp_entries[ti], "pblang_tooling_s1_lock_adm_") and ("/tmp/" + tmp_entries[ti]) != base {
+            _rm_tree_libc(libc, "/tmp/" + tmp_entries[ti]);
+        }
+        ti = ti + 1;
+    }
+
+    let run_in = fn(work_dir, argv) {
+        let _c1 = ffi_call_typed(libc, "chdir", "i32(cstr)", [work_dir]);
+        let r = proc_spawn_wait(binary, argv);
+        let _c2 = ffi_call_typed(libc, "chdir", "i32(cstr)", [repo]);
+        return r;
+    };
+
+    // 1. Build harness with isolated stdlib copy
+    let harness = base + "/harness";
+    fs_mkdirs(harness);
+    _copy_tree(repo + "/stdlib", harness + "/stdlib");
+    if baseline_arg != "" {
+        fs_write_bytes(harness + "/stdlib/locked_source_snapshot.sapp", fs_read_bytes(baseline_arg));
+    }
+    fs_write(harness + "/pblang.toml",
+        "[package]\nname=\"lock-harness\"\nversion=\"1.0.0\"\nentry=\"main.sapp\"\n"
+        + "[dependencies]\nstdlib={path=\"" + harness + "/stdlib\"}\n");
+    fs_write(harness + "/main.sapp", "print 0;");
+    let h_proc = run_in(harness, ["build", harness]);
+    record_row("harness builds", h_proc.exit_code == 0, map{ stderr: h_proc.stderr });
+
+    // 2. Build fixture project and publish portable lock
+    let root = base + "/project";
+    fs_mkdirs(root + "/dep");
+    fs_write(root + "/dep/value.sapp", "let value=42;export value;\n");
+    fs_write(root + "/pblang.toml",
+        "[package]\nname=\"lock-fixture\"\nversion=\"1.0.0\"\nentry=\"main.sapp\"\n"
+        + "[dependencies]\ndep={path=\"dep\"}\n");
+    fs_write(root + "/main.sapp", "let D=import(\"dep:value.sapp\");print D.value;\n");
+    let p_proc = run_in(root, ["build", root]);
+    record_row("native project lock builds", p_proc.exit_code == 0, map{ stderr: p_proc.stderr });
+
+    let driver = harness + "/probe.sapp";
+    fs_write(driver,
+        "let L=import(\"stdlib:portable_lock.sapp\");print json_stringify(L.publish(" + json_stringify(root) + "));");
+    let pub_proc = run_in(harness + "/stdlib", ["run", driver, "--allow-all"]);
+    let pub_obj = _last_json_object(pub_proc.stdout);
+    record_row(
+        "native lock made portable",
+        pub_proc.exit_code == 0 and pub_obj != nil and (try pub_obj.ok catch false) == true,
+        map{ stdout: pub_proc.stdout, stderr: pub_proc.stderr }
+    );
+
+    let manifest_bytes = fs_read_bytes(root + "/pblang.toml");
+    let lock_text = fs_read(root + "/pblang.lock");
+    let parsed_lock = SER.toml_parse(lock_text);
+    let digest = parsed_lock.dependencies.dep.sha256;
+    let manifest_digest = parsed_lock.manifest_sha256;
+    let zeros = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fs_write(driver,
+        "let S=import(\"stdlib:locked_source_snapshot.sapp\");"
+        + "let B=import(\"stdlib:immutable_broker_bundle.sapp\");"
+        + "let R=" + json_stringify(root) + ";"
+        + "let s=S.load(R);"
+        + "let b=B.build(\"main.sapp\",R);"
+        + "print json_stringify(map{snapshot:s.ok,bundle:b.ok,error:try s.error catch nil,bundle_error:try b.error catch nil,verified:try s.lock_verified catch false});");
+
+    let run_case = fn(label, lock_bytes, accepted, mf_bytes) {
+        fs_write_bytes(root + "/pblang.toml", mf_bytes);
+        fs_write_bytes(root + "/pblang.lock", lock_bytes);
+        let before = map{};
+        _snapshot_files(root, "", before);
+
+        let proc = run_in(harness + "/stdlib", ["run", driver, "--allow-all"]);
+        let res = _last_json_object(proc.stdout);
+
+        let after = map{};
+        _snapshot_files(root, "", after);
+        let unchanged = _maps_equal(before, after);
+        let ok = proc.exit_code == 0
+            and res != nil
+            and (try res.snapshot catch (not accepted)) == accepted
+            and (try res.bundle catch (not accepted)) == accepted
+            and (try res.verified catch (not accepted)) == accepted
+            and unchanged;
+        record_row(label, ok, map{ result: res, source_unchanged: unchanged, stderr: proc.stderr });
+    };
+
+    run_case("genuine portable native lock", str_to_bytes(lock_text), true, manifest_bytes);
+
+    let flawed = [
+        map{
+            name: "duplicate manifest digest",
+            bad: _replace_first(lock_text, "manifest_sha256 = ", "manifest_sha256 = \"" + zeros + "\"\nmanifest_sha256 = ")
+        },
+        map{
+            name: "duplicate algorithm",
+            bad: _replace_first(lock_text, "content_hash_algorithm = ", "content_hash_algorithm = \"legacy\"\ncontent_hash_algorithm = ")
+        },
+        map{
+            name: "duplicate dependency digest",
+            bad: str_replace_all(lock_text, "sha256 = \"" + digest + "\"", "sha256 = \"" + zeros + "\"\nsha256 = \"" + digest + "\"")
+        },
+        map{
+            name: "duplicate dependency path",
+            bad: str_replace_all(lock_text, "path = \"dep\"", "path = \"wrong\"\npath = \"dep\"")
+        },
+        map{
+            name: "undeclared extra dependency",
+            bad: lock_text + "\n[dependencies.extra]\npath=\"dep\"\nsha256=\"" + digest + "\"\n"
+        },
+        map{
+            name: "mixed registry and local record",
+            bad: lock_text + "\nsource=\"registry:example\"\n"
+        }
+    ];
+
+    let has_baseline = baseline_arg != "";
+    let fi = 0;
+    while fi < len(flawed) {
+        let item = flawed[fi];
+        let prefix = if has_baseline { "baseline accepts " } else { "reject " };
+        run_case(prefix + item.name, str_to_bytes(item.bad), has_baseline, manifest_bytes);
+        fi = fi + 1;
+    }
+
+    if not has_baseline {
+        let reordered = "# generated fixture\n" + str_replace_all(
+            lock_text,
+            "path = \"dep\"\nsha256 = \"" + digest + "\"",
+            "sha256 = \"" + digest + "\" # digest\npath = \"dep\""
+        );
+        run_case("comments and reordered fields", str_to_bytes(reordered), true, manifest_bytes);
+
+        let quoted = str_replace_all(
+            str_replace_all(lock_text, "path = ", "\"path\" = "),
+            "sha256 = \"" + digest,
+            "\"sha256\" = \"" + digest
+        );
+        run_case("quoted dependency fields", str_to_bytes(quoted), true, manifest_bytes);
+
+        run_case("identical duplicate dependency digest", str_to_bytes(lock_text + "\nsha256=\"" + digest + "\"\n"), false, manifest_bytes);
+        run_case("repeated dependency table", str_to_bytes(lock_text + "\n[dependencies.dep]\npath=\"dep\"\nsha256=\"" + digest + "\"\n"), false, manifest_bytes);
+        run_case("malformed line", str_to_bytes(lock_text + "\nnot-an-assignment\n"), false, manifest_bytes);
+        run_case("scalar versus table conflict", str_to_bytes(str_replace_all(lock_text, "[dependencies.dep]", "dependencies=\"wrong\"\n[dependencies.dep]")), false, manifest_bytes);
+        run_case("unsupported inline table lock", str_to_bytes(lock_text + "\nextra={path=\"unused\"}\n"), false, manifest_bytes);
+        run_case("source marker empty still not local record", str_to_bytes(lock_text + "\nsource=\"\"\n"), false, manifest_bytes);
+        run_case("renamed dependency same cardinality", str_to_bytes(str_replace_all(lock_text, "[dependencies.dep]", "[dependencies.other]")), false, manifest_bytes);
+
+        let split_dep = str_split(lock_text, "[dependencies.dep]");
+        run_case("missing dependency", str_to_bytes(split_dep[0] + "[dependencies]\n"), false, manifest_bytes);
+
+        // Invalid UTF-8 lock: append "\n#\xff\n" ([10, 35, 255, 10])
+        let bad_utf8_lock = str_to_bytes(lock_text);
+        array_push(bad_utf8_lock, 10);
+        array_push(bad_utf8_lock, 35);
+        array_push(bad_utf8_lock, 255);
+        array_push(bad_utf8_lock, 10);
+        run_case("invalid UTF8 lock", bad_utf8_lock, false, manifest_bytes);
+
+        // Invalid UTF-8 manifest: append "#\xff\n" ([35, 255, 10]) with matching sha256
+        let bad_utf8_mf = [];
+        let mi = 0;
+        while mi < len(manifest_bytes) {
+            array_push(bad_utf8_mf, manifest_bytes[mi]);
+            mi = mi + 1;
+        }
+        array_push(bad_utf8_mf, 35);
+        array_push(bad_utf8_mf, 255);
+        array_push(bad_utf8_mf, 10);
+        let bad_mf_digest = SHA256.sha256_hex_bytes(bad_utf8_mf);
+        run_case("invalid UTF8 manifest", str_to_bytes(str_replace_all(lock_text, manifest_digest, bad_mf_digest)), false, bad_utf8_mf);
+
+        run_case("stale valid dependency digest", str_to_bytes(str_replace_all(lock_text, digest, zeros)), false, manifest_bytes);
+
+        // Empty dependency set project profile
+        let empty_mf_txt = "[package]\nname=\"empty\"\nversion=\"1.0.0\"\nentry=\"main.sapp\"\n";
+        let empty_mf_bytes = str_to_bytes(empty_mf_txt);
+        fs_write(root + "/main.sapp", "print 42;\n");
+        let empty_lock = "manifest_sha256=\"" + sha256(empty_mf_txt) + "\"\ncontent_hash_algorithm=\"pblang-package-tree-v2\"\n[dependencies]\n";
+        run_case("empty dependency set", str_to_bytes(empty_lock), true, empty_mf_bytes);
+        run_case(
+            "unused locked dependency in empty project",
+            str_to_bytes(empty_lock + "[dependencies.extra]\npath=\"dep\"\nsha256=\"" + digest + "\"\n"),
+            false,
+            empty_mf_bytes
+        );
+    }
+
+    _rm_tree_libc(libc, base);
+    assert(not fs_exists(base), "snapshot_lock_admission: temporary base directory must be cleaned up");
+    print "snapshot_lock_admission_pass: rows=" + str(len(rows));
+}
+
+main();

@@ -104,12 +104,11 @@ fix is also retained when integrating current main.
 ```sh
 pblang run tests/fixtures/uno_r4_led_studio_device_host.sapp --allow-all
 pblang run tests/fixtures/uno_r4_led_studio_device_export.sapp --allow-all
-c++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -I build/pblang_led_device tests/graphics/uno_r4_device_firmware.cpp -o /tmp/pbled-firmware-test
-/tmp/pbled-firmware-test > /tmp/pbled-firmware-responses.tsv
-python3 tests/graphics/uno_r4_device_assert.py /tmp/pbled-firmware-responses.tsv
-python3 tests/graphics/uno_r4_device_oracle.py build/pblang_led_device/firmware.sapp build/pblang_led_device/oracle.sapp
+pblang run tests/graphics/uno_r4_device_firmware.sapp --allow-all -- build/pblang_led_device /tmp/pbled-firmware-responses.tsv
+pblang run tests/graphics/uno_r4_device_assert.sapp --allow-all -- /tmp/pbled-firmware-responses.tsv
+pblang run tests/graphics/uno_r4_device_oracle.sapp --allow-all -- build/pblang_led_device/firmware.sapp build/pblang_led_device/oracle.sapp
 pblang run build/pblang_led_device/oracle.sapp --allow-all > /tmp/pbled-native-oracle.tsv
-python3 tests/graphics/uno_r4_device_compare.py /tmp/pbled-firmware-responses.tsv /tmp/pbled-native-oracle.tsv
+pblang run tests/graphics/uno_r4_device_compare.sapp --allow-all -- /tmp/pbled-firmware-responses.tsv /tmp/pbled-native-oracle.tsv
 ```
 
 Tests use synthetic state/byte/clock callbacks. They do not open serial devices or

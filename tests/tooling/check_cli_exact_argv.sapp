@@ -1,0 +1,320 @@
+// Isolated checker process verification: exact filename identity, exits,
+// static no-env filename contract, and profile parity in pure PBLang.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _rm_rf(path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            _rm_rf(path + "/" + entries[i]);
+            i = i + 1;
+        }
+    }
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _inventory(root, rel_prefix, out_map) {
+    let entries = array_sort(try fs_listdir(root) catch []);
+    let i = 0;
+    while i < len(entries) {
+        let name = entries[i];
+        let full = root + "/" + name;
+        let rel = if rel_prefix == "" { name } else { rel_prefix + "/" + name };
+        let sub = try fs_listdir(full) catch nil;
+        if sub != nil {
+            _inventory(full, rel, out_map);
+        } else {
+            out_map[rel] = SHA256.sha256_hex_bytes(fs_read_bytes(full));
+        }
+        i = i + 1;
+    }
+}
+
+fn _maps_equal(a, b) {
+    let ka = array_sort(map_keys(a));
+    let kb = array_sort(map_keys(b));
+    if len(ka) != len(kb) { return false; }
+    let i = 0;
+    while i < len(ka) {
+        let k = ka[i];
+        if k != kb[i] or a[k] != b[k] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() {
+    let raw_args = os_args();
+    let release_arg = "";
+    let runtime_arg = "";
+    let report_arg = "";
+    let only_arg = "";
+    let baseline = false;
+    let idx = 0;
+    while idx < len(raw_args) {
+        let a = raw_args[idx];
+        if a == "--release" and idx + 1 < len(raw_args) {
+            release_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--runtime" and idx + 1 < len(raw_args) {
+            runtime_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--report" and idx + 1 < len(raw_args) {
+            report_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--only" and idx + 1 < len(raw_args) {
+            only_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--baseline" {
+            baseline = true;
+        }
+        idx = idx + 1;
+    }
+
+    let repo_root = cwd();
+    let binary = "";
+    let driver = "";
+    let has_public_check_route = false;
+    if release_arg != "" and fs_exists(release_arg + "/bin/pblang") {
+        binary = release_arg + "/bin/pblang";
+        driver = release_arg + "/stdlib/check_cli.sapp";
+        has_public_check_route = true;
+    } else {
+        binary = if runtime_arg != "" { runtime_arg } else { repo_root + "/pblang" };
+        driver = repo_root + "/stdlib/check_cli.sapp";
+    }
+    assert(fs_exists(binary) and fs_exists(driver), "check_cli_exact_argv: binary or check_cli.sapp missing");
+
+    let driver_text = fs_read(driver);
+    let split1 = str_split(driver_text, "fn _arg_files() {");
+    assert(len(split1) >= 2, "check_cli.sapp missing _arg_files");
+    let body = str_split(split1[1], "fn check_files")[0];
+    let static_check = map{
+        contains_os_args: str_contains(body, "os_args()"),
+        contains_filename_environment: str_contains(body, "PBLANG_SCRIPT_ARGS"),
+        contains_env_get: str_contains(body, "env_get(")
+    };
+    if not baseline {
+        assert(static_check.contains_os_args and not static_check.contains_env_get and not static_check.contains_filename_environment,
+            "_arg_files static contract violated");
+    }
+
+    let scratch = "/tmp/pblang_tooling_s1_check_argv_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(scratch).ok, "create private scratch");
+
+    let good = "let answer = 42; print answer;\n";
+    let bad = "let answer = ;\n";
+    let sources = map{
+        "valid.sapp": good,
+        "invalid.sapp": bad,
+        "bad.sapp ": bad,
+        "bad.sapp": good,
+        "good.sapp ": good,
+        "good.sapp": bad,
+        "line\nvalid.sapp": good,
+        "line\nbad.sapp": bad,
+        "split\n/piece.sapp": bad,
+        "split": good,
+        "piece.sapp": good,
+        "ελληνικά.sapp": good,
+        "two words.sapp": good,
+        " leading.sapp": good,
+        "tab\tname.sapp": good,
+        "--": good,
+        "--retained-source": good,
+        "arity.sapp": "fn identity(value:number){return value;} identity();",
+        "type.sapp": "let answer:number=nil-1;",
+        "nested.sapp": "for _i 1 {let p=map{run:fn(self){return 7;}};print (try {p:run()} catch 9);}",
+        "lazy.sapp": "fn load(){return import(\"PRIVATE_CANARY\");} export load;",
+        "effect.sapp": "fs_write(\"" + scratch + "/MUST_NOT_EXIST\", \"SOURCE_EXECUTED\");",
+        "throw.sapp": "throw \"SOURCE_EXECUTED\";"
+    };
+
+    let skeys = map_keys(sources);
+    let si = 0;
+    while si < len(skeys) {
+        let rel = skeys[si];
+        let full = scratch + "/" + rel;
+        let pdir = path_dirname(full);
+        if pdir != "" and pdir != "." { fs_mkdirs(pdir); }
+        fs_write(full, sources[rel]);
+        si = si + 1;
+    }
+
+    let before = map{};
+    _inventory(scratch, "", before);
+
+    let restrictions = [
+        "--deny-net", "--deny-http", "--deny-exec", "--deny-ffi",
+        "--deny-spawn", "--deny-gfx", "--deny-sqlite"
+    ];
+
+    let make_direct = fn(files, flags) {
+        let out = ["run"];
+        let ri = 0;
+        while ri < len(restrictions) { array_push(out, restrictions[ri]); ri = ri + 1; }
+        array_push(out, driver);
+        array_push(out, "--");
+        let fi = 0;
+        while fi < len(flags) { array_push(out, flags[fi]); fi = fi + 1; }
+        let pi = 0;
+        while pi < len(files) { array_push(out, files[pi]); pi = pi + 1; }
+        return out;
+    };
+
+    let make_route = fn(mode, files, flags) {
+        if mode == "public" and has_public_check_route {
+            let out = ["check"];
+            let pi = 0;
+            while pi < len(files) { array_push(out, files[pi]); pi = pi + 1; }
+            return out;
+        }
+        return make_direct(files, flags);
+    };
+
+    let rows = [];
+    let prev_script_args = env_get("PBLANG_SCRIPT_ARGS");
+    let prev_profile = env_get("PBLANG_CHECK_PROFILE");
+
+    let run_case = fn(name, args, expected_code, expected_count, expected_contains, env_map, old_code) {
+        if only_arg != "" and only_arg != name { return; }
+        env_set("PBLANG_SCRIPT_ARGS", try env_map["PBLANG_SCRIPT_ARGS"] catch "");
+        env_set("PBLANG_CHECK_PROFILE", try env_map["PBLANG_CHECK_PROFILE"] catch "");
+
+        let proc = proc_spawn_wait(binary, args);
+        let want_exit = if baseline and old_code != nil { old_code } else { expected_code };
+        let text = proc.stdout + proc.stderr;
+        let current = map{};
+        _inventory(scratch, "", current);
+        let unchanged = _maps_equal(current, before);
+        let old_bug = baseline and old_code != nil;
+
+        let checks = map{
+            status: proc.exit_code == want_exit,
+            fixtures_unchanged: unchanged,
+            source_not_executed: not str_contains(text, "SOURCE_EXECUTED") and not fs_exists(scratch + "/MUST_NOT_EXIST"),
+            batch_count: old_bug or expected_count == nil or str_contains(proc.stdout, "checked " + str(expected_count) + " file(s):"),
+            expected_diagnostic: old_bug or expected_contains == "" or str_contains(text, expected_contains)
+        };
+
+        let ckeys = map_keys(checks);
+        let ok = true;
+        let ci = 0;
+        while ci < len(ckeys) {
+            if not checks[ckeys[ci]] { ok = false; }
+            ci = ci + 1;
+        }
+
+        array_push(rows, map{
+            name: name,
+            passed: ok,
+            exit: proc.exit_code,
+            expected_exit: want_exit,
+            checks: checks
+        });
+        assert(checks.fixtures_unchanged and checks.source_not_executed, "isolation invariant failed: " + name);
+    };
+
+    let modes = if has_public_check_route { ["public", "direct"] } else { ["direct"] };
+    let run_all = fn() {
+        let mi = 0;
+        while mi < len(modes) {
+            let mode = modes[mi];
+            run_case(mode + " wrong-file rejection", make_route(mode, [scratch + "/bad.sapp "], []), 1, 1, "", map{}, 0);
+            run_case(mode + " reverse wrong-file acceptance", make_route(mode, [scratch + "/good.sapp "], []), 0, 1, "", map{}, 1);
+            run_case(mode + " newline single file", make_route(mode, [scratch + "/line\nvalid.sapp"], []), 0, 1, "", map{}, 1);
+            run_case(mode + " split-decoy rejection", make_route(mode, [scratch + "/split\n/piece.sapp"], []), 1, 1, "", map{}, 0);
+            run_case(mode + " valid control", make_route(mode, [scratch + "/valid.sapp"], []), 0, 1, "", map{}, nil);
+
+            if not baseline {
+                let exact_names = ["ελληνικά.sapp", "two words.sapp", " leading.sapp", "tab\tname.sapp", "--", "--retained-source"];
+                let ei = 0;
+                while ei < len(exact_names) {
+                    let en = exact_names[ei];
+                    run_case(mode + " exact " + en, make_route(mode, [scratch + "/" + en], []), 0, 1, "", map{}, nil);
+                    ei = ei + 1;
+                }
+                let bad_names = ["invalid.sapp", "arity.sapp", "type.sapp", "line\nbad.sapp", "missing.sapp"];
+                let bi = 0;
+                while bi < len(bad_names) {
+                    let bn = bad_names[bi];
+                    run_case(mode + " invalid " + bn, make_route(mode, [scratch + "/" + bn], []), 1, 1, "", map{}, nil);
+                    bi = bi + 1;
+                }
+                run_case(mode + " mixed batch", make_route(mode, [scratch + "/valid.sapp", scratch + "/line\nbad.sapp"], []), 1, 2, "", map{}, nil);
+                run_case(mode + " two valid", make_route(mode, [scratch + "/valid.sapp", scratch + "/line\nvalid.sapp"], []), 0, 2, "", map{}, nil);
+                run_case(mode + " empty argument", make_route(mode, [""], []), 1, 1, "", map{}, nil);
+                run_case(mode + " parent env decoy", make_route(mode, [scratch + "/invalid.sapp"], []), 1, 1, "", map{ "PBLANG_SCRIPT_ARGS": scratch + "/valid.sapp" }, nil);
+            }
+            mi = mi + 1;
+        }
+
+        if not baseline {
+            run_case("direct second separator is filename", make_direct([scratch + "/--"], []), 0, 1, "", map{}, nil);
+            let no_delim = ["run"];
+            let rj = 0;
+            while rj < len(restrictions) { array_push(no_delim, restrictions[rj]); rj = rj + 1; }
+            array_push(no_delim, driver);
+            run_case("direct no delimiter", no_delim, 1, nil, "source files required", map{}, nil);
+            run_case("direct empty tail", make_direct([], []), 1, nil, "source files required", map{}, nil);
+            run_case("not executed effect.sapp", make_direct([scratch + "/effect.sapp"], []), 0, 1, "", map{}, nil);
+            run_case("not executed throw.sapp", make_direct([scratch + "/throw.sapp"], []), 0, 1, "", map{}, nil);
+            run_case("default profile empty", make_direct([scratch + "/nested.sapp"], []), 0, 1, "", map{ "PBLANG_CHECK_PROFILE": "" }, nil);
+            run_case("default profile explicit", make_direct([scratch + "/nested.sapp"], []), 0, 1, "", map{ "PBLANG_CHECK_PROFILE": "default" }, nil);
+
+            run_case("environment retained-source", make_direct([scratch + "/nested.sapp"], []), 1, 1, "retained-nested-try", map{ "PBLANG_CHECK_PROFILE": "retained-source" }, nil);
+            run_case("explicit retained-source", make_direct([scratch + "/nested.sapp"], ["--retained-source"]), 1, 1, "retained-nested-try", map{}, nil);
+            run_case("duplicate retained-source", make_direct([scratch + "/valid.sapp"], ["--retained-source", "--retained-source"]), 1, nil, "duplicate", map{}, nil);
+
+            run_case("environment import-origin", make_direct([scratch + "/lazy.sapp"], []), 1, 1, "import-origin-deferred", map{ "PBLANG_CHECK_PROFILE": "import-origin" }, nil);
+            run_case("explicit import-origin", make_direct([scratch + "/lazy.sapp"], ["--import-origin"]), 1, 1, "import-origin-deferred", map{}, nil);
+            run_case("duplicate import-origin", make_direct([scratch + "/valid.sapp"], ["--import-origin", "--import-origin"]), 1, nil, "duplicate", map{}, nil);
+
+            run_case("unknown profile", make_direct([scratch + "/valid.sapp"], []), 1, nil, "unknown source profile", map{ "PBLANG_CHECK_PROFILE": "unknown" }, nil);
+        }
+        return true;
+    };
+    let _all_ran = try run_all() catch false;
+
+    env_set("PBLANG_SCRIPT_ARGS", if prev_script_args == nil { "" } else { prev_script_args });
+    env_set("PBLANG_CHECK_PROFILE", if prev_profile == nil { "" } else { prev_profile });
+
+    _rm_rf(scratch);
+    assert(not fs_exists(scratch), "check_cli_exact_argv scratch cleaned up");
+
+    let passed = len(rows) > 0;
+    let k = 0;
+    while k < len(rows) {
+        if not rows[k].passed {
+            print "FAILED CASE: " + json_stringify(rows[k]);
+            passed = false;
+        }
+        k = k + 1;
+    }
+
+    let report = map{
+        passed: passed,
+        baseline: baseline,
+        selected_case: only_arg,
+        case_count: len(rows),
+        driver_sha256: SHA256.sha256_hex(driver_text),
+        filename_environment_static: static_check,
+        synthetic_fixture_hashes: before,
+        fixture_directory_removed: true,
+        rows: rows
+    };
+
+    if report_arg != "" {
+        let pdir = path_dirname(report_arg);
+        if pdir != "" and pdir != "." { fs_mkdirs(pdir); }
+        fs_write(report_arg, json_stringify(report) + "\n");
+    }
+
+    assert(report.passed, "check_cli_exact_argv failed");
+    print "check_cli_exact_argv_pass: cases=" + str(len(rows));
+}
+
+main();

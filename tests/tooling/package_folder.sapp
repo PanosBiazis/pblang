@@ -1,0 +1,609 @@
+// Real CLI source-folder packaging and source-integrity checks for
+// tools/pbpackage.sapp and stdlib/package_folder.sapp in pure PBLang.
+// All fixtures are created inside a private disposable /tmp directory and
+// removed before exit.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _find_libc() {
+    let paths = [
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/usr/lib/libc.so.6",
+        "/lib/libc.so.6"
+    ];
+    let i = 0;
+    while i < len(paths) {
+        if fs_exists(paths[i]) { return paths[i]; }
+        i = i + 1;
+    }
+    throw "package_folder: libc.so.6 not found";
+}
+
+fn _rm_tree_libc(libc, path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            let child = path + "/" + entries[i];
+            if ffi_call_typed(libc, "unlink", "i32(cstr)", [child]) != 0 {
+                _rm_tree_libc(libc, child);
+            }
+            i = i + 1;
+        }
+    }
+    let _u = ffi_call_typed(libc, "unlink", "i32(cstr)", [path]);
+    let _d = ffi_call_typed(libc, "rmdir", "i32(cstr)", [path]);
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _copy_tree(src, dst) {
+    fs_mkdirs(dst);
+    let entries = fs_listdir(src);
+    let i = 0;
+    while i < len(entries) {
+        let nm = entries[i];
+        let s = src + "/" + nm;
+        let d = dst + "/" + nm;
+        let sub = try fs_listdir(s) catch nil;
+        if sub != nil {
+            _copy_tree(s, d);
+        } else {
+            fs_write_bytes(d, fs_read_bytes(s));
+        }
+        i = i + 1;
+    }
+}
+
+fn _file_kind(path) {
+    let st_bin = if fs_exists("/usr/bin/stat") { "/usr/bin/stat" } else { "/bin/stat" };
+    let r = proc_spawn_wait(st_bin, ["-c", "%F", path]);
+    if r.exit_code != 0 { return "missing"; }
+    let out = str_trim(r.stdout);
+    if str_contains(out, "symbolic link") { return "link"; }
+    if str_contains(out, "directory") { return "dir"; }
+    if str_contains(out, "regular") { return "file"; }
+    return "special";
+}
+
+fn _readlink_target(path) {
+    let rl_bin = if fs_exists("/usr/bin/readlink") { "/usr/bin/readlink" } else { "/bin/readlink" };
+    let r = proc_spawn_wait(rl_bin, [path]);
+    return str_trim(r.stdout);
+}
+
+fn _mode_octal(path) {
+    let st_bin = if fs_exists("/usr/bin/stat") { "/usr/bin/stat" } else { "/bin/stat" };
+    let r = proc_spawn_wait(st_bin, ["-c", "%a", path]);
+    if r.exit_code != 0 { return ""; }
+    return str_trim(r.stdout);
+}
+
+fn _snapshot_tree(cur_dir, rel_prefix, acc) {
+    let entries = try fs_listdir(cur_dir) catch nil;
+    if entries == nil { return; }
+    let sorted = array_sort(entries);
+    let i = 0;
+    while i < len(sorted) {
+        let nm = sorted[i];
+        let full = cur_dir + "/" + nm;
+        let rel = if rel_prefix == "" { nm } else { rel_prefix + "/" + nm };
+        let knd = _file_kind(full);
+        if knd == "link" {
+            acc[rel] = "link:" + _readlink_target(full);
+        } elif knd == "dir" {
+            acc[rel] = "dir";
+            _snapshot_tree(full, rel, acc);
+        } elif knd == "file" {
+            acc[rel] = "file:" + sha256(bytes_to_str(fs_read_bytes(full)));
+        } else {
+            acc[rel] = "special";
+        }
+        i = i + 1;
+    }
+}
+
+fn _trees_equal(a, b) {
+    let ak = array_sort(map_keys(a));
+    let bk = array_sort(map_keys(b));
+    if ak != bk { return false; }
+    let i = 0;
+    while i < len(ak) {
+        let k = ak[i];
+        if a[k] != b[k] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _u64_be(value) {
+    let out = [0, 0, 0, 0, 0, 0, 0, 0];
+    let v = value;
+    let i = 7;
+    while i >= 0 {
+        out[i] = v % 256;
+        v = num_floor(v / 256);
+        i = i - 1;
+    }
+    return out;
+}
+
+fn _collect_rel(cur_dir, rel_prefix, acc) {
+    let entries = try fs_listdir(cur_dir) catch nil;
+    if entries == nil { return; }
+    let i = 0;
+    while i < len(entries) {
+        let nm = entries[i];
+        let full = cur_dir + "/" + nm;
+        let rel = if rel_prefix == "" { nm } else { rel_prefix + "/" + nm };
+        let sub = try fs_listdir(full) catch nil;
+        if sub != nil {
+            acc[rel] = map{ kind: "d", bytes: [] };
+            _collect_rel(full, rel, acc);
+        } else {
+            acc[rel] = map{ kind: "f", bytes: fs_read_bytes(full) };
+        }
+        i = i + 1;
+    }
+}
+
+fn _tree_digest(root) {
+    let acc = map{};
+    _collect_rel(root, "", acc);
+    let keys = array_sort(map_keys(acc));
+    let h = SHA256.new();
+    SHA256.update(h, str_to_bytes("pblang-package-tree-v2"));
+    SHA256.update(h, [0]);
+    let i = 0;
+    while i < len(keys) {
+        let rel = keys[i];
+        let item = acc[rel];
+        let rel_b = str_to_bytes(rel);
+        SHA256.update(h, str_to_bytes(item.kind));
+        SHA256.update(h, _u64_be(len(rel_b)));
+        SHA256.update(h, rel_b);
+        SHA256.update(h, _u64_be(len(item.bytes)));
+        SHA256.update(h, item.bytes);
+        i = i + 1;
+    }
+    return SHA256.finish(h);
+}
+
+fn _make_fixtures(libc, root, dependency) {
+    let _m0 = ffi_call_typed(libc, "mkdir", "i32(cstr,i32)", [root, 448]);
+    fs_mkdirs(root + "/src");
+    fs_mkdirs(root + "/assets/empty-dir");
+    fs_write_bytes(root + "/assets/empty.bin", []);
+    fs_write_bytes(root + "/assets/payload.bin", [0, 255, 128, 7]);
+    fs_write(root + "/assets/message.txt", "portable fixture\n");
+    fs_write(root + "/.private", "not-for-the-package");
+
+    let manifest = "[package]\nname=\"package-fixture\"\nversion=\"1.0.0\"\nentry=\"src/main.sapp\"\n";
+    let src_body = "let value=42;\n";
+    if dependency {
+        fs_mkdirs(root + "/dep/nested");
+        fs_mkdirs(root + "/dep/empty");
+        fs_write(root + "/dep/nested/value.sapp", "let value=42;export value;\n");
+        fs_write_bytes(root + "/dep/binary.dat", [0, 255, 128]);
+        manifest = manifest + "[dependencies]\ncalc={path=\"dep\"}\n";
+        src_body = "let d=import(\"calc:nested/value.sapp\");let value=d.value;\n";
+    }
+    fs_write(root + "/pblang.toml", manifest);
+    fs_write(root + "/src/main.sapp", src_body + "print \"packaged: \"+str(value);\n");
+    if dependency {
+        let lock_txt = "manifest_sha256 = \"" + sha256(manifest) + "\"\n"
+            + "content_hash_algorithm = \"pblang-package-tree-v2\"\n\n"
+            + "[dependencies.calc]\n"
+            + "path = \"" + root + "/dep\"\n"
+            + "sha256 = \"" + _tree_digest(root + "/dep") + "\"\n";
+        fs_write(root + "/pblang.lock", lock_txt);
+    }
+}
+
+fn _make_over_1mb_string() {
+    let s = "x";
+    let i = 0;
+    while i < 20 {
+        s = s + s;
+        i = i + 1;
+    }
+    return s + "x";
+}
+
+fn _last_json_object(stdout_txt) {
+    let lines = str_split(stdout_txt, "\n");
+    let last_line = "";
+    let i = 0;
+    while i < len(lines) {
+        let ln = str_trim(lines[i]);
+        if str_starts_with(ln, "{") {
+            last_line = ln;
+        }
+        i = i + 1;
+    }
+    if last_line == "" { return nil; }
+    return try json_parse(last_line) catch nil;
+}
+
+fn main() {
+    let raw_args = os_args();
+    let runtime_arg = "";
+    let repo_arg = "";
+    let report_arg = "";
+    let idx = 0;
+    while idx < len(raw_args) {
+        let a = raw_args[idx];
+        if a == "--runtime" and idx + 1 < len(raw_args) {
+            runtime_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--repo" and idx + 1 < len(raw_args) {
+            repo_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--report" and idx + 1 < len(raw_args) {
+            report_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        }
+        idx = idx + 1;
+    }
+
+    let repo = if repo_arg != "" { repo_arg } else { cwd() };
+    let binary = if runtime_arg != "" {
+        runtime_arg
+    } elif fs_exists(repo + "/target/release/pblang") {
+        repo + "/target/release/pblang"
+    } else {
+        repo + "/pblang"
+    };
+    assert(fs_exists(binary), "package_folder: runtime binary missing");
+    let binary_sha = sha256(bytes_to_str(fs_read_bytes(binary)));
+
+    let libc_path = _find_libc();
+    let libc = ffi_load(libc_path);
+    let bwrap_bin = if fs_exists("/usr/bin/bwrap") {
+        "/usr/bin/bwrap"
+    } elif fs_exists("/bin/bwrap") {
+        "/bin/bwrap"
+    } else {
+        ""
+    };
+
+    let base = "/tmp/pblang_tooling_s1_pkgfolder_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(base).ok, "create private base");
+
+    let rows = [];
+    let record_row = fn(label, passed, detail) {
+        let row = map{ label: label, passed: passed, detail: detail };
+        array_push(rows, row);
+        if report_arg != "" {
+            fs_write(report_arg, json_stringify(rows) + "\n");
+        }
+        if not passed {
+            print "FAIL_PACKAGE_FOLDER: " + label + " -> " + json_stringify(detail);
+            _rm_tree_libc(libc, base);
+        }
+        assert(passed, "package_folder check failed: " + label);
+    };
+
+    // 1. Installed tool fixture (with fresh lock)
+    let installed = base + "/installed";
+    fs_mkdirs(installed + "/tools");
+    _copy_tree(repo + "/stdlib", installed + "/stdlib");
+    fs_write(installed + "/tools/pbpackage.sapp", fs_read(repo + "/tools/pbpackage.sapp"));
+    fs_write(installed + "/main.sapp", "print \"fixture\";");
+    fs_write(installed + "/pblang.toml",
+        "[package]\nname=\"installed-package-tool\"\nversion=\"1.0.0\"\nentry=\"main.sapp\"\n"
+        + "[dependencies]\nstdlib={path=\"" + installed + "/stdlib\"}\n");
+
+    let _ch0 = ffi_call_typed(libc, "chdir", "i32(cstr)", [installed]);
+    let built = proc_spawn_wait(binary, ["build", installed]);
+    let _ch_back0 = ffi_call_typed(libc, "chdir", "i32(cstr)", [repo]);
+    record_row("installed tool fixture", built.exit_code == 0, map{ exit_code: built.exit_code, stderr: built.stderr });
+
+    // Prepare deterministic competing-runtime fixture exercising O_EXCL runtime publication failure
+    let installed_compete = base + "/installed_compete";
+    fs_mkdirs(installed_compete + "/tools");
+    _copy_tree(repo + "/stdlib", installed_compete + "/stdlib");
+    let orig_pkg_mod = fs_read(repo + "/stdlib/package_folder.sapp");
+    let target_pub_line = "let copied=Dir.copy_held_range_new_atomic(runtime_fs,held,dest,\"pblang\",0,held.size,false,true);";
+    assert(str_contains(orig_pkg_mod, target_pub_line), "package_folder.sapp expected runtime copy anchor");
+    let compete_pkg_mod = str_replace_all(
+        orig_pkg_mod,
+        target_pub_line,
+        "let _comp=Dir.write_new_atomic(dest,\"pblang\",str_to_bytes(\"competing output preserved\"),false);\n    " + target_pub_line
+    );
+    fs_write(installed_compete + "/stdlib/package_folder.sapp", compete_pkg_mod);
+    fs_write(installed_compete + "/tools/pbpackage.sapp", fs_read(repo + "/tools/pbpackage.sapp"));
+    fs_write(installed_compete + "/main.sapp", "print \"fixture\";");
+    fs_write(installed_compete + "/pblang.toml",
+        "[package]\nname=\"installed-compete-tool\"\nversion=\"1.0.0\"\nentry=\"main.sapp\"\n"
+        + "[dependencies]\nstdlib={path=\"" + installed_compete + "/stdlib\"}\n");
+    let _ch_c = ffi_call_typed(libc, "chdir", "i32(cstr)", [installed_compete]);
+    let built_c = proc_spawn_wait(binary, ["build", installed_compete]);
+    let _ch_back_c = ffi_call_typed(libc, "chdir", "i32(cstr)", [repo]);
+    record_row("installed competing fixture", built_c.exit_code == 0, map{ exit_code: built_c.exit_code });
+
+    let run_case = fn(label, source_arg, mutate_fn, expected_code, dependency, extra_flags, compete_mode, execute_pkg, mount_alias) {
+        let root = base + "/" + label;
+        let _mk_r = ffi_call_typed(libc, "mkdir", "i32(cstr,i32)", [root, 448]);
+        let source_dir = root + "/source";
+        _make_fixtures(libc, source_dir, dependency);
+        let output_dir = root + "/bundle";
+        let rt_path = binary;
+
+        if mutate_fn != nil {
+            let mut_res = mutate_fn(source_dir, output_dir, root);
+            if type(mut_res) == "map" {
+                if map_has(mut_res, "output") { output_dir = mut_res.output; }
+                if map_has(mut_res, "runtime") { rt_path = mut_res.runtime; }
+            }
+        }
+        if mount_alias {
+            let _c_s = ffi_call_typed(libc, "chmod", "i32(cstr,i32)", [source_dir, 448]);
+            let _mk_a = ffi_call_typed(libc, "mkdir", "i32(cstr,i32)", [root + "/alias", 448]);
+            output_dir = root + "/alias/out";
+        }
+
+        let before_src = map{};
+        _snapshot_tree(source_dir, "", before_src);
+
+        let had_existing_dir = _file_kind(output_dir) == "dir";
+        let existing_snap = map{};
+        if had_existing_dir {
+            _snapshot_tree(output_dir, "", existing_snap);
+        }
+
+        let arg_src = if source_arg == "dot" {
+            "."
+        } elif source_arg == "nested" {
+            "./src/.."
+        } else {
+            source_dir
+        };
+
+        let tool_script = if compete_mode {
+            installed_compete + "/tools/pbpackage.sapp"
+        } else {
+            installed + "/tools/pbpackage.sapp"
+        };
+
+        let pb_args = ["run", tool_script, "--allow-all"];
+        let fi = 0;
+        while fi < len(extra_flags) {
+            array_push(pb_args, extra_flags[fi]);
+            fi = fi + 1;
+        }
+        array_push(pb_args, "--");
+        array_push(pb_args, arg_src);
+        array_push(pb_args, output_dir);
+        array_push(pb_args, "--runtime");
+        array_push(pb_args, rt_path);
+
+        let proc = nil;
+        if mount_alias and bwrap_bin != "" {
+            let bw_args = [
+                "--unshare-all", "--die-with-parent",
+                "--ro-bind", "/usr", "/usr",
+                "--ro-bind", "/bin", "/bin",
+                "--ro-bind", "/lib", "/lib",
+                "--ro-bind", "/lib64", "/lib64",
+                "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+                "--ro-bind", binary, binary,
+                "--bind", base, base,
+                "--bind", source_dir, root + "/alias",
+                "--chdir", source_dir,
+                binary
+            ];
+            let bi = 0;
+            while bi < len(pb_args) {
+                array_push(bw_args, pb_args[bi]);
+                bi = bi + 1;
+            }
+            proc = proc_spawn_wait(bwrap_bin, bw_args);
+        } else {
+            let _ch_s = ffi_call_typed(libc, "chdir", "i32(cstr)", [source_dir]);
+            proc = proc_spawn_wait(binary, pb_args);
+            let _ch_r = ffi_call_typed(libc, "chdir", "i32(cstr)", [repo]);
+        }
+
+        let res_obj = _last_json_object(proc.stdout);
+        let after_src = map{};
+        _snapshot_tree(source_dir, "", after_src);
+        let unchanged = _trees_equal(before_src, after_src);
+
+        if expected_code == "" {
+            let passed = proc.exit_code == 0
+                and res_obj != nil
+                and (try res_obj.ok catch false) == true
+                and (try res_obj.complete catch false) == true
+                and (try res_obj.owned_handles_closed catch false) == true
+                and unchanged;
+            record_row(label, passed, map{ exit_code: proc.exit_code, result: res_obj, stderr: proc.stderr });
+
+            assert(not fs_exists(output_dir + "/.private"), label + ": .private excluded");
+            let out_snap = map{};
+            _snapshot_tree(output_dir, "", out_snap);
+            let bkeys = map_keys(before_src);
+            let ki = 0;
+            while ki < len(bkeys) {
+                let k = bkeys[ki];
+                if not str_starts_with(k, ".") and k != "pblang.lock" {
+                    assert(map_has(out_snap, k) and out_snap[k] == before_src[k], label + ": output mismatch on " + k);
+                }
+                ki = ki + 1;
+            }
+            let out_bin_sha = sha256(bytes_to_str(fs_read_bytes(output_dir + "/pblang")));
+            assert(out_bin_sha == binary_sha, label + ": packaged runtime sha256 mismatch");
+            assert(_mode_octal(output_dir + "/pblang") == "700", label + ": packaged runtime mode must be 0700");
+            if dependency {
+                let out_lock = fs_read(output_dir + "/pblang.lock");
+                assert(not str_contains(out_lock, source_dir), label + ": lock must be portable without host source path");
+            }
+            if execute_pkg {
+                let run_res = nil;
+                if bwrap_bin != "" {
+                    run_res = proc_spawn_wait(bwrap_bin, [
+                        "--unshare-all", "--die-with-parent",
+                        "--ro-bind", "/usr", "/usr",
+                        "--ro-bind", "/bin", "/bin",
+                        "--ro-bind", "/lib", "/lib",
+                        "--ro-bind", "/lib64", "/lib64",
+                        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+                        "--ro-bind", output_dir, output_dir,
+                        "--chdir", output_dir,
+                        output_dir + "/pblang", "run", ".",
+                        "--deny-net", "--deny-http", "--deny-exec", "--deny-ffi"
+                    ]);
+                } else {
+                    let _ch_o = ffi_call_typed(libc, "chdir", "i32(cstr)", [output_dir]);
+                    run_res = proc_spawn_wait(output_dir + "/pblang", ["run", ".", "--deny-net", "--deny-http", "--deny-exec", "--deny-ffi"]);
+                    let _ch_o2 = ffi_call_typed(libc, "chdir", "i32(cstr)", [repo]);
+                }
+                record_row(
+                    label + " artifact source-hidden",
+                    run_res.exit_code == 0 and str_trim(run_res.stdout) == "packaged: 42",
+                    map{ exit_code: run_res.exit_code, stdout: run_res.stdout, stderr: run_res.stderr }
+                );
+            }
+        } else {
+            let passed = proc.exit_code != 0
+                and res_obj != nil
+                and (try res_obj.ok catch true) == false
+                and (try res_obj.code catch "") == expected_code
+                and unchanged;
+            if had_existing_dir {
+                let cur_out = map{};
+                _snapshot_tree(output_dir, "", cur_out);
+                passed = passed and _trees_equal(cur_out, existing_snap);
+            }
+            if compete_mode {
+                let preserved = fs_exists(output_dir + "/pblang")
+                    and bytes_to_str(fs_read_bytes(output_dir + "/pblang")) == "competing output preserved";
+                passed = passed and preserved and (try res_obj.partial_output_possible catch false) == true;
+            }
+            record_row(label, passed, map{ exit_code: proc.exit_code, result: res_obj, stderr: proc.stderr });
+        }
+    };
+
+    // Positive journeys
+    run_case("relative", "dot", nil, "", false, [], false, true, false);
+    run_case("absolute", "absolute", nil, "", false, [], false, true, false);
+    run_case("nested-relative", "nested", nil, "", false, [], false, true, false);
+    run_case("portable-local-dependency", "absolute", nil, "", true, [], false, true, false);
+    run_case("source-not-executed", "absolute", fn(s, _o, _r) {
+        fs_write(s + "/src/main.sapp", "throw \"must not execute while packaging\";");
+        return nil;
+    }, "", false, [], false, false, false);
+
+    // Overlap & existing output rejections
+    run_case("same-root", "absolute", fn(s, _o, _r) { return map{ output: s }; }, "overlap", false, [], false, true, false);
+    run_case("inside-source", "absolute", fn(s, _o, _r) { return map{ output: s + "/out" }; }, "overlap", false, [], false, true, false);
+    run_case("ancestor-source", "absolute", fn(_s, _o, r) { return map{ output: r }; }, "overlap", false, [], false, true, false);
+    run_case("existing-output", "absolute", fn(_s, o, _r) {
+        fs_mkdirs(o);
+        fs_write(o + "/sentinel", "preserve");
+        return nil;
+    }, "output_exists", false, [], false, true, false);
+    run_case("output-link", "absolute", fn(s, o, _r) {
+        let _sl = ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", [s, o]);
+        return nil;
+    }, "output_exists", false, [], false, true, false);
+    run_case("parent-link", "absolute", fn(s, _o, r) {
+        let _sl = ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", [s, r + "/alias"]);
+        return map{ output: r + "/alias/out" };
+    }, "root_unavailable", false, [], false, true, false);
+
+    // Special files & metadata rejections
+    run_case("source-link", "absolute", fn(s, _o, r) {
+        fs_write(r + "/external", "external");
+        let _sl = ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", [r + "/external", s + "/linked"]);
+        return nil;
+    }, "unsupported_entry", false, [], false, true, false);
+    run_case("source-fifo", "absolute", fn(s, _o, _r) {
+        let _ff = ffi_call_typed(libc, "mkfifo", "i32(cstr,i32)", [s + "/fifo", 384]);
+        return nil;
+    }, "unsupported_entry", false, [], false, true, false);
+    run_case("missing-entry", "absolute", fn(s, _o, _r) {
+        fs_remove(s + "/src/main.sapp");
+        return nil;
+    }, "entry_missing", false, [], false, true, false);
+    run_case("malformed-manifest", "absolute", fn(s, _o, _r) {
+        fs_write(s + "/pblang.toml", "[package\n");
+        return nil;
+    }, "invalid_metadata", false, [], false, true, false);
+    run_case("duplicate-manifest-key", "absolute", fn(s, _o, _r) {
+        fs_write(s + "/pblang.toml", "[package]\nname=\"a\"\nname=\"b\"\nversion=\"1.0.0\"\nentry=\"src/main.sapp\"\n");
+        return nil;
+    }, "invalid_metadata", false, [], false, true, false);
+    run_case("traversing-entry", "absolute", fn(s, _o, _r) {
+        fs_write(s + "/pblang.toml", "[package]\nname=\"a\"\nversion=\"1.0.0\"\nentry=\"../main.sapp\"\n");
+        return nil;
+    }, "invalid_relative_path", false, [], false, true, false);
+    run_case("nested-package-metadata", "absolute", fn(s, _o, _r) {
+        fs_write(s + "/assets/pblang.toml", "[package]\nname=\"nested\"\n");
+        return nil;
+    }, "nested_metadata", false, [], false, true, false);
+
+    let big_payload = _make_over_1mb_string();
+    run_case("source-file-limit", "absolute", fn(s, _o, _r) {
+        fs_write(s + "/large.bin", big_payload);
+        return nil;
+    }, "source_unavailable", false, [], false, true, false);
+
+    // Dependency & lock rejections
+    run_case("stale-dependency", "absolute", fn(s, _o, _r) {
+        fs_write(s + "/dep/nested/value.sapp", "let value=43;export value;");
+        return nil;
+    }, "dependency_hash", true, [], false, true, false);
+    run_case("missing-lock", "absolute", fn(s, _o, _r) {
+        fs_remove(s + "/pblang.lock");
+        return nil;
+    }, "lock_missing", true, [], false, true, false);
+    run_case("wrong-lock-path", "absolute", fn(s, _o, r) {
+        let lk = fs_read(s + "/pblang.lock");
+        fs_write(s + "/pblang.lock", str_replace_all(lk, s + "/dep", r + "/outside"));
+        return nil;
+    }, "lock_path", true, [], false, true, false);
+    run_case("duplicate-inline-dependency", "absolute", fn(s, _o, _r) {
+        let mf = fs_read(s + "/pblang.toml");
+        fs_write(s + "/pblang.toml", mf + "calc={path=\"dep\"}\n");
+        return nil;
+    }, "invalid_metadata", true, [], false, true, false);
+    run_case("remote-dependency", "absolute", fn(s, _o, _r) {
+        fs_write(s + "/pblang.toml", "[package]\nname=\"a\"\nversion=\"1.0.0\"\nentry=\"src/main.sapp\"\n[dependencies]\nx=\"1.0.0\"\n");
+        return nil;
+    }, "unsupported_dependency", false, [], false, true, false);
+
+    // Runtime & capability & mount & competing-runtime rejections
+    run_case("non-elf-runtime", "absolute", fn(_s, _o, r) {
+        let p = r + "/not-runtime";
+        fs_write(p, "not ELF");
+        return map{ runtime: p };
+    }, "runtime_format", false, [], false, true, false);
+    run_case("runtime-link", "absolute", fn(_s, _o, r) {
+        let p = r + "/linked-runtime";
+        let _sl = ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", [binary, p]);
+        return map{ runtime: p };
+    }, "runtime_unavailable", false, [], false, true, false);
+    run_case("missing-runtime", "absolute", fn(_s, _o, r) {
+        return map{ runtime: r + "/missing-runtime" };
+    }, "runtime_unavailable", false, [], false, true, false);
+    run_case("non-private-parent", "absolute", fn(_s, _o, r) {
+        let _chm = ffi_call_typed(libc, "chmod", "i32(cstr,i32)", [r, 493]);
+        return nil;
+    }, "root_unavailable", false, [], false, true, false);
+    run_case("no-ffi", "absolute", nil, "root_unavailable", false, ["--deny-ffi"], false, true, false);
+    run_case("no-exec", "absolute", nil, "identity_unavailable", false, ["--deny-exec"], false, true, false);
+    if bwrap_bin != "" {
+        run_case("bind-alias-parent", "absolute", nil, "mount_mismatch", false, [], false, true, true);
+    }
+    run_case("competing-runtime", "absolute", nil, "runtime_publication_failed", false, [], true, true, false);
+
+    _rm_tree_libc(libc, base);
+    assert(not fs_exists(base), "package_folder: temporary base directory must be cleaned up");
+    print "package_folder_pass: rows=" + str(len(rows));
+}
+
+main();

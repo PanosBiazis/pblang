@@ -12,29 +12,28 @@ host OS and architecture with working native graphics. The runtime is not
 included or downloaded. A Linux executable cannot launch on Windows or macOS.
 A legacy runtime may lack features required by the current source libraries.
 
-From the repository root, use the command for your platform (replace the sample
-runtime path with your installed executable):
+From the repository root, use the pure-PBLang launcher on Linux, macOS or Windows
+(replace the sample runtime path with your installed executable):
 
 ```sh
 # Linux
-sh examples/uno_r4_led_studio/platforms/desktop/launch.sh /opt/pblang/pblang
+/opt/pblang/pblang run examples/uno_r4_led_studio/platforms/desktop/launch.sapp --allow-all -- /opt/pblang/pblang
 # macOS, in Terminal
-sh examples/uno_r4_led_studio/platforms/desktop/launch.command /Applications/PBLang/pblang
+/Applications/PBLang/pblang run examples/uno_r4_led_studio/platforms/desktop/launch.sapp --allow-all -- /Applications/PBLang/pblang
 ```
 
 ```powershell
 # Windows, in PowerShell
-& .\examples\uno_r4_led_studio\platforms\desktop\launch.ps1 -Runtime 'C:\PBLang\pblang.exe'
+& 'C:\PBLang\pblang.exe' run examples/uno_r4_led_studio/platforms/desktop/launch.sapp --allow-all -- -Runtime 'C:\PBLang\pblang.exe'
 ```
 
-The shell launchers require an absolute executable path. PowerShell resolves the
-selected executable before changing directory. All launchers use the package
-root as the working directory, so relative imports and exports keep the same
-meaning even when launched from elsewhere. Paths with spaces are supported.
-The commands use the editor's existing `--allow-all` trusted-local-source profile;
-only run a package and executable you trust. Do not change system execution policy
-merely to launch the PowerShell file; where scripts are restricted, run the
-following directly from the package root:
+`launch.sapp` requires an absolute executable path and validates the complete
+source package (`stdlib/graphics.sapp` and `examples/uno_r4_led_studio/view.sapp`)
+before running `main.sapp` from the package root, so relative imports and exports
+keep the same meaning even when launched from elsewhere. Paths with spaces are
+supported. The command uses the editor's existing `--allow-all` trusted-local-source
+profile; only run a package and executable you trust. You can also run directly
+from the package root:
 
 ```powershell
 & 'C:\PBLang\pblang.exe' run examples/uno_r4_led_studio/platforms/desktop/main.sapp --allow-all

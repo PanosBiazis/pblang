@@ -1,0 +1,307 @@
+// Pure PBLang qualification runner for secure_file write_new_exclusive and
+// write_text_new_exclusive parent ownership, single-close verification,
+// exception propagation, caller uncertainty suppression, and Linux FD checks.
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _replace_once(source, needle, replacement) {
+    let parts = str_split(source, needle);
+    assert(len(parts) == 2, "expected exactly one occurrence of needle");
+    return parts[0] + replacement + parts[1];
+}
+
+fn _rm_rf(target) {
+    if not fs_exists(target) { return; }
+    let entries = try fs_listdir(target) catch nil;
+    if type(entries) == "array" {
+        for entry in entries {
+            _rm_rf(target + "/" + entry);
+        }
+    }
+    let _removed = try fs_remove(target) catch nil;
+}
+
+let raw_args = os_args();
+let baseline_dir = "";
+let baseline_file = "";
+let report_path = "";
+let idx = 0;
+while idx < len(raw_args) {
+    if raw_args[idx] == "--baseline" and idx + 1 < len(raw_args) {
+        baseline_dir = raw_args[idx + 1];
+    } elif raw_args[idx] == "--baseline-source" and idx + 1 < len(raw_args) {
+        baseline_file = raw_args[idx + 1];
+    } elif raw_args[idx] == "--report" and idx + 1 < len(raw_args) {
+        report_path = raw_args[idx + 1];
+    }
+    idx = idx + 1;
+}
+
+let repo_root = cwd();
+let stdlib_root = repo_root + "/stdlib/";
+let candidate_raw = fs_read(stdlib_root + "secure_file.sapp");
+let semantic_raw = fs_read(repo_root + "/tests/semantics/secure_file_exclusive_close_test.sapp");
+let baseline_raw = "";
+if baseline_file != "" {
+    baseline_raw = fs_read(baseline_file);
+} elif baseline_dir != "" {
+    baseline_raw = fs_read(baseline_dir + "/stdlib/secure_file.sapp");
+} else {
+    baseline_raw = _replace_once(
+        candidate_raw,
+        "let closed = _close(fs);\n    if type(closed) == \"bool\" and closed { return result; }",
+        "let _ignored_closed = _close(fs);\n    return result;"
+    );
+}
+
+let scratch = "/tmp/pblang_tooling_s2_exclusive_close_" + str(num_floor(now_ms()));
+assert(SECURE.create_private_temporary_directory_new(scratch).ok, "private temporary qualification directory created");
+assert(SECURE.create_private_directory_new(scratch + "/work").ok, "private work subdirectory created");
+
+let backend_src = "let state = map{};\n"
+    + "fn configure(success, closed) {\n"
+    + "    state.success = success; state.closed = closed;\n"
+    + "    state.opens = 0; state.writes = 0; state.closes = 0;\n"
+    + "    state.admit = true; state.backend_throw = false;\n"
+    + "    state.close_throw = false; state.object_error = false;\n"
+    + "    state.result = nil; state.bytes = nil; state.create = nil;\n"
+    + "}\n"
+    + "fn open(path, create = false, protect = false) {\n"
+    + "    let _p = path; let _c = create; let _pr = protect;\n"
+    + "    state.opens = state.opens + 1;\n"
+    + "    return if state.admit { map{ ok: true } } else { map{ ok: false, error: \"admission denied\" } };\n"
+    + "}\n"
+    + "fn open_absolute(path, create = false, protect = false) { return open(path, create, protect); }\n"
+    + "fn close(fs) {\n"
+    + "    let _f = fs;\n"
+    + "    state.closes = state.closes + 1;\n"
+    + "    if state.close_throw { throw \"synthetic-close-error\"; }\n"
+    + "    return state.closed;\n"
+    + "}\n"
+    + "fn write_new_exclusive(fs, name, bytes, create = false) {\n"
+    + "    let _f = fs; let _n = name;\n"
+    + "    state.writes = state.writes + 1; state.bytes = bytes; state.create = create;\n"
+    + "    if state.backend_throw { throw \"synthetic-backend-error\"; }\n"
+    + "    state.result = map{ ok: state.success, size: len(bytes), no_replace: true,\n"
+    + "        atomic_visibility: false, published: true, durability_verified: false,\n"
+    + "        extra: map{ value: 7, items: [1, 2] } };\n"
+    + "    if not state.success {\n"
+    + "        state.result.error = if state.object_error { map{ kind: \"synthetic\", code: 7 } } else { \"αρχικό σφάλμα\" };\n"
+    + "    }\n"
+    + "    return state.result;\n"
+    + "}\n"
+    + "export configure, state, open, open_absolute, close, write_new_exclusive;\n";
+
+fs_write(scratch + "/backend.sapp", backend_src);
+fs_write(scratch + "/semantic.sapp", semantic_raw);
+
+let cand_bound = str_replace_all(candidate_raw, "\"stdlib:", "\"" + stdlib_root);
+let base_bound = str_replace_all(baseline_raw, "\"stdlib:", "\"" + stdlib_root);
+
+let cand_model = _replace_once(
+    cand_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/cand_model.sapp", cand_model);
+
+let base_model = _replace_once(
+    base_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/base_model.sapp", base_model);
+
+let caller_adapter_src = "let S = import(\"" + scratch + "/cand_model.sapp\");\n"
+    + "let state = map{ removes: 0, atomic_writes: 0 };\n"
+    + "fn create_private_temporary_directory_new(path) { let _p = path; return map{ ok: true }; }\n"
+    + "fn write_text_new_exclusive(path, text, create = true, private_parent = false) {\n"
+    + "    let _p = path; let _c = create; let _pr = private_parent;\n"
+    + "    return S.write_text_new_exclusive(\"owned/value\", text, false, false);\n"
+    + "}\n"
+    + "fn remove(path, private_parent = false) {\n"
+    + "    let _p = path; let _pr = private_parent;\n"
+    + "    state.removes = state.removes + 1; return map{ ok: true };\n"
+    + "}\n"
+    + "fn write_text_atomic(path, text, create = true, private_parent = false) {\n"
+    + "    let _p = path; let _t = text; let _c = create; let _pr = private_parent;\n"
+    + "    state.atomic_writes = state.atomic_writes + 1; return map{ ok: true };\n"
+    + "}\n"
+    + "export state, create_private_temporary_directory_new, write_text_new_exclusive, remove, write_text_atomic;\n";
+fs_write(scratch + "/caller_adapter.sapp", caller_adapter_src);
+
+let web_raw = fs_read(stdlib_root + "polyglot_web.sapp");
+let web_bound = str_replace_all(web_raw, "\"stdlib:", "\"" + stdlib_root);
+let web_caller = _replace_once(
+    web_bound,
+    "let SECURE_FILE = import(\"" + stdlib_root + "secure_file.sapp\");",
+    "let SECURE_FILE = import(\"" + scratch + "/caller_adapter.sapp\");"
+);
+fs_write(scratch + "/web_caller.sapp", web_caller);
+
+let build_raw = fs_read(stdlib_root + "polyglot_build.sapp");
+let build_bound = str_replace_all(build_raw, "\"stdlib:", "\"" + stdlib_root);
+let build_caller = _replace_once(
+    build_bound,
+    "let SECURE_FILE = import(\"" + stdlib_root + "secure_file.sapp\");",
+    "let SECURE_FILE = import(\"" + scratch + "/caller_adapter.sapp\");"
+);
+fs_write(scratch + "/build_caller.sapp", build_caller);
+
+let cand_close_false = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); return false; }"
+);
+fs_write(scratch + "/cand_close_false.sapp", cand_close_false);
+
+let cand_close_throw = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); throw \"synthetic-close-error\"; }"
+);
+fs_write(scratch + "/cand_close_throw.sapp", cand_close_throw);
+
+let B = import(scratch + "/backend.sapp");
+let SEM = import(scratch + "/semantic.sapp");
+let S_CAND_MODEL = import(scratch + "/cand_model.sapp");
+let S_BASE_MODEL = import(scratch + "/base_model.sapp");
+let ADAPTER = import(scratch + "/caller_adapter.sapp");
+let WEB_CALLER = import(scratch + "/web_caller.sapp");
+let BUILD_CALLER = import(scratch + "/build_caller.sapp");
+let S_CLOSE_FALSE = import(scratch + "/cand_close_false.sapp");
+let S_CLOSE_THROW = import(scratch + "/cand_close_throw.sapp");
+
+let rows = [];
+
+// Group 1: Candidate modeled matrix (16 matrix cases + 5 additional cases)
+let m_res = SEM.run(S_CAND_MODEL, B, false);
+assert(m_res.ok and m_res.matrix_cases == 16 and m_res.additional_cases == 5, "candidate modeled matrix passed");
+array_push(rows, map{ label: "candidate_modeled_matrix", passed: true, result: m_res });
+
+// Group 2: Baseline source rejected by strict candidate ownership contract, accepted in baseline mode
+let base_rejected = false;
+try {
+    let _br = SEM.run(S_BASE_MODEL, B, false);
+} catch {
+    base_rejected = true;
+}
+assert(base_rejected, "baseline source rejected by candidate exclusive-close contract");
+let base_legacy = SEM.run(S_BASE_MODEL, B, true);
+assert(base_legacy.ok and base_legacy.matrix_cases == 16, "baseline legacy mode matches");
+array_push(rows, map{ label: "baseline_contract_contrast", passed: true, rejected_strict: base_rejected });
+
+// Group 3: Exception propagation on backend_throw and close_throw
+for api in ["bytes", "text"] {
+    for mode in ["backend", "close-success", "close-failure"] {
+        B.configure(mode != "close-failure", true);
+        if mode == "backend" { B.state.backend_throw = true; }
+        else { B.state.close_throw = true; }
+        let threw = false;
+        try {
+            if api == "bytes" {
+                let _r = S_CAND_MODEL.write_new_exclusive("owned/value", [65], false, false);
+            } else {
+                let _r = S_CAND_MODEL.write_text_new_exclusive("owned/value", "A", false, false);
+            }
+        } catch {
+            threw = true;
+        }
+        assert(threw, "exception propagated for " + api + "/" + mode);
+        if mode == "backend" {
+            assert(B.state.writes == 1 and B.state.closes == 0, "backend throw leaves 1 write and 0 closes");
+        } else {
+            assert(B.state.writes == 1 and B.state.closes == 1, "close throw leaves 1 write and 1 close");
+        }
+    }
+}
+array_push(rows, map{ label: "exception_propagation_matrix", passed: true, cases: 6 });
+
+// Group 4: Public callers (polyglot_web.bundle and polyglot_build.build_language) never retry on uncertain cleanup
+for success_flag in [true, false] {
+    B.configure(success_flag, false);
+    ADAPTER.state.removes = 0;
+    ADAPTER.state.atomic_writes = 0;
+    let web_failed = false;
+    try {
+        let _p = WEB_CALLER.bundle("synthetic", "", "");
+    } catch {
+        web_failed = true;
+    }
+    assert(web_failed and B.state.writes == 1 and B.state.closes == 1
+        and ADAPTER.state.removes == 0 and ADAPTER.state.atomic_writes == 0,
+        "polyglot_web stops immediately on uncertain cleanup");
+
+    B.configure(success_flag, false);
+    ADAPTER.state.removes = 0;
+    ADAPTER.state.atomic_writes = 0;
+    let auth = map{
+        unsafe_polyglot: true,
+        trusted_source: true,
+        allow_toolchain_effects: true,
+        unsafe_polyglot_sha256: SHA256.sha256_hex_bytes(str_to_bytes("synthetic"))
+    };
+    let build_failed = false;
+    try {
+        let _b = BUILD_CALLER.build_language("python", "sample", "synthetic", "/tmp", auth);
+    } catch {
+        build_failed = true;
+    }
+    assert(build_failed and B.state.writes == 1 and B.state.closes == 1
+        and ADAPTER.state.removes == 0 and ADAPTER.state.atomic_writes == 0,
+        "polyglot_build stops immediately on uncertain cleanup");
+}
+array_push(rows, map{ label: "caller_uncertain_cleanup_no_retry", passed: true, cases: 4 });
+
+// Group 5: Real Linux exclusive creates, overwrite refusals, and zero FD delta
+let fd_before_real = len(fs_listdir("/proc/self/fd"));
+let existing_path = scratch + "/work/existing";
+assert(SECURE.write_text_atomic(existing_path, "KEEP", false, true).ok, "seed existing file");
+let out_text = scratch + "/work/new-text";
+let out_bytes = scratch + "/work/new-bytes";
+let a = SECURE.write_text_new_exclusive(out_text, "α", false, true);
+let b = SECURE.write_new_exclusive(out_bytes, [0, 127, 255], false, true);
+assert(a.ok and b.ok and not a.atomic_visibility and not b.atomic_visibility, "real exclusive creates");
+assert(SECURE.read_bytes(out_text, 8, true).bytes == [206, 177], "exact UTF-8 bytes written");
+assert(SECURE.read_bytes(out_bytes, 8, true).bytes == [0, 127, 255], "exact raw bytes written");
+for blocked in [existing_path, out_text, scratch + "/work/missing_dir/file"] {
+    assert(not SECURE.write_text_new_exclusive(blocked, "replace", false, false).ok, "exclusive refusal");
+}
+assert(SECURE.read_text(existing_path, 8, true).text == "KEEP", "existing target preserved");
+let fd_delta_real = len(fs_listdir("/proc/self/fd")) - fd_before_real;
+assert(fd_delta_real == 0, "zero fd delta on real exclusive operations");
+array_push(rows, map{ label: "real_linux_exclusive_io", passed: true, fd_delta: fd_delta_real });
+
+// Group 6: Real close followed by false or throw reports uncertainty/error with zero FD leak
+let fd_before_proj = len(fs_listdir("/proc/self/fd"));
+let proj_false = S_CLOSE_FALSE.write_text_new_exclusive(scratch + "/work/proj-false.txt", "x", false, false);
+assert(not proj_false.ok and proj_false.cleanup_uncertain and not proj_false.parent_close_confirmed
+    and proj_false.write_backend_succeeded and proj_false.publication_may_have_occurred,
+    "real close false projection");
+let proj_threw = false;
+try {
+    let _pt = S_CLOSE_THROW.write_text_new_exclusive(scratch + "/work/proj-throw.txt", "y", false, false);
+} catch {
+    proj_threw = true;
+}
+assert(proj_threw, "real close throw propagates");
+let fd_delta_proj = len(fs_listdir("/proc/self/fd")) - fd_before_proj;
+assert(fd_delta_proj == 0, "zero fd delta on real close projection");
+array_push(rows, map{ label: "real_close_projection", passed: true, fd_delta: fd_delta_proj });
+
+let report = map{
+    passed: true,
+    runner: "tests/tooling/secure_file_exclusive_close_check.sapp",
+    language: "PBLang",
+    source_sha256: SHA256.sha256_hex(candidate_raw),
+    baseline_sha256: SHA256.sha256_hex(baseline_raw),
+    semantic_sha256: SHA256.sha256_hex(semantic_raw),
+    groups_passed: len(rows),
+    rows: rows
+};
+if report_path != "" {
+    fs_write(report_path, json_stringify(report) + "\n");
+}
+_rm_rf(scratch);
+assert(not fs_exists(scratch), "scratch cleaned up");
+print json_stringify(report);

@@ -109,7 +109,7 @@ static bool bi_fs_write(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (!zr_check_taint_sink(vm, argv[1], "fs_write")) return false;
     const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
     PbStr *content = (PbStr *)val_as_obj(argv[1]);
-    FILE *fp = zr_fopen(path, "wb");
+    FILE *fp = fopen(path, "wb");
     if (!fp) { vm_raise(vm, "fs_write('%s'): %s", path, strerror(errno)); return false; }
     if (content->len > 0 && fwrite(content->chars, 1, content->len, fp) != content->len) {
         fclose(fp);
@@ -132,7 +132,7 @@ static bool bi_fs_write_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
     if (val_is_obj(argv[1], OBJ_BYTES)) {
         PbBytes *b = (PbBytes *)val_as_obj(argv[1]);
-        FILE *fp = zr_fopen(path, "wb");
+        FILE *fp = fopen(path, "wb");
         if (!fp) { vm_raise(vm, "fs_write_bytes('%s'): %s", path, strerror(errno)); return false; }
         if (b->len > 0 && fwrite(b->data, 1, b->len, fp) != b->len) {
             fclose(fp);
@@ -147,17 +147,14 @@ static bool bi_fs_write_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     uint8_t *buf = (uint8_t *)zr_xmalloc(arr->len > 0 ? arr->len : 1);
     for (size_t i = 0; i < arr->len; i++) {
         PbValue v = arr->items[i];
-        int64_t bv = -1;
-        if (v.tag == VAL_I64) bv = v.as.i64;
-        else if (v.tag == VAL_NUM && isfinite(v.u.num)) bv = (int64_t)v.u.num;
-        if (bv < 0 || bv > 255) {
+        if (v.tag != VAL_NUM || !isfinite(v.u.num) || v.u.num < 0.0 || v.u.num > 255.0) {
             free(buf);
             vm_raise(vm, "fs_write_bytes(): byte values must be numbers 0..255");
             return false;
         }
-        buf[i] = (uint8_t)bv;
+        buf[i] = (uint8_t)v.u.num;
     }
-    FILE *fp = zr_fopen(path, "wb");
+    FILE *fp = fopen(path, "wb");
     if (!fp) { free(buf); vm_raise(vm, "fs_write_bytes('%s'): %s", path, strerror(errno)); return false; }
     if (arr->len > 0 && fwrite(buf, 1, arr->len, fp) != arr->len) {
         free(buf);
@@ -180,7 +177,7 @@ static bool bi_fs_append(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (!zr_check_taint_sink(vm, argv[1], "fs_append")) return false;
     const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
     PbStr *content = (PbStr *)val_as_obj(argv[1]);
-    FILE *fp = zr_fopen(path, "ab");
+    FILE *fp = fopen(path, "ab");
     if (!fp) { vm_raise(vm, "fs_append('%s'): %s", path, strerror(errno)); return false; }
     if (content->len > 0 && fwrite(content->chars, 1, content->len, fp) != content->len) {
         fclose(fp);
@@ -197,9 +194,7 @@ static bool bi_fs_exists(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc != 1 || !val_is_obj(argv[0], OBJ_STR)) { vm_raise(vm, "fs_exists() expects 1 path string"); return false; }
     const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
 #if defined(_WIN32)
-    wchar_t *wp = zr_win_utf8_to_wide(path, true);
-    DWORD attr = wp ? GetFileAttributesW(wp) : INVALID_FILE_ATTRIBUTES;
-    free(wp);
+    DWORD attr = GetFileAttributesA(path);
     *out = val_bool(attr != INVALID_FILE_ATTRIBUTES);
 #else
     struct stat st;
@@ -210,42 +205,23 @@ static bool bi_fs_exists(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 
 static bool zr_remove_recursive(const char *path) {
 #if defined(_WIN32)
-    wchar_t *wp = zr_win_utf8_to_wide(path, true);
-    if (!wp) return false;
-    DWORD attr = GetFileAttributesW(wp);
-    if (attr == INVALID_FILE_ATTRIBUTES) { free(wp); return false; }
-    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-        BOOL ok = DeleteFileW(wp);
-        free(wp);
-        return ok != 0;
-    }
-    size_t plen = strlen(path);
-    char *pat_u8 = (char *)zr_xmalloc(plen + 4);
-    memcpy(pat_u8, path, plen);
-    memcpy(pat_u8 + plen, "\\*", 3);
-    wchar_t *wpat = zr_win_utf8_to_wide(pat_u8, true);
-    free(pat_u8);
-    WIN32_FIND_DATAW fd;
-    HANDLE h = wpat ? FindFirstFileW(wpat, &fd) : INVALID_HANDLE_VALUE;
-    free(wpat);
+    DWORD attr = GetFileAttributesA(path);
+    if (attr == INVALID_FILE_ATTRIBUTES) return false;
+    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) return DeleteFileA(path) != 0;
+    char pat[4096];
+    snprintf(pat, sizeof(pat), "%s\\*", path);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
-            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-            char *name_u8 = zr_win_wide_to_utf8(fd.cFileName);
-            if (name_u8) {
-                size_t nlen = strlen(name_u8);
-                char *sub = (char *)zr_xmalloc(plen + nlen + 4);
-                snprintf(sub, plen + nlen + 4, "%s\\%s", path, name_u8);
-                zr_remove_recursive(sub);
-                free(sub);
-                free(name_u8);
-            }
-        } while (FindNextFileW(h, &fd));
+            if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+            char sub[4096];
+            snprintf(sub, sizeof(sub), "%s\\%s", path, fd.cFileName);
+            zr_remove_recursive(sub);
+        } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
-    BOOL ok = RemoveDirectoryW(wp);
-    free(wp);
-    return ok != 0;
+    return RemoveDirectoryA(path) != 0;
 #else
     struct stat st;
     if (lstat(path, &st) != 0) return false;
@@ -285,12 +261,7 @@ static bool bi_fs_rename(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     const char *src = ((PbStr *)val_as_obj(argv[0]))->chars;
     const char *dst = ((PbStr *)val_as_obj(argv[1]))->chars;
 #if defined(_WIN32)
-    wchar_t *wsrc = zr_win_utf8_to_wide(src, true);
-    wchar_t *wdst = zr_win_utf8_to_wide(dst, true);
-    BOOL ok = (wsrc && wdst) ? MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING) : FALSE;
-    free(wsrc);
-    free(wdst);
-    if (!ok) {
+    if (!MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING)) {
         vm_raise(vm, "fs_rename('%s', '%s') failed", src, dst);
         return false;
     }
@@ -317,7 +288,7 @@ static bool bi_fs_copy(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         vm_raise(vm, "fs_copy(): cannot read '%s': %s", src, strerror(errno));
         return false;
     }
-    FILE *fp = zr_fopen(dst, "wb");
+    FILE *fp = fopen(dst, "wb");
     if (!fp) { free(buf); vm_raise(vm, "fs_copy(): cannot open '%s': %s", dst, strerror(errno)); return false; }
     if (len > 0 && fwrite(buf, 1, len, fp) != len) {
         free(buf); fclose(fp);
@@ -356,28 +327,19 @@ static bool bi_fs_listdir(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     PbArray *arr = vm_new_array(vm, 16);
     vm_temp_push(vm, val_obj(arr));
 #if defined(_WIN32)
-    size_t plen = strlen(path);
-    char *pat_u8 = (char *)zr_xmalloc(plen + 4);
-    memcpy(pat_u8, path, plen);
-    memcpy(pat_u8 + plen, "\\*", 3);
-    wchar_t *wpat = zr_win_utf8_to_wide(pat_u8, true);
-    free(pat_u8);
-    WIN32_FIND_DATAW fd;
-    HANDLE h = wpat ? FindFirstFileW(wpat, &fd) : INVALID_HANDLE_VALUE;
-    free(wpat);
+    char pat[4096];
+    snprintf(pat, sizeof(pat), "%s\\*", path);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) {
         vm_temp_pop(vm, 1);
         vm_raise(vm, "fs_listdir('%s'): directory not found", path);
         return false;
     }
     do {
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        char *name_u8 = zr_win_wide_to_utf8(fd.cFileName);
-        if (name_u8) {
-            arr_push(arr, val_obj(vm_new_cstr(vm, name_u8)));
-            free(name_u8);
-        }
-    } while (FindNextFileW(h, &fd));
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        arr_push(arr, val_obj(vm_new_cstr(vm, fd.cFileName)));
+    } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
     DIR *d = opendir(path);
@@ -449,23 +411,14 @@ static bool bi_cwd(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     (void)argv;
     if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "cwd", "fs")) return false;
     if (argc != 0) { vm_raise(vm, "cwd() takes no arguments"); return false; }
-#if defined(_WIN32)
-    DWORD wlen = GetCurrentDirectoryW(0, NULL);
-    if (wlen == 0) { vm_raise(vm, "cwd() failed"); return false; }
-    wchar_t *wbuf = (wchar_t *)zr_xmalloc(((size_t)wlen + 2) * sizeof(wchar_t));
-    GetCurrentDirectoryW(wlen + 1, wbuf);
-    char *u8 = zr_win_wide_to_utf8(wbuf);
-    free(wbuf);
-    if (!u8) { vm_raise(vm, "cwd() UTF-8 conversion failed"); return false; }
-    *out = val_obj(vm_new_cstr(vm, u8));
-    free(u8);
-    return true;
-#else
     char buf[4096];
+#if defined(_WIN32)
+    if (!_getcwd(buf, sizeof(buf))) { vm_raise(vm, "cwd() failed"); return false; }
+#else
     if (!getcwd(buf, sizeof(buf))) { vm_raise(vm, "cwd(): %s", strerror(errno)); return false; }
+#endif
     *out = val_obj(vm_new_cstr(vm, buf));
     return true;
-#endif
 }
 
 /* ---- Environment, CLI Args, Signals, Time & OS ---- */
@@ -478,23 +431,12 @@ static bool bi_env_get(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         if (!zr_flight_replay_next(vm, "env_get", &ev)) return false;
         *out = ev->is_nil ? val_nil() : val_obj(vm_new_str(vm, ev->str_val ? ev->str_val : "", ev->str_len));
     } else {
-#if defined(_WIN32)
-        wchar_t *wk = zr_win_utf8_to_wide(key, false);
-        const wchar_t *wv = wk ? _wgetenv(wk) : NULL;
-        char *v_owned = wv ? zr_win_wide_to_utf8(wv) : NULL;
-        free(wk);
-        const char *v = v_owned;
-#else
         const char *v = getenv(key);
-#endif
         if (vm->flight_recording) {
             if (v) zr_flight_record_str(vm, "env_get", "str", v, strlen(v));
             else zr_flight_record_nil(vm, "env_get");
         }
         *out = v ? val_obj(vm_new_cstr(vm, v)) : val_nil();
-#if defined(_WIN32)
-        free(v_owned);
-#endif
     }
     if (out->tag == VAL_OBJ && vm->taint_guard_enabled && zr_env_name_is_sensitive(key)) {
         *out = val_with_taint(*out, TAINT_SECRET);
@@ -511,11 +453,7 @@ static bool bi_env_set(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     const char *k = ((PbStr *)val_as_obj(argv[0]))->chars;
     const char *v = ((PbStr *)val_as_obj(argv[1]))->chars;
 #if defined(_WIN32)
-    wchar_t *wk = zr_win_utf8_to_wide(k, false);
-    wchar_t *wv = zr_win_utf8_to_wide(v, false);
-    if (wk && wv) _wputenv_s(wk, wv);
-    free(wk);
-    free(wv);
+    _putenv_s(k, v);
 #else
     setenv(k, v, 1);
 #endif
@@ -810,16 +748,13 @@ static bool bi_exec(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         }
     }
 #if defined(_WIN32)
-    STARTUPINFOW si; PROCESS_INFORMATION pi;
+    STARTUPINFOA si; PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
     memset(&pi, 0, sizeof(pi));
     char cmd_mut[1024];
     snprintf(cmd_mut, sizeof(cmd_mut), "\"%s\"", cmd);
-    wchar_t *wcmd = zr_win_utf8_to_wide(cmd_mut, false);
-    BOOL c_ok = wcmd ? CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi) : FALSE;
-    free(wcmd);
-    if (!c_ok) {
-        vm_raise(vm, "exec('%s'): CreateProcessW failed", cmd);
+    if (!CreateProcessA(NULL, cmd_mut, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        vm_raise(vm, "exec('%s'): CreateProcessA failed", cmd);
         return false;
     }
     WaitForSingleObject(pi.hProcess, INFINITE);
@@ -945,7 +880,7 @@ static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
     }
     zr_buf_push_u8(&cmdline, 0);
 
-    STARTUPINFOW si; PROCESS_INFORMATION pi;
+    STARTUPINFOA si; PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput = stdin_data ? in_r : GetStdHandle(STD_INPUT_HANDLE);
@@ -953,9 +888,7 @@ static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
     si.hStdError = err_w;
     memset(&pi, 0, sizeof(pi));
 
-    wchar_t *wcmdline = zr_win_utf8_to_wide((const char *)cmdline.data, false);
-    BOOL ok = wcmdline ? CreateProcessW(NULL, wcmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi) : FALSE;
-    free(wcmdline);
+    BOOL ok = CreateProcessA(NULL, (LPSTR)cmdline.data, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
     zr_buf_free(&cmdline);
     CloseHandle(out_w);
     CloseHandle(err_w);
@@ -964,7 +897,7 @@ static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
         if (in_w) CloseHandle(in_w);
         CloseHandle(out_r); CloseHandle(err_r);
         zr_buf_free(&out_b); zr_buf_free(&err_b);
-        vm_raise(vm, "proc_spawn_wait('%s'): CreateProcessW failed", prog);
+        vm_raise(vm, "proc_spawn_wait('%s'): CreateProcessA failed", prog);
         return false;
     }
     ZrPipeReaderArg pra_o = { out_r, &out_b }, pra_e = { err_r, &err_b };

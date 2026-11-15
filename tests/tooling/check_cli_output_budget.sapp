@@ -1,0 +1,222 @@
+// Finite real-process CLI output-budget regressions for stdlib/check_cli.sapp in pure PBLang.
+// Verifies 16 KiB stdout budget, single truncation marker, complete final counts, and non-execution.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _rm_rf(path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            _rm_rf(path + "/" + entries[i]);
+            i = i + 1;
+        }
+    }
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _repeat_char(ch, count) {
+    let s = ch;
+    while len(s) < count {
+        s = s + s;
+    }
+    return str_slice(s, 0, count);
+}
+
+fn _last_nonempty_line(text) {
+    let lines = str_split(text, "\n");
+    let i = len(lines) - 1;
+    while i >= 0 {
+        if lines[i] != "" { return lines[i]; }
+        i = i - 1;
+    }
+    return "";
+}
+
+fn _count_occurrences(haystack, needle) {
+    let parts = str_split(haystack, needle);
+    return len(parts) - 1;
+}
+
+fn main() {
+    let raw_args = os_args();
+    let release_arg = "";
+    let runtime_arg = "";
+    let report_arg = "";
+    let baseline = false;
+    let idx = 0;
+    while idx < len(raw_args) {
+        let a = raw_args[idx];
+        if a == "--release" and idx + 1 < len(raw_args) {
+            release_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--runtime" and idx + 1 < len(raw_args) {
+            runtime_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--report" and idx + 1 < len(raw_args) {
+            report_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--baseline" {
+            baseline = true;
+        }
+        idx = idx + 1;
+    }
+
+    let repo_root = cwd();
+    let binary = "";
+    let driver = "";
+    let has_public_route = false;
+    if release_arg != "" and fs_exists(release_arg + "/bin/pblang") {
+        binary = release_arg + "/bin/pblang";
+        driver = release_arg + "/stdlib/check_cli.sapp";
+        has_public_route = true;
+    } else {
+        binary = if runtime_arg != "" { runtime_arg } else { repo_root + "/pblang" };
+        driver = repo_root + "/stdlib/check_cli.sapp";
+    }
+    assert(fs_exists(binary) and fs_exists(driver), "check_cli_output_budget: missing binary or check_cli.sapp");
+
+    let scratch = "/tmp/pblang_tooling_s1_cli_budget_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(scratch).ok, "create private scratch");
+
+    let x700 = _repeat_char("x", 700);
+    let warn_lines = [];
+    let wi = 0;
+    while wi < 24 {
+        array_push(warn_lines, "let unused_" + str(wi) + x700 + "=1;");
+        wi = wi + 1;
+    }
+
+    let fixtures = map{
+        "valid.sapp": "let answer=42; print answer;",
+        "invalid.sapp": "let answer=;",
+        "warnings.sapp": str_join(warn_lines, "\n"),
+        "effect.sapp": "fs_write(\"" + scratch + "/UNEXPECTED\", \"SOURCE_EXECUTED\");",
+        "nested.sapp": "for _i 1 {let p=map{run:fn(self){return 7;}};print (try {p:run()} catch 9);}",
+        "lazy.sapp": "fn load(){return import(\"PRIVATE_CANARY\");} export load;"
+    };
+
+    let fkeys = array_sort(map_keys(fixtures));
+    let before = map{};
+    let fi = 0;
+    while fi < len(fkeys) {
+        let nm = fkeys[fi];
+        let txt = fixtures[nm];
+        fs_write(scratch + "/" + nm, txt);
+        before[nm] = SHA256.sha256_hex(txt);
+        fi = fi + 1;
+    }
+
+    let x225 = _repeat_char("x", 225);
+    let missing_batch = [];
+    let mi = 0;
+    while mi < 96 {
+        array_push(missing_batch, scratch + "/missing-" + str(mi) + x225 + ".sapp");
+        mi = mi + 1;
+    }
+
+    let cases = [
+        map{ name: "missing batch", args: missing_batch, status: 1, expected: "checked 96 file(s): 96 error(s), 0 warning(s)", exact: true, truncated: true },
+        map{ name: "late valid", args: [scratch + "/warnings.sapp", scratch + "/valid.sapp"], status: 0, expected: "checked 2 file(s): 0 error(s), 24 warning(s)", exact: true, truncated: true },
+        map{ name: "late invalid", args: [scratch + "/warnings.sapp", scratch + "/invalid.sapp"], status: 1, expected: "checked 2 file(s): 1 error(s), 25 warning(s)", exact: true, truncated: true },
+        map{ name: "small valid", args: [scratch + "/valid.sapp"], status: 0, expected: "0 error(s)", exact: false, truncated: false },
+        map{ name: "small invalid", args: [scratch + "/invalid.sapp"], status: 1, expected: "1 error(s), 1 warning(s)", exact: false, truncated: false },
+        map{ name: "not executed", args: [scratch + "/effect.sapp"], status: 0, expected: "0 error(s)", exact: false, truncated: false },
+        map{ name: "retained rejection", args: ["--retained-source", scratch + "/nested.sapp"], status: 1, expected: "1 error(s), 0 warning(s)", exact: false, truncated: false },
+        map{ name: "origin rejection", args: ["--import-origin", scratch + "/lazy.sapp"], status: 1, expected: "1 error(s), 0 warning(s)", exact: false, truncated: false }
+    ];
+
+    let routes = if has_public_route { ["public", "direct"] } else { ["direct"] };
+    let rows = [];
+    let marker = "[diagnostic output truncated; final counts remain complete]";
+    let replacement_char = bytes_to_str([239, 191, 189]);
+
+    let ri = 0;
+    while ri < len(routes) {
+        let route = routes[ri];
+        let limit_cases = if route == "public" { 6 } else { len(cases) };
+        let ci = 0;
+        while ci < limit_cases {
+            let c = cases[ci];
+            let cmd = if route == "public" { ["check"] } else { ["run", "--allow-all", driver, "--"] };
+            let ai = 0;
+            while ai < len(c.args) {
+                array_push(cmd, c.args[ai]);
+                ai = ai + 1;
+            }
+            let proc = proc_spawn_wait(binary, cmd);
+            let stdout_bytes = len(str_to_bytes(proc.stdout));
+            let summary = _last_nonempty_line(proc.stdout);
+            let summary_ok = if c.exact { summary == c.expected } else { str_contains(summary, c.expected) };
+            let ok = proc.exit_code == c.status and summary_ok and not str_contains(proc.stdout, replacement_char);
+
+            let marker_count = _count_occurrences(proc.stdout, marker);
+            if not baseline {
+                ok = ok and stdout_bytes <= 16384;
+                ok = ok and ((marker_count > 0) == c.truncated);
+                ok = ok and marker_count <= 1;
+            } elif c.truncated {
+                ok = ok and stdout_bytes > 16384;
+            }
+            if c.name == "late invalid" {
+                ok = ok and summary != "" and not str_contains(summary, "0 error(s)");
+            }
+
+            array_push(rows, map{
+                name: route + " " + c.name,
+                passed: ok,
+                exit: proc.exit_code,
+                stdout_bytes: stdout_bytes,
+                final_summary: summary
+            });
+            ci = ci + 1;
+        }
+        ri = ri + 1;
+    }
+
+    let fixtures_unchanged = true;
+    let hi = 0;
+    while hi < len(fkeys) {
+        let fnm = fkeys[hi];
+        if SHA256.sha256_hex(fs_read(scratch + "/" + fnm)) != before[fnm] {
+            fixtures_unchanged = false;
+        }
+        hi = hi + 1;
+    }
+    let source_not_executed = not fs_exists(scratch + "/UNEXPECTED");
+
+    _rm_rf(scratch);
+    assert(not fs_exists(scratch), "check_cli_output_budget scratch cleaned up");
+
+    let all_ok = fixtures_unchanged and source_not_executed and len(rows) > 0;
+    let k = 0;
+    while k < len(rows) {
+        if not rows[k].passed {
+            print "FAILED CASE: " + json_stringify(rows[k]);
+            all_ok = false;
+        }
+        k = k + 1;
+    }
+
+    let report = map{
+        passed: all_ok,
+        baseline: baseline,
+        stdout_limit: 16384,
+        fixtures_unchanged: fixtures_unchanged,
+        source_not_executed: source_not_executed,
+        fixture_hashes: before,
+        rows: rows
+    };
+
+    if report_arg != "" {
+        let pdir = path_dirname(report_arg);
+        if pdir != "" and pdir != "." { fs_mkdirs(pdir); }
+        fs_write(report_arg, json_stringify(report) + "\n");
+    }
+
+    assert(report.passed, "check_cli_output_budget failed");
+    print "check_cli_output_budget_pass: cases=" + str(len(rows));
+}
+
+main();

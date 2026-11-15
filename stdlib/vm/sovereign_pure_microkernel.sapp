@@ -1,0 +1,2860 @@
+// Licensed under Apache-2.0.
+//
+// stdlib/vm/sovereign_pure_microkernel.sapp — PBLang v5.1.0 Sovereign Pure Microkernel
+// 100% Pure-PBLang (.sapp) VM & OS Systems Layer:
+//   1. Exact 64-Bit Signed Integer (`VAL_I64`) + Live W^X `REX.W` x86-64 Machine Code Execution
+//   2. OS-Page `64 KiB` Slab Allocator (`mmap` / `VirtualAlloc`), `@region` Arenas & `1,024`-Slot String Interning
+//   3. CSPRNG-Seeded `SipHash-1-3` & `SipHash-2-4` + Open-Addressed Robin-Hood Dynamic Maps
+//   4. First-Class Zero-Copy Typed Pointer `OBJ_PTR` (`ffi_ptr_*`) with Bounds-Checked Memory Access
+//   5. Win32 Wide `UTF-16LE` (`*W`) & POSIX Direct OS Syscall Driver (`pure_fs_*`, `pure_proc_spawn_w`)
+//   6. `AF_UNIX` Domain Sockets (`SO_PEERCRED`), `epoll`/`kqueue`/`WSAPoll` Async Mux, OS Sandbox & VM Line Hook
+
+let MICROKERNEL_VERSION = "5.1.0";
+let SLAB_PAGE_BYTES = 65536;
+let INTERN_TABLE_CAP = 1024;
+let INTERN_MAX_BYTES = 24;
+let MUX_READ = 1;
+let MUX_WRITE = 4;
+
+// ============================================================================
+// Internal FFI Handle Cache & Cross-Platform Helpers
+// ============================================================================
+
+let _FFI_CACHE = map{
+    "libc": nil,
+    "kernel32": nil,
+    "msvcrt": nil,
+    "ws2_32": nil,
+    "wsa_started": false
+};
+
+fn _get_libc() {
+    if _FFI_CACHE["libc"] != nil { return _FFI_CACHE["libc"]; }
+    let h = ffi_load("libc");
+    _FFI_CACHE["libc"] = h;
+    return h;
+}
+
+fn _try_get_libc() {
+    if _FFI_CACHE["libc"] != nil { return _FFI_CACHE["libc"]; }
+    let h = try ffi_load("libc") catch nil;
+    if h != nil { _FFI_CACHE["libc"] = h; }
+    return h;
+}
+
+fn _get_kernel32() {
+    if _FFI_CACHE["kernel32"] != nil { return _FFI_CACHE["kernel32"]; }
+    let h = ffi_load("kernel32.dll");
+    _FFI_CACHE["kernel32"] = h;
+    return h;
+}
+
+fn _try_get_kernel32() {
+    if _FFI_CACHE["kernel32"] != nil { return _FFI_CACHE["kernel32"]; }
+    let h = try ffi_load("kernel32.dll") catch nil;
+    if h != nil { _FFI_CACHE["kernel32"] = h; }
+    return h;
+}
+
+fn _get_msvcrt() {
+    if _FFI_CACHE["msvcrt"] != nil { return _FFI_CACHE["msvcrt"]; }
+    let h = ffi_load("msvcrt.dll");
+    _FFI_CACHE["msvcrt"] = h;
+    return h;
+}
+
+fn _get_ws2_32() {
+    if _FFI_CACHE["ws2_32"] != nil { return _FFI_CACHE["ws2_32"]; }
+    let h = ffi_load("ws2_32.dll");
+    _FFI_CACHE["ws2_32"] = h;
+    if not _FFI_CACHE["wsa_started"] {
+        let wsa_data = bytes_new(408);
+        ffi_call_typed(h, "WSAStartup", "u16, ptr -> i32", [0x0202, wsa_data]);
+        _FFI_CACHE["wsa_started"] = true;
+    }
+    return h;
+}
+
+fn ffi_sym(lib_handle_or_name, sym_name) {
+    let sname = str(sym_name);
+    if platform() == "windows" {
+        let k32 = _get_kernel32();
+        let hmod = if type(lib_handle_or_name) == "string" {
+            ffi_call_typed(k32, "LoadLibraryW", "ptr -> i64", [utf8_to_utf16le_bytes(lib_handle_or_name, true)])
+        } else {
+            ffi_call_typed(k32, "GetModuleHandleW", "ptr -> i64", [0])
+        };
+        if hmod == 0 { return 0; }
+        return ffi_call_typed(k32, "GetProcAddress", "i64, str -> i64", [hmod, sname]);
+    }
+    let lc = _get_libc();
+    let rtld_default = if platform() == "macos" or platform() == "darwin" { -2 } else { 0 };
+    return ffi_call_typed(lc, "dlsym", "i64, str -> i64", [rtld_default, sname]);
+}
+
+fn _opt(m, key, fallback) {
+    if m == nil or type(m) != "map" { return fallback; }
+    if not map_has(m, key) { return fallback; }
+    let v = m[key];
+    if v == nil { return fallback; }
+    return v;
+}
+
+fn _byte_len(b) {
+    return len(b);
+}
+
+fn _byte_at(b, idx) {
+    if type(b) == "bytes" { return bytes_get(b, idx); }
+    return bit_and(b[idx], 255);
+}
+
+fn _to_byte_array(data) {
+    let t = type(data);
+    if t == "array" {
+        let out = [];
+        let i = 0;
+        while i < len(data) {
+            array_push(out, bit_and(data[i], 255));
+            i = i + 1;
+        }
+        return out;
+    }
+    if t == "bytes" {
+        let out = [];
+        let n = len(data);
+        let i = 0;
+        while i < n {
+            array_push(out, bytes_get(data, i));
+            i = i + 1;
+        }
+        return out;
+    }
+    if t == "string" {
+        return str_to_bytes(data);
+    }
+    throw "expected bytes, byte array, or string, got " + t;
+}
+
+fn _to_bytes_obj(data) {
+    let t = type(data);
+    if t == "bytes" { return data; }
+    if t == "string" { return bytes_from_str(data); }
+    if t == "array" { return bytes_new(data); }
+    throw "expected bytes, byte array, or string, got " + t;
+}
+
+// ============================================================================
+// 1. Exact 64-Bit Signed Integer (`VAL_I64`) + Live W^X `REX.W` Machine Code
+// ============================================================================
+
+let _BI_ZERO = bigint(0);
+let _BI_ONE = bigint(1);
+let _BI_TWO = bigint(2);
+let _BI_EIGHT = bigint(8);
+let _BI_TEN = bigint(10);
+let _BI_SIXTEEN = bigint(16);
+let _BI_256 = bigint(256);
+let _BI_MOD64 = bigint("18446744073709551616");
+let _BI_SIGN64 = bigint("9223372036854775808");
+let _BI_MAX_I64 = bigint("9223372036854775807");
+let _BI_MIN_I64 = bigint("-9223372036854775808");
+
+fn _build_pow2_table() {
+    let tbl = [];
+    let cur = _BI_ONE;
+    let i = 0;
+    while i <= 64 {
+        array_push(tbl, cur);
+        cur = cur * _BI_TWO;
+        i = i + 1;
+    }
+    return tbl;
+}
+
+let _POW2_BI = _build_pow2_table();
+let _HEX_DIGITS = "0123456789abcdef";
+
+fn is_i64(v) {
+    return type(v) == "map" and map_has(v, "__tag__") and v["__tag__"] == "i64" and
+           map_has(v, "bits_le") and map_has(v, "big");
+}
+
+fn _i64_from_unsigned_bi(u_in) {
+    let u = u_in % _BI_MOD64;
+    if u < _BI_ZERO {
+        u = u + _BI_MOD64;
+    }
+    let bits = [];
+    let rem = u;
+    let k = 0;
+    while k < 8 {
+        let b_bi = rem % _BI_256;
+        let b_num = parse_number(str(b_bi));
+        array_push(bits, if b_num == nil { 0 } else { b_num });
+        rem = rem / _BI_256;
+        k = k + 1;
+    }
+    let signed_bi = if u >= _BI_SIGN64 { u - _BI_MOD64 } else { u };
+    return map{
+        "__tag__": "i64",
+        "bits_le": bits,
+        "big": signed_bi
+    };
+}
+
+fn _i64_from_le_bytes(b_seq) {
+    let bits = [];
+    let u = _BI_ZERO;
+    let mult = _BI_ONE;
+    let k = 0;
+    while k < 8 {
+        let b = bit_and(_byte_at(b_seq, k), 255);
+        array_push(bits, b);
+        u = u + bigint(b) * mult;
+        mult = mult * _BI_256;
+        k = k + 1;
+    }
+    let signed_bi = if u >= _BI_SIGN64 { u - _BI_MOD64 } else { u };
+    return map{
+        "__tag__": "i64",
+        "bits_le": bits,
+        "big": signed_bi
+    };
+}
+
+fn _i64_unsigned_bi(x) {
+    let v = i64_new(x);
+    let b = v["big"];
+    return if b < _BI_ZERO { b + _BI_MOD64 } else { b };
+}
+
+fn _hex_char_val(c) {
+    if c >= 48 and c <= 57 { return c - 48; }
+    if c >= 65 and c <= 70 { return c - 55; }
+    if c >= 97 and c <= 102 { return c - 87; }
+    return -1;
+}
+
+fn _parse_str_to_bi(raw_str) {
+    let s = str_trim(str_replace_all(raw_str, "_", ""));
+    if len(s) == 0 { throw "i64_new(): empty integer string"; }
+    let neg = false;
+    if str_starts_with(s, "-") {
+        neg = true;
+        s = str_slice(s, 1, len(s));
+    } elif str_starts_with(s, "+") {
+        s = str_slice(s, 1, len(s));
+    }
+    if str_ends_with(s, "i64") or str_ends_with(s, "u64") {
+        s = str_slice(s, 0, len(s) - 3);
+    } elif str_ends_with(s, "L") or str_ends_with(s, "l") {
+        s = str_slice(s, 0, len(s) - 1);
+    }
+    if len(s) == 0 { throw "i64_new(): invalid integer string '" + raw_str + "'"; }
+
+    let acc = _BI_ZERO;
+    if str_starts_with(s, "0x") or str_starts_with(s, "0X") {
+        let hex_body = str_slice(s, 2, len(s));
+        if len(hex_body) == 0 { throw "i64_new(): empty hex literal"; }
+        let i = 0;
+        while i < len(hex_body) {
+            let d = _hex_char_val(strcharcodeat(hex_body, i));
+            if d < 0 { throw "i64_new(): invalid hex digit in '" + raw_str + "'"; }
+            acc = acc * _BI_SIXTEEN + bigint(d);
+            i = i + 1;
+        }
+    } elif str_starts_with(s, "0b") or str_starts_with(s, "0B") {
+        let bin_body = str_slice(s, 2, len(s));
+        if len(bin_body) == 0 { throw "i64_new(): empty binary literal"; }
+        let i = 0;
+        while i < len(bin_body) {
+            let c = strcharcodeat(bin_body, i);
+            if c != 48 and c != 49 { throw "i64_new(): invalid binary digit in '" + raw_str + "'"; }
+            acc = acc * _BI_TWO + bigint(c - 48);
+            i = i + 1;
+        }
+    } elif str_starts_with(s, "0o") or str_starts_with(s, "0O") {
+        let oct_body = str_slice(s, 2, len(s));
+        if len(oct_body) == 0 { throw "i64_new(): empty octal literal"; }
+        let i = 0;
+        while i < len(oct_body) {
+            let c = strcharcodeat(oct_body, i);
+            if c < 48 or c > 55 { throw "i64_new(): invalid octal digit in '" + raw_str + "'"; }
+            acc = acc * _BI_EIGHT + bigint(c - 48);
+            i = i + 1;
+        }
+    } else {
+        acc = bigint(s);
+    }
+    return if neg { _BI_ZERO - acc } else { acc };
+}
+
+fn i64_new(v) {
+    if is_i64(v) {
+        return map{
+            "__tag__": "i64",
+            "bits_le": slice(v["bits_le"], 0, 8),
+            "big": v["big"]
+        };
+    }
+    let t = type(v);
+    if t == "bigint" {
+        return _i64_from_unsigned_bi(v);
+    }
+    if t == "number" {
+        let tr = if v < 0 { 0 - num_floor(0 - v) } else { num_floor(v) };
+        return _i64_from_unsigned_bi(bigint(tr));
+    }
+    if t == "bool" {
+        return _i64_from_unsigned_bi(if v { _BI_ONE } else { _BI_ZERO });
+    }
+    if t == "string" {
+        return _i64_from_unsigned_bi(_parse_str_to_bi(v));
+    }
+    if (t == "array" or t == "bytes") and len(v) == 8 {
+        return _i64_from_le_bytes(v);
+    }
+    throw "i64_new(): unsupported input type '" + t + "'";
+}
+
+fn i64_to_str(v) {
+    return str(i64_new(v)["big"]);
+}
+
+fn i64_to_hex(v) {
+    let x = i64_new(v);
+    let bits = x["bits_le"];
+    let out = "0x";
+    let k = 7;
+    while k >= 0 {
+        let b = bits[k];
+        let hi = bit_and(bit_shr(b, 4), 15);
+        let lo = bit_and(b, 15);
+        out = out + str_slice(_HEX_DIGITS, hi, hi + 1) + str_slice(_HEX_DIGITS, lo, lo + 1);
+        k = k - 1;
+    }
+    return out;
+}
+
+fn i64_to_bigint(v) {
+    return i64_new(v)["big"];
+}
+
+fn i64_eq(a, b) {
+    return i64_new(a)["big"] == i64_new(b)["big"];
+}
+
+fn i64_cmp(a, b) {
+    let ba = i64_new(a)["big"];
+    let bb = i64_new(b)["big"];
+    if ba < bb { return -1; }
+    if ba > bb { return 1; }
+    return 0;
+}
+
+fn i64_add(a, b) {
+    return _i64_from_unsigned_bi(i64_new(a)["big"] + i64_new(b)["big"]);
+}
+
+fn i64_sub(a, b) {
+    return _i64_from_unsigned_bi(i64_new(a)["big"] - i64_new(b)["big"]);
+}
+
+fn i64_mul(a, b) {
+    return _i64_from_unsigned_bi(i64_new(a)["big"] * i64_new(b)["big"]);
+}
+
+fn i64_div(a, b) {
+    let ba = i64_new(a)["big"];
+    let bb = i64_new(b)["big"];
+    if bb == _BI_ZERO { throw "i64_div(): division by zero"; }
+    return _i64_from_unsigned_bi(ba / bb);
+}
+
+fn i64_mod(a, b) {
+    let ba = i64_new(a)["big"];
+    let bb = i64_new(b)["big"];
+    if bb == _BI_ZERO { throw "i64_mod(): modulo by zero"; }
+    return _i64_from_unsigned_bi(ba % bb);
+}
+
+fn i64_and(a, b) {
+    let ba = i64_new(a)["bits_le"];
+    let bb = i64_new(b)["bits_le"];
+    let out = [];
+    let k = 0;
+    while k < 8 {
+        array_push(out, bit_and(ba[k], bb[k]));
+        k = k + 1;
+    }
+    return _i64_from_le_bytes(out);
+}
+
+fn i64_or(a, b) {
+    let ba = i64_new(a)["bits_le"];
+    let bb = i64_new(b)["bits_le"];
+    let out = [];
+    let k = 0;
+    while k < 8 {
+        array_push(out, bit_or(ba[k], bb[k]));
+        k = k + 1;
+    }
+    return _i64_from_le_bytes(out);
+}
+
+fn i64_xor(a, b) {
+    let ba = i64_new(a)["bits_le"];
+    let bb = i64_new(b)["bits_le"];
+    let out = [];
+    let k = 0;
+    while k < 8 {
+        array_push(out, bit_xor(ba[k], bb[k]));
+        k = k + 1;
+    }
+    return _i64_from_le_bytes(out);
+}
+
+fn i64_not(a) {
+    let ba = i64_new(a)["bits_le"];
+    let out = [];
+    let k = 0;
+    while k < 8 {
+        array_push(out, bit_xor(ba[k], 255));
+        k = k + 1;
+    }
+    return _i64_from_le_bytes(out);
+}
+
+fn _norm_shift64(sh) {
+    let s64 = i64_new(sh);
+    return bit_and(s64["bits_le"][0], 63);
+}
+
+fn i64_shl(a, shift) {
+    let sh = _norm_shift64(shift);
+    if sh == 0 { return i64_new(a); }
+    let u = _i64_unsigned_bi(a);
+    return _i64_from_unsigned_bi((u * _POW2_BI[sh]) % _BI_MOD64);
+}
+
+fn i64_shr(a, shift) {
+    let sh = _norm_shift64(shift);
+    if sh == 0 { return i64_new(a); }
+    let u = _i64_unsigned_bi(a);
+    return _i64_from_unsigned_bi(u / _POW2_BI[sh]);
+}
+
+fn i64_sar(a, shift) {
+    let v = i64_new(a);
+    let sh = _norm_shift64(shift);
+    if sh == 0 { return v; }
+    let u = _i64_unsigned_bi(v);
+    let shifted = u / _POW2_BI[sh];
+    if v["bits_le"][7] >= 128 {
+        let sign_fill = _BI_MOD64 - _POW2_BI[64 - sh];
+        shifted = shifted + sign_fill;
+    }
+    return _i64_from_unsigned_bi(shifted);
+}
+
+fn i64_rotl(a, r) {
+    let sh = _norm_shift64(r);
+    if sh == 0 { return i64_new(a); }
+    return i64_or(i64_shl(a, sh), i64_shr(a, 64 - sh));
+}
+
+fn i64_rotr(a, r) {
+    let sh = _norm_shift64(r);
+    if sh == 0 { return i64_new(a); }
+    return i64_or(i64_shr(a, sh), i64_shl(a, 64 - sh));
+}
+
+fn i64_index(arr, idx_i64) {
+    let idx_bi = i64_new(idx_i64)["big"];
+    let n = len(arr);
+    if idx_bi < _BI_ZERO or idx_bi >= bigint(n) {
+        throw "i64_index(): index " + str(idx_bi) + " out of bounds for length " + str(n);
+    }
+    let idx_num = parse_number(str(idx_bi));
+    if type(arr) == "bytes" { return bytes_get(arr, idx_num); }
+    if type(arr) == "string" { return str_slice(arr, idx_num, idx_num + 1); }
+    return arr[idx_num];
+}
+
+fn _i64_sw_exec_op(op, a, b) {
+    if op == "add" or op == "+" { return i64_add(a, b); }
+    if op == "sub" or op == "-" { return i64_sub(a, b); }
+    if op == "mul" or op == "imul" or op == "*" { return i64_mul(a, b); }
+    if op == "and" or op == "&" { return i64_and(a, b); }
+    if op == "or" or op == "|" { return i64_or(a, b); }
+    if op == "xor" or op == "^" { return i64_xor(a, b); }
+    if op == "not" or op == "~" { return i64_not(a); }
+    if op == "shl" or op == "<<" { return i64_shl(a, b); }
+    if op == "shr" or op == ">>>" { return i64_shr(a, b); }
+    if op == "sar" or op == ">>" { return i64_sar(a, b); }
+    throw "i64_jit_rexw_exec_live(): unsupported op '" + str(op) + "'";
+}
+
+fn _build_x64_rexw_code(op, is_win64) {
+    let mc = [];
+    if is_win64 {
+        // Win64 ABI (`bsearch` passes `io_ptr` in `rcx`; `rax`, `rcx`, `rdx`, `r8` are volatile):
+        //   49 89 C8       mov r8, rcx        ; save io_ptr
+        //   49 8B 08       mov rcx, [r8]      ; load 64-bit operand a
+        //   49 8B 50 08    mov rdx, [r8 + 8]  ; load 64-bit operand b
+        //   48 89 C8       mov rax, rcx       ; REX.W 64-bit move
+        mc = [0x49, 0x89, 0xC8, 0x49, 0x8B, 0x08, 0x49, 0x8B, 0x50, 0x08, 0x48, 0x89, 0xC8];
+        if op == "add" or op == "+" { array_push(mc, 0x48); array_push(mc, 0x01); array_push(mc, 0xD0); }
+        elif op == "sub" or op == "-" { array_push(mc, 0x48); array_push(mc, 0x29); array_push(mc, 0xD0); }
+        elif op == "mul" or op == "imul" or op == "*" { array_push(mc, 0x48); array_push(mc, 0x0F); array_push(mc, 0xAF); array_push(mc, 0xC2); }
+        elif op == "and" or op == "&" { array_push(mc, 0x48); array_push(mc, 0x21); array_push(mc, 0xD0); }
+        elif op == "or" or op == "|" { array_push(mc, 0x48); array_push(mc, 0x09); array_push(mc, 0xD0); }
+        elif op == "xor" or op == "^" { array_push(mc, 0x48); array_push(mc, 0x31); array_push(mc, 0xD0); }
+        elif op == "not" or op == "~" { array_push(mc, 0x48); array_push(mc, 0xF7); array_push(mc, 0xD0); }
+        elif op == "shl" or op == "<<" {
+            array_push(mc, 0x48); array_push(mc, 0x89); array_push(mc, 0xD1);
+            array_push(mc, 0x48); array_push(mc, 0xD3); array_push(mc, 0xE0);
+        } elif op == "shr" or op == ">>>" {
+            array_push(mc, 0x48); array_push(mc, 0x89); array_push(mc, 0xD1);
+            array_push(mc, 0x48); array_push(mc, 0xD3); array_push(mc, 0xE8);
+        } elif op == "sar" or op == ">>" {
+            array_push(mc, 0x48); array_push(mc, 0x89); array_push(mc, 0xD1);
+            array_push(mc, 0x48); array_push(mc, 0xD3); array_push(mc, 0xF8);
+        } else {
+            throw "i64_jit_rexw_exec_live(): unsupported op '" + str(op) + "'";
+        }
+        //   49 89 40 10    mov [r8 + 16], rax ; store full 64-bit result
+        //   31 C0          xor eax, eax       ; return 0
+        //   C3             ret
+        array_push(mc, 0x49); array_push(mc, 0x89); array_push(mc, 0x40); array_push(mc, 0x10);
+        array_push(mc, 0x31); array_push(mc, 0xC0);
+        array_push(mc, 0xC3);
+        return mc;
+    }
+
+    // SysV AMD64 ABI (`bsearch` passes `io_ptr` in `rdi`):
+    //   48 89 FA       mov rdx, rdi        ; save io_ptr
+    //   48 8B 3A       mov rdi, [rdx]      ; load 64-bit operand a
+    //   48 8B 72 08    mov rsi, [rdx + 8]  ; load 64-bit operand b
+    //   48 89 F8       mov rax, rdi        ; REX.W 64-bit move
+    mc = [0x48, 0x89, 0xFA, 0x48, 0x8B, 0x3A, 0x48, 0x8B, 0x72, 0x08, 0x48, 0x89, 0xF8];
+    if op == "add" or op == "+" { array_push(mc, 0x48); array_push(mc, 0x01); array_push(mc, 0xF0); }
+    elif op == "sub" or op == "-" { array_push(mc, 0x48); array_push(mc, 0x29); array_push(mc, 0xF0); }
+    elif op == "mul" or op == "imul" or op == "*" { array_push(mc, 0x48); array_push(mc, 0x0F); array_push(mc, 0xAF); array_push(mc, 0xC6); }
+    elif op == "and" or op == "&" { array_push(mc, 0x48); array_push(mc, 0x21); array_push(mc, 0xF0); }
+    elif op == "or" or op == "|" { array_push(mc, 0x48); array_push(mc, 0x09); array_push(mc, 0xF0); }
+    elif op == "xor" or op == "^" { array_push(mc, 0x48); array_push(mc, 0x31); array_push(mc, 0xF0); }
+    elif op == "not" or op == "~" { array_push(mc, 0x48); array_push(mc, 0xF7); array_push(mc, 0xD0); }
+    elif op == "shl" or op == "<<" {
+        array_push(mc, 0x48); array_push(mc, 0x89); array_push(mc, 0xF1);
+        array_push(mc, 0x48); array_push(mc, 0xD3); array_push(mc, 0xE0);
+    } elif op == "shr" or op == ">>>" {
+        array_push(mc, 0x48); array_push(mc, 0x89); array_push(mc, 0xF1);
+        array_push(mc, 0x48); array_push(mc, 0xD3); array_push(mc, 0xE8);
+    } elif op == "sar" or op == ">>" {
+        array_push(mc, 0x48); array_push(mc, 0x89); array_push(mc, 0xF1);
+        array_push(mc, 0x48); array_push(mc, 0xD3); array_push(mc, 0xF8);
+    } else {
+        throw "i64_jit_rexw_exec_live(): unsupported op '" + str(op) + "'";
+    }
+    //   48 89 42 10    mov [rdx + 16], rax ; store full 64-bit result
+    //   31 C0          xor eax, eax       ; return 0
+    //   C3             ret
+    array_push(mc, 0x48); array_push(mc, 0x89); array_push(mc, 0x42); array_push(mc, 0x10);
+    array_push(mc, 0x31); array_push(mc, 0xC0);
+    array_push(mc, 0xC3);
+    return mc;
+}
+
+fn i64_jit_rexw_exec_live(op, a_i64, b_i64 = 0) {
+    let a = i64_new(a_i64);
+    let b = i64_new(b_i64);
+    let sw_expected = _i64_sw_exec_op(op, a, b);
+    let plat = platform();
+    let arch = os_arch();
+
+    if arch != "x86_64" and arch != "amd64" {
+        return map{
+            "__tag__": "i64",
+            "bits_le": sw_expected["bits_le"],
+            "big": sw_expected["big"],
+            "ok": true,
+            "result": sw_expected,
+            "wx_enforced": true,
+            "executed_live": false,
+            "fallback": "pure_sapp_i64_non_x64",
+            "arch": arch,
+            "platform": plat
+        };
+    }
+
+    let is_win = (plat == "windows");
+    let mc_arr = _build_x64_rexw_code(op, is_win);
+    let mc_buf = bytes_new(mc_arr);
+
+    let io_arr = [];
+    let k = 0;
+    while k < 8 { array_push(io_arr, a["bits_le"][k]); k = k + 1; }
+    k = 0;
+    while k < 8 { array_push(io_arr, b["bits_le"][k]); k = k + 1; }
+    k = 0;
+    while k < 8 { array_push(io_arr, 0); k = k + 1; }
+    let io_buf = bytes_new(io_arr);
+
+    if is_win {
+        let k32 = _get_kernel32();
+        let msvc = _get_msvcrt();
+        // VirtualAlloc(NULL, 4096, MEM_COMMIT|MEM_RESERVE=0x3000, PAGE_READWRITE=0x04)
+        let page = ffi_call_typed(k32, "VirtualAlloc", "ptr, u64, u32, u32 -> i64", [0, 4096, 0x3000, 0x04]);
+        if page <= 0 { throw "i64_jit_rexw_exec_live(): VirtualAlloc(4096, PAGE_READWRITE) failed"; }
+        ffi_ptr_write(page, mc_buf, len(mc_buf));
+        let old_prot = bytes_new(4);
+        // W^X transition: RW (0x04) -> RX (PAGE_EXECUTE_READ = 0x20)
+        let vp_ok = ffi_call_typed(k32, "VirtualProtect", "i64, u64, u32, ptr -> i32", [page, 4096, 0x20, old_prot]);
+        if vp_ok == 0 {
+            ffi_call_typed(k32, "VirtualFree", "i64, u64, u32 -> i32", [page, 0, 0x8000]);
+            throw "i64_jit_rexw_exec_live(): VirtualProtect(PAGE_EXECUTE_READ) failed";
+        }
+        ffi_call_typed(msvc, "bsearch", "ptr, ptr, u64, u64, i64 -> i64", [io_buf, io_buf, 1, 1, page]);
+        let vf_ok = ffi_call_typed(k32, "VirtualFree", "i64, u64, u32 -> i32", [page, 0, 0x8000]);
+        let out_bytes = [];
+        k = 0;
+        while k < 8 { array_push(out_bytes, bytes_get(io_buf, 16 + k)); k = k + 1; }
+        let hw_res = _i64_from_le_bytes(out_bytes);
+        return map{
+            "__tag__": "i64",
+            "bits_le": hw_res["bits_le"],
+            "big": hw_res["big"],
+            "ok": i64_eq(hw_res, sw_expected) and vf_ok != 0,
+            "result": hw_res,
+            "wx_enforced": true,
+            "executed_live": true,
+            "munmapped": vf_ok != 0,
+            "page_size": 4096,
+            "code_bytes": mc_arr,
+            "arch": arch,
+            "platform": plat
+        };
+    }
+
+    let lc = _get_libc();
+    let map_flags = if plat == "macos" or plat == "darwin" { 0x1002 } else { 0x22 };
+    // mmap(NULL, 4096, PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    let page = ffi_call_typed(lc, "mmap", "ptr, u64, i32, i32, i32, i64 -> i64", [0, 4096, 3, map_flags, -1, 0]);
+    if page <= 0 { throw "i64_jit_rexw_exec_live(): mmap(4096, PROT_READ|PROT_WRITE) failed"; }
+    ffi_ptr_write(page, mc_buf, len(mc_buf));
+    // W^X transition: RW (3) -> RX (PROT_READ|PROT_EXEC = 5)
+    let mp_rc = ffi_call_typed(lc, "mprotect", "i64, u64, i32 -> i32", [page, 4096, 5]);
+    if mp_rc != 0 {
+        ffi_call_typed(lc, "munmap", "i64, u64 -> i32", [page, 4096]);
+        throw "i64_jit_rexw_exec_live(): mprotect(PROT_READ|PROT_EXEC) failed";
+    }
+    ffi_call_typed(lc, "bsearch", "ptr, ptr, u64, u64, i64 -> i64", [io_buf, io_buf, 1, 1, page]);
+    let unm_rc = ffi_call_typed(lc, "munmap", "i64, u64 -> i32", [page, 4096]);
+    let out_bytes = [];
+    k = 0;
+    while k < 8 { array_push(out_bytes, bytes_get(io_buf, 16 + k)); k = k + 1; }
+    let hw_res = _i64_from_le_bytes(out_bytes);
+    return map{
+        "__tag__": "i64",
+        "bits_le": hw_res["bits_le"],
+        "big": hw_res["big"],
+        "ok": i64_eq(hw_res, sw_expected) and unm_rc == 0,
+        "result": hw_res,
+        "wx_enforced": true,
+        "executed_live": true,
+        "munmapped": unm_rc == 0,
+        "page_size": 4096,
+        "code_bytes": mc_arr,
+        "arch": arch,
+        "platform": plat
+    };
+}
+
+// ============================================================================
+// 2. OS-Page `64 KiB` Slab Allocator, `@region` Arenas & `1,024`-Slot Interning
+// ============================================================================
+
+let _SLAB_STATE = map{
+    "slabs": [],
+    "next_id": 1,
+    "region_stack": [],
+    "total_reclaimed_slabs": 0,
+    "total_reclaimed_bytes": 0
+};
+
+fn _os_map_rw_bytes(cap_bytes) {
+    let plat = platform();
+    if plat == "windows" {
+        let k32 = _try_get_kernel32();
+        if k32 != nil {
+            let addr = ffi_call_typed(k32, "VirtualAlloc", "ptr, u64, u32, u32 -> i64", [0, cap_bytes, 0x3000, 0x04]);
+            if addr > 0 {
+                return map{ "addr": addr, "cap": cap_bytes, "os_mapped": true, "pin": nil };
+            }
+        }
+    } else {
+        let lc = _try_get_libc();
+        if lc != nil {
+            let map_flags = if plat == "macos" or plat == "darwin" { 0x1002 } else { 0x22 };
+            let addr = ffi_call_typed(lc, "mmap", "ptr, u64, i32, i32, i32, i64 -> i64", [0, cap_bytes, 3, map_flags, -1, 0]);
+            if addr > 0 {
+                return map{ "addr": addr, "cap": cap_bytes, "os_mapped": true, "pin": nil };
+            }
+        }
+    }
+    // Restricted-capability fallback pinned buffer
+    let pin = bytes_new(cap_bytes);
+    let p_addr = try ffi_bytes_ptr(pin) catch 0;
+    return map{ "addr": p_addr, "cap": cap_bytes, "os_mapped": false, "pin": pin };
+}
+
+fn _os_unmap_slab(slab, advise_dontneed) {
+    if not slab["os_mapped"] or slab["addr"] <= 0 {
+        slab["pin"] = nil;
+        slab["addr"] = 0;
+        slab["freed"] = true;
+        return true;
+    }
+    let plat = platform();
+    if plat == "windows" {
+        let k32 = _get_kernel32();
+        let rc = ffi_call_typed(k32, "VirtualFree", "i64, u64, u32 -> i32", [slab["addr"], 0, 0x8000]);
+        slab["addr"] = 0;
+        slab["freed"] = true;
+        return rc != 0;
+    }
+    let lc = _get_libc();
+    if advise_dontneed {
+        // MADV_DONTNEED = 4 on Linux / macOS
+        ffi_call_typed(lc, "madvise", "i64, u64, i32 -> i32", [slab["addr"], slab["cap"], 4]);
+    }
+    let rc = ffi_call_typed(lc, "munmap", "i64, u64 -> i32", [slab["addr"], slab["cap"]]);
+    slab["addr"] = 0;
+    slab["freed"] = true;
+    return rc == 0;
+}
+
+fn slab_alloc_os_page(min_bytes = 65536) {
+    let req = if min_bytes <= SLAB_PAGE_BYTES {
+        SLAB_PAGE_BYTES
+    } else {
+        num_ceil(min_bytes / SLAB_PAGE_BYTES) * SLAB_PAGE_BYTES
+    };
+    let mapped = _os_map_rw_bytes(req);
+    let sid = _SLAB_STATE["next_id"];
+    _SLAB_STATE["next_id"] = sid + 1;
+    let slab = map{
+        "id": sid,
+        "addr": mapped["addr"],
+        "cap": mapped["cap"],
+        "used": 0,
+        "pin_count": 0,
+        "os_mapped": mapped["os_mapped"],
+        "pin": mapped["pin"],
+        "freed": false
+    };
+    array_push(_SLAB_STATE["slabs"], slab);
+    return slab;
+}
+
+fn slab_stats() {
+    let slabs = _SLAB_STATE["slabs"];
+    let active = 0;
+    let bytes_cap = 0;
+    let bytes_used = 0;
+    let i = 0;
+    while i < len(slabs) {
+        let s = slabs[i];
+        if not s["freed"] {
+            active = active + 1;
+            bytes_cap = bytes_cap + s["cap"];
+            bytes_used = bytes_used + s["used"];
+        }
+        i = i + 1;
+    }
+    return map{
+        "slab_page_bytes": SLAB_PAGE_BYTES,
+        "active_slabs": active,
+        "capacity_bytes": bytes_cap,
+        "used_bytes": bytes_used,
+        "region_depth": len(_SLAB_STATE["region_stack"]),
+        "total_reclaimed_slabs": _SLAB_STATE["total_reclaimed_slabs"],
+        "total_reclaimed_bytes": _SLAB_STATE["total_reclaimed_bytes"]
+    };
+}
+
+fn region_enter() {
+    let marks = [];
+    let slabs = _SLAB_STATE["slabs"];
+    let i = 0;
+    while i < len(slabs) {
+        let s = slabs[i];
+        if not s["freed"] {
+            array_push(marks, map{ "id": s["id"], "used": s["used"] });
+        }
+        i = i + 1;
+    }
+    let frame = map{
+        "depth": len(_SLAB_STATE["region_stack"]) + 1,
+        "marks": marks
+    };
+    array_push(_SLAB_STATE["region_stack"], frame);
+    return frame["depth"];
+}
+
+fn region_alloc(byte_len) {
+    let n = num_floor(byte_len);
+    if n < 0 { throw "region_alloc(): negative byte_len " + str(n); }
+    let aligned = if n == 0 { 8 } else { bit_and(n + 7, -8) };
+
+    let slabs = _SLAB_STATE["slabs"];
+    let chosen = nil;
+    let i = 0;
+    while i < len(slabs) {
+        let s = slabs[i];
+        if not s["freed"] and (s["used"] + aligned <= s["cap"]) {
+            chosen = s;
+            break;
+        }
+        i = i + 1;
+    }
+    if chosen == nil {
+        chosen = slab_alloc_os_page(aligned);
+    }
+    let off = chosen["used"];
+    chosen["used"] = off + aligned;
+    let ptr_addr = chosen["addr"] + off;
+    if n > 0 and ptr_addr > 0 and chosen["os_mapped"] {
+        ffi_ptr_write(ptr_addr, bytes_new(n), n);
+    }
+    return map{
+        "__tag__": "ptr",
+        "addr": ptr_addr,
+        "size": n,
+        "type_tag": "region*",
+        "owned": false,
+        "os_mapped": chosen["os_mapped"],
+        "map_cap": 0,
+        "freed": false,
+        "slab_id": chosen["id"],
+        "slab_offset": off,
+        "region_depth": len(_SLAB_STATE["region_stack"])
+    };
+}
+
+fn region_exit() {
+    let stk = _SLAB_STATE["region_stack"];
+    if len(stk) == 0 {
+        return map{ "ok": false, "depth_remaining": 0, "reset_slabs": 0 };
+    }
+    let frame = array_pop(stk);
+    let mark_map = map{};
+    let marks = frame["marks"];
+    let m = 0;
+    while m < len(marks) {
+        let mk = marks[m];
+        mark_map[str(mk["id"])] = mk["used"];
+        m = m + 1;
+    }
+
+    // O(1) per-slab bump-pointer rewind
+    let slabs = _SLAB_STATE["slabs"];
+    let reset_cnt = 0;
+    let i = 0;
+    while i < len(slabs) {
+        let s = slabs[i];
+        if not s["freed"] {
+            let key = str(s["id"]);
+            if map_has(mark_map, key) {
+                s["used"] = mark_map[key];
+            } else {
+                // Slab was allocated inside this region: rewind bump pointer to 0!
+                s["used"] = 0;
+            }
+            reset_cnt = reset_cnt + 1;
+        }
+        i = i + 1;
+    }
+    return map{
+        "ok": true,
+        "depth_remaining": len(stk),
+        "reset_slabs": reset_cnt
+    };
+}
+
+fn with_region(fn_body) {
+    region_enter();
+    let state = map{ "ok": true, "val": nil, "err": nil };
+    try {
+        state["val"] = fn_body();
+    } catch err {
+        state["ok"] = false;
+        state["err"] = err;
+    }
+    region_exit();
+    if not state["ok"] {
+        throw state["err"];
+    }
+    return state["val"];
+}
+
+fn gc_reclaim_os_pages() {
+    let slabs = _SLAB_STATE["slabs"];
+    let kept = [];
+    let reclaimed_slabs = 0;
+    let reclaimed_bytes = 0;
+    let i = 0;
+    while i < len(slabs) {
+        let s = slabs[i];
+        if not s["freed"] and s["used"] == 0 and s["pin_count"] == 0 {
+            let cap = s["cap"];
+            _os_unmap_slab(s, true);
+            reclaimed_slabs = reclaimed_slabs + 1;
+            reclaimed_bytes = reclaimed_bytes + cap;
+        } elif not s["freed"] {
+            array_push(kept, s);
+        }
+        i = i + 1;
+    }
+    _SLAB_STATE["slabs"] = kept;
+    _SLAB_STATE["total_reclaimed_slabs"] = _SLAB_STATE["total_reclaimed_slabs"] + reclaimed_slabs;
+    _SLAB_STATE["total_reclaimed_bytes"] = _SLAB_STATE["total_reclaimed_bytes"] + reclaimed_bytes;
+    return map{
+        "ok": true,
+        "reclaimed_slabs": reclaimed_slabs,
+        "reclaimed_bytes": reclaimed_bytes,
+        "active_slabs": len(kept)
+    };
+}
+
+// ---- 1,024-Slot Short-String (`<= 24` bytes) Interning Table ----
+
+fn _init_intern_slots() {
+    let arr = [];
+    let i = 0;
+    while i < INTERN_TABLE_CAP {
+        array_push(arr, nil);
+        i = i + 1;
+    }
+    return arr;
+}
+
+let _INTERN_STATE = map{
+    "slots": _init_intern_slots(),
+    "used": 0,
+    "hits": 0,
+    "misses": 0,
+    "evict_hand": 0
+};
+
+fn _fnv1a_short_bytes(bs) {
+    let h = 2166136261;
+    let i = 0;
+    while i < len(bs) {
+        h = bit_xor(h, bs[i]);
+        // (h * 16777619) & 0xFFFFFFFF — exact in 53-bit double since 4.29e9 * 1.67e7 = 7.2e16 > 2^53,
+        // so decompose 16777619 = (1 << 24) + (1 << 8) + 0x93 = 16777216 + 256 + 147:
+        let p1 = bit_and(bit_shl(bit_and(h, 255), 24), 4294967295);
+        let p2 = bit_and(bit_shl(bit_and(h, 16777215), 8), 4294967295);
+        let p3 = h * 147;
+        h = bit_and(p1 + p2 + p3, 4294967295);
+        i = i + 1;
+    }
+    return h;
+}
+
+fn intern_str(s) {
+    let txt = str(s);
+    let bs = str_to_bytes(txt);
+    if len(bs) > INTERN_MAX_BYTES {
+        _INTERN_STATE["misses"] = _INTERN_STATE["misses"] + 1;
+        return txt;
+    }
+    let slots = _INTERN_STATE["slots"];
+    let mask = INTERN_TABLE_CAP - 1;
+    let start = bit_and(_fnv1a_short_bytes(bs), mask);
+    let probe = 0;
+    while probe < INTERN_TABLE_CAP {
+        let idx = bit_and(start + probe, mask);
+        let cur = slots[idx];
+        if cur == nil {
+            slots[idx] = txt;
+            _INTERN_STATE["used"] = _INTERN_STATE["used"] + 1;
+            _INTERN_STATE["misses"] = _INTERN_STATE["misses"] + 1;
+            return txt;
+        }
+        if cur == txt {
+            _INTERN_STATE["hits"] = _INTERN_STATE["hits"] + 1;
+            return cur;
+        }
+        probe = probe + 1;
+    }
+    // Table is at full 1,024 capacity: clock-hand replacement keeps `intern_used == 1024`
+    let victim = _INTERN_STATE["evict_hand"];
+    _INTERN_STATE["evict_hand"] = bit_and(victim + 1, mask);
+    slots[victim] = txt;
+    _INTERN_STATE["misses"] = _INTERN_STATE["misses"] + 1;
+    return txt;
+}
+
+fn intern_stats() {
+    return map{
+        "intern_cap": INTERN_TABLE_CAP,
+        "intern_used": _INTERN_STATE["used"],
+        "hits": _INTERN_STATE["hits"],
+        "misses": _INTERN_STATE["misses"]
+    };
+}
+
+// ============================================================================
+// 3. CSPRNG-Seeded `SipHash-1-3` & `SipHash-2-4` + Robin-Hood Dynamic Maps
+// ============================================================================
+
+let _CSPRNG_SIP_SEED = random_bytes(16);
+let _U32_MOD = 4294967296;
+let _U32_MASK = 4294967295;
+
+fn siphash_csprng_seed() {
+    return slice(_CSPRNG_SIP_SEED, 0, 16);
+}
+
+fn _read_u32_le(seq, off) {
+    let b0 = _byte_at(seq, off);
+    let b1 = _byte_at(seq, off + 1);
+    let b2 = _byte_at(seq, off + 2);
+    let b3 = _byte_at(seq, off + 3);
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+}
+
+fn _u64p_add(a, b) {
+    let slo = a[0] + b[0];
+    let carry = if slo >= _U32_MOD { 1 } else { 0 };
+    let lo = if carry == 1 { slo - _U32_MOD } else { slo };
+    let shi = a[1] + b[1] + carry;
+    let hi = if shi >= _U32_MOD { shi - _U32_MOD } else { shi };
+    return [lo, hi];
+}
+
+fn _u64p_xor(a, b) {
+    return [bit_and(bit_xor(a[0], b[0]), _U32_MASK), bit_and(bit_xor(a[1], b[1]), _U32_MASK)];
+}
+
+fn _u64p_rotl(a, k) {
+    let lo = a[0];
+    let hi = a[1];
+    if k == 32 { return [hi, lo]; }
+    // 0 < k < 32: mask low `(32 - k)` bits BEFORE left-shifting so intermediate stays <= 0xFFFFFFFF!
+    let keep_mask = bit_shl(1, 32 - k) - 1;
+    let nlo = bit_or(bit_shl(bit_and(lo, keep_mask), k), bit_shr(hi, 32 - k));
+    let nhi = bit_or(bit_shl(bit_and(hi, keep_mask), k), bit_shr(lo, 32 - k));
+    return [bit_and(nlo, _U32_MASK), bit_and(nhi, _U32_MASK)];
+}
+
+fn _u64p_to_i64(p) {
+    let lo = p[0];
+    let hi = p[1];
+    return _i64_from_le_bytes([
+        bit_and(lo, 255),
+        bit_and(bit_shr(lo, 8), 255),
+        bit_and(bit_shr(lo, 16), 255),
+        bit_and(bit_shr(lo, 24), 255),
+        bit_and(hi, 255),
+        bit_and(bit_shr(hi, 8), 255),
+        bit_and(bit_shr(hi, 16), 255),
+        bit_and(bit_shr(hi, 24), 255)
+    ]);
+}
+
+fn _siphash_core_pair(data_seq, key_seq, c_rounds, d_rounds) {
+    let k = if key_seq == nil { _CSPRNG_SIP_SEED } else { key_seq };
+    if _byte_len(k) < 16 {
+        throw "SipHash key must be at least 16 bytes";
+    }
+    let k0 = [_read_u32_le(k, 0), _read_u32_le(k, 4)];
+    let k1 = [_read_u32_le(k, 8), _read_u32_le(k, 12)];
+
+    // Official SipHash initialization vectors:
+    //   "somepseudorandomlygeneratedbytes"
+    let v0 = _u64p_xor(k0, [1886610805, 1936682341]); // 0x736f6d6570736575
+    let v1 = _u64p_xor(k1, [1852075885, 1685025377]); // 0x646f72616e646f6d
+    let v2 = _u64p_xor(k0, [1852142177, 1819895653]); // 0x6c7967656e657261
+    let v3 = _u64p_xor(k1, [2037671283, 1952801890]); // 0x7465646279746573
+
+    let total_len = _byte_len(data_seq);
+    let full_end = total_len - num_mod(total_len, 8);
+    let off = 0;
+    while off < full_end {
+        let m = [_read_u32_le(data_seq, off), _read_u32_le(data_seq, off + 4)];
+        v3 = _u64p_xor(v3, m);
+        let r = 0;
+        while r < c_rounds {
+            v0 = _u64p_add(v0, v1);
+            v1 = _u64p_rotl(v1, 13);
+            v1 = _u64p_xor(v1, v0);
+            v0 = _u64p_rotl(v0, 32);
+            v2 = _u64p_add(v2, v3);
+            v3 = _u64p_rotl(v3, 16);
+            v3 = _u64p_xor(v3, v2);
+            v0 = _u64p_add(v0, v3);
+            v3 = _u64p_rotl(v3, 21);
+            v3 = _u64p_xor(v3, v0);
+            v2 = _u64p_add(v2, v1);
+            v1 = _u64p_rotl(v1, 17);
+            v1 = _u64p_xor(v1, v2);
+            v2 = _u64p_rotl(v2, 32);
+            r = r + 1;
+        }
+        v0 = _u64p_xor(v0, m);
+        off = off + 8;
+    }
+
+    // Final partial block + length byte in top bits (bits 56..63)
+    let rem = total_len - full_end;
+    let tail_lo = 0;
+    let tail_hi = bit_and(total_len, 255) * 16777216;
+    if rem >= 1 { tail_lo = tail_lo + _byte_at(data_seq, full_end); }
+    if rem >= 2 { tail_lo = tail_lo + _byte_at(data_seq, full_end + 1) * 256; }
+    if rem >= 3 { tail_lo = tail_lo + _byte_at(data_seq, full_end + 2) * 65536; }
+    if rem >= 4 { tail_lo = tail_lo + _byte_at(data_seq, full_end + 3) * 16777216; }
+    if rem >= 5 { tail_hi = tail_hi + _byte_at(data_seq, full_end + 4); }
+    if rem >= 6 { tail_hi = tail_hi + _byte_at(data_seq, full_end + 5) * 256; }
+    if rem >= 7 { tail_hi = tail_hi + _byte_at(data_seq, full_end + 6) * 65536; }
+    let b_blk = [tail_lo, tail_hi];
+
+    v3 = _u64p_xor(v3, b_blk);
+    let rc = 0;
+    while rc < c_rounds {
+        v0 = _u64p_add(v0, v1);
+        v1 = _u64p_rotl(v1, 13);
+        v1 = _u64p_xor(v1, v0);
+        v0 = _u64p_rotl(v0, 32);
+        v2 = _u64p_add(v2, v3);
+        v3 = _u64p_rotl(v3, 16);
+        v3 = _u64p_xor(v3, v2);
+        v0 = _u64p_add(v0, v3);
+        v3 = _u64p_rotl(v3, 21);
+        v3 = _u64p_xor(v3, v0);
+        v2 = _u64p_add(v2, v1);
+        v1 = _u64p_rotl(v1, 17);
+        v1 = _u64p_xor(v1, v2);
+        v2 = _u64p_rotl(v2, 32);
+        rc = rc + 1;
+    }
+    v0 = _u64p_xor(v0, b_blk);
+
+    // Finalization: v2 ^= 0xff, then d_rounds of SipRound
+    v2 = [bit_xor(v2[0], 255), v2[1]];
+    let rd = 0;
+    while rd < d_rounds {
+        v0 = _u64p_add(v0, v1);
+        v1 = _u64p_rotl(v1, 13);
+        v1 = _u64p_xor(v1, v0);
+        v0 = _u64p_rotl(v0, 32);
+        v2 = _u64p_add(v2, v3);
+        v3 = _u64p_rotl(v3, 16);
+        v3 = _u64p_xor(v3, v2);
+        v0 = _u64p_add(v0, v3);
+        v3 = _u64p_rotl(v3, 21);
+        v3 = _u64p_xor(v3, v0);
+        v2 = _u64p_add(v2, v1);
+        v1 = _u64p_rotl(v1, 17);
+        v1 = _u64p_xor(v1, v2);
+        v2 = _u64p_rotl(v2, 32);
+        rd = rd + 1;
+    }
+
+    return _u64p_xor(_u64p_xor(v0, v1), _u64p_xor(v2, v3));
+}
+
+fn siphash13_bytes(data, key16 = nil) {
+    let seq = if type(data) == "string" { str_to_bytes(data) } else { data };
+    return _u64p_to_i64(_siphash_core_pair(seq, key16, 1, 3));
+}
+
+fn siphash13_str(s, key16 = nil) {
+    return _u64p_to_i64(_siphash_core_pair(str_to_bytes(str(s)), key16, 1, 3));
+}
+
+fn siphash24_bytes(data, key16 = nil) {
+    let seq = if type(data) == "string" { str_to_bytes(data) } else { data };
+    return _u64p_to_i64(_siphash_core_pair(seq, key16, 2, 4));
+}
+
+fn siphash24_str(s, key16 = nil) {
+    return _u64p_to_i64(_siphash_core_pair(str_to_bytes(str(s)), key16, 2, 4));
+}
+
+// ---- Open-Addressed Robin-Hood Hash Map (`sipmap_*`) ----
+
+fn _next_pow2(n) {
+    let p = 8;
+    while p < n { p = p * 2; }
+    return p;
+}
+
+fn _make_nil_array(n) {
+    let arr = [];
+    let i = 0;
+    while i < n {
+        array_push(arr, nil);
+        i = i + 1;
+    }
+    return arr;
+}
+
+fn _sipmap_key_bytes(k) {
+    if is_i64(k) {
+        let out = [105]; // tag 'i'
+        let b = k["bits_le"];
+        let idx = 0;
+        while idx < 8 { array_push(out, b[idx]); idx = idx + 1; }
+        return out;
+    }
+    let t = type(k);
+    if t == "string" {
+        return str_to_bytes("s:" + k);
+    }
+    if t == "number" {
+        return str_to_bytes("n:" + str(k));
+    }
+    if t == "bool" {
+        return str_to_bytes(if k { "b:1" } else { "b:0" });
+    }
+    if t == "bigint" {
+        return str_to_bytes("g:" + str(k));
+    }
+    if t == "bytes" {
+        let out = [98, 58]; // "b:"
+        let idx = 0;
+        while idx < len(k) { array_push(out, bytes_get(k, idx)); idx = idx + 1; }
+        return out;
+    }
+    return str_to_bytes(t + ":" + str(k));
+}
+
+fn _sipmap_keys_eq(a, b) {
+    if is_i64(a) and is_i64(b) { return i64_eq(a, b); }
+    if is_i64(a) or is_i64(b) { return false; }
+    if type(a) != type(b) { return false; }
+    if type(a) == "bytes" {
+        if len(a) != len(b) { return false; }
+        let i = 0;
+        while i < len(a) {
+            if bytes_get(a, i) != bytes_get(b, i) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    return a == b;
+}
+
+fn sipmap_new(initial_cap = 16, seed16 = nil) {
+    let cap = _next_pow2(if initial_cap == nil or initial_cap < 8 { 8 } else { num_floor(initial_cap) });
+    let seed = if seed16 != nil { seed16 } else { random_bytes(16) };
+    return map{
+        "__tag__": "sipmap",
+        "cap": cap,
+        "size": 0,
+        "resizes": 0,
+        "seed": seed,
+        "slots": _make_nil_array(cap)
+    };
+}
+
+fn _sipmap_insert_raw(slots, cap, entry) {
+    let mask = cap - 1;
+    let idx = bit_and(entry["hlo"], mask);
+    let cur = entry;
+    cur["psl"] = 0;
+    while true {
+        let resident = slots[idx];
+        if resident == nil {
+            slots[idx] = cur;
+            return true;
+        }
+        if resident["hlo"] == cur["hlo"] and resident["hhi"] == cur["hhi"] and _sipmap_keys_eq(resident["key"], cur["key"]) {
+            resident["val"] = cur["val"];
+            return false;
+        }
+        // Robin-Hood steal: displace entry with smaller probe distance
+        if cur["psl"] > resident["psl"] {
+            slots[idx] = cur;
+            cur = resident;
+        }
+        cur["psl"] = cur["psl"] + 1;
+        idx = bit_and(idx + 1, mask);
+    }
+}
+
+fn _sipmap_grow(m) {
+    let old_slots = m["slots"];
+    let old_cap = m["cap"];
+    let new_cap = old_cap * 2;
+    let new_slots = _make_nil_array(new_cap);
+    let i = 0;
+    while i < old_cap {
+        let e = old_slots[i];
+        if e != nil {
+            _sipmap_insert_raw(new_slots, new_cap, map{
+                "key": e["key"],
+                "val": e["val"],
+                "hlo": e["hlo"],
+                "hhi": e["hhi"],
+                "psl": 0
+            });
+        }
+        i = i + 1;
+    }
+    m["slots"] = new_slots;
+    m["cap"] = new_cap;
+    m["resizes"] = m["resizes"] + 1;
+}
+
+fn sipmap_set(m, k, v) {
+    if (m["size"] + 1) * 4 >= m["cap"] * 3 {
+        _sipmap_grow(m);
+    }
+    let hp = _siphash_core_pair(_sipmap_key_bytes(k), m["seed"], 1, 3);
+    let added = _sipmap_insert_raw(m["slots"], m["cap"], map{
+        "key": k,
+        "val": v,
+        "hlo": hp[0],
+        "hhi": hp[1],
+        "psl": 0
+    });
+    if added {
+        m["size"] = m["size"] + 1;
+    }
+    return m;
+}
+
+fn _sipmap_find_slot(m, k) {
+    let hp = _siphash_core_pair(_sipmap_key_bytes(k), m["seed"], 1, 3);
+    let hlo = hp[0];
+    let hhi = hp[1];
+    let slots = m["slots"];
+    let mask = m["cap"] - 1;
+    let idx = bit_and(hlo, mask);
+    let psl = 0;
+    while psl < m["cap"] {
+        let resident = slots[idx];
+        if resident == nil { return -1; }
+        // Robin-Hood early-exit invariant
+        if psl > resident["psl"] { return -1; }
+        if resident["hlo"] == hlo and resident["hhi"] == hhi and _sipmap_keys_eq(resident["key"], k) {
+            return idx;
+        }
+        psl = psl + 1;
+        idx = bit_and(idx + 1, mask);
+    }
+    return -1;
+}
+
+fn sipmap_get(m, k, default_val = nil) {
+    let idx = _sipmap_find_slot(m, k);
+    if idx < 0 { return default_val; }
+    return m["slots"][idx]["val"];
+}
+
+fn sipmap_has(m, k) {
+    return _sipmap_find_slot(m, k) >= 0;
+}
+
+fn sipmap_remove(m, k) {
+    let idx = _sipmap_find_slot(m, k);
+    if idx < 0 { return false; }
+    let slots = m["slots"];
+    let mask = m["cap"] - 1;
+    // Robin-Hood backward-shift deletion (tombstone-free)
+    let cur = idx;
+    while true {
+        let nxt = bit_and(cur + 1, mask);
+        let nxt_entry = slots[nxt];
+        if nxt_entry == nil or nxt_entry["psl"] == 0 {
+            slots[cur] = nil;
+            break;
+        }
+        nxt_entry["psl"] = nxt_entry["psl"] - 1;
+        slots[cur] = nxt_entry;
+        cur = nxt;
+    }
+    m["size"] = m["size"] - 1;
+    return true;
+}
+
+fn sipmap_keys(m) {
+    let out = [];
+    let slots = m["slots"];
+    let i = 0;
+    while i < m["cap"] {
+        if slots[i] != nil {
+            array_push(out, slots[i]["key"]);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn sipmap_stats(m) {
+    let slots = m["slots"];
+    let max_psl = 0;
+    let total_psl = 0;
+    let i = 0;
+    while i < m["cap"] {
+        let e = slots[i];
+        if e != nil {
+            if e["psl"] > max_psl { max_psl = e["psl"]; }
+            total_psl = total_psl + e["psl"];
+        }
+        i = i + 1;
+    }
+    return map{
+        "size": m["size"],
+        "cap": m["cap"],
+        "load_factor": if m["cap"] > 0 { m["size"] / m["cap"] } else { 0 },
+        "max_psl": max_psl,
+        "avg_psl": if m["size"] > 0 { total_psl / m["size"] } else { 0 },
+        "resizes": m["resizes"],
+        "algorithm": "SipHash-1-3+RobinHood",
+        "csprng_seeded": true
+    };
+}
+
+// ============================================================================
+// 4. First-Class Zero-Copy Typed Pointer `OBJ_PTR` (`ffi_ptr_*`)
+// ============================================================================
+
+fn is_ffi_ptr(p) {
+    return type(p) == "map" and map_has(p, "__tag__") and p["__tag__"] == "ptr";
+}
+
+fn ffi_ptr_new(byte_size, type_tag = "void*") {
+    let sz = num_floor(byte_size);
+    if sz < 0 { throw "ffi_ptr_new(): byte_size must be >= 0"; }
+    if sz == 0 {
+        return map{
+            "__tag__": "ptr",
+            "addr": 0,
+            "size": 0,
+            "type_tag": str(type_tag),
+            "owned": false,
+            "os_mapped": false,
+            "map_cap": 0,
+            "pin": nil,
+            "freed": false
+        };
+    }
+    let page_aligned = num_ceil(sz / 4096) * 4096;
+    let mapped = _os_map_rw_bytes(page_aligned);
+    return map{
+        "__tag__": "ptr",
+        "addr": mapped["addr"],
+        "size": sz,
+        "type_tag": str(type_tag),
+        "owned": true,
+        "os_mapped": mapped["os_mapped"],
+        "map_cap": mapped["cap"],
+        "pin": mapped["pin"],
+        "freed": false
+    };
+}
+
+fn ffi_ptr_wrap(raw_addr, byte_size, type_tag = "void*") {
+    let sz = num_floor(byte_size);
+    if sz < 0 { throw "ffi_ptr_wrap(): byte_size must be >= 0"; }
+    let addr = 0;
+    let pin = nil;
+    if raw_addr == nil {
+        addr = 0;
+    } elif is_ffi_ptr(raw_addr) {
+        addr = raw_addr["addr"];
+    } elif is_i64(raw_addr) {
+        addr = parse_number(i64_to_str(raw_addr));
+    } elif type(raw_addr) == "bytes" {
+        pin = raw_addr;
+        addr = ffi_bytes_ptr(raw_addr);
+    } elif type(raw_addr) == "number" {
+        addr = raw_addr;
+    } else {
+        throw "ffi_ptr_wrap(): unsupported raw_addr type '" + type(raw_addr) + "'";
+    }
+    return map{
+        "__tag__": "ptr",
+        "addr": addr,
+        "size": sz,
+        "type_tag": str(type_tag),
+        "owned": false,
+        "os_mapped": false,
+        "map_cap": 0,
+        "pin": pin,
+        "freed": false
+    };
+}
+
+fn _req_ffi_ptr(p, fn_name) {
+    if not is_ffi_ptr(p) {
+        throw fn_name + "(): expected OBJ_PTR, got " + type(p);
+    }
+}
+
+fn _check_ptr_bounds(p, off, width, fn_name) {
+    _req_ffi_ptr(p, fn_name);
+    if p["freed"] {
+        throw fn_name + "(): use-after-free on OBJ_PTR (" + p["type_tag"] + ")";
+    }
+    if p["addr"] <= 0 and width > 0 {
+        throw fn_name + "(): NULL pointer dereference";
+    }
+    let o = num_floor(off);
+    let w = num_floor(width);
+    if o < 0 or w < 0 or (o + w) > p["size"] {
+        throw fn_name + "(): out-of-bounds access at offset " + str(o) + ".." + str(o + w) + " (size " + str(p["size"]) + ")";
+    }
+    return o;
+}
+
+fn ffi_ptr_type(p) {
+    _req_ffi_ptr(p, "ffi_ptr_type");
+    return "ptr";
+}
+
+fn ffi_ptr_tag(p) {
+    _req_ffi_ptr(p, "ffi_ptr_tag");
+    return p["type_tag"];
+}
+
+fn ffi_ptr_addr(p) {
+    _req_ffi_ptr(p, "ffi_ptr_addr");
+    if p["freed"] { return 0; }
+    return p["addr"];
+}
+
+fn ffi_ptr_size(p) {
+    _req_ffi_ptr(p, "ffi_ptr_size");
+    return p["size"];
+}
+
+fn ffi_ptr_is_null(p) {
+    if p == nil { return true; }
+    _req_ffi_ptr(p, "ffi_ptr_is_null");
+    return p["freed"] or p["addr"] <= 0;
+}
+
+fn ffi_ptr_free(p) {
+    _req_ffi_ptr(p, "ffi_ptr_free");
+    if p["freed"] {
+        return map{ "ok": false, "already_freed": true };
+    }
+    if p["owned"] and p["os_mapped"] and p["addr"] > 0 {
+        if platform() == "windows" {
+            let k32 = _get_kernel32();
+            ffi_call_typed(k32, "VirtualFree", "i64, u64, u32 -> i32", [p["addr"], 0, 0x8000]);
+        } else {
+            let lc = _get_libc();
+            ffi_call_typed(lc, "munmap", "i64, u64 -> i32", [p["addr"], p["map_cap"]]);
+        }
+    }
+    p["addr"] = 0;
+    p["pin"] = nil;
+    p["freed"] = true;
+    return map{ "ok": true, "freed": true };
+}
+
+fn ffi_ptr_read_bytes(p, offset_or_len = nil, maybe_len = nil) {
+    _req_ffi_ptr(p, "ffi_ptr_read_bytes");
+    let off = 0;
+    let n = p["size"];
+    if offset_or_len != nil and maybe_len == nil {
+        off = 0;
+        n = offset_or_len;
+    } elif offset_or_len != nil and maybe_len != nil {
+        off = offset_or_len;
+        n = maybe_len;
+    }
+    let clean_off = _check_ptr_bounds(p, off, n, "ffi_ptr_read_bytes");
+    return ffi_ptr_read(p["addr"] + clean_off, num_floor(n));
+}
+
+fn ffi_ptr_write_bytes(p, offset_or_data, maybe_data = "__UNSET__") {
+    let off = 0;
+    let data = offset_or_data;
+    if type(maybe_data) != "string" or maybe_data != "__UNSET__" {
+        off = offset_or_data;
+        data = maybe_data;
+    }
+    let buf = _to_bytes_obj(data);
+    let n = len(buf);
+    let clean_off = _check_ptr_bounds(p, off, n, "ffi_ptr_write_bytes");
+    return ffi_ptr_write(p["addr"] + clean_off, buf, n);
+}
+
+fn ffi_ptr_read_i32(p, offset = 0) {
+    let clean_off = _check_ptr_bounds(p, offset, 4, "ffi_ptr_read_i32");
+    return ffi_read_i32(p["addr"], clean_off);
+}
+
+fn ffi_ptr_write_i32(p, offset_or_val, maybe_val = "__UNSET__") {
+    let off = 0;
+    let val = offset_or_val;
+    if type(maybe_val) != "string" or maybe_val != "__UNSET__" {
+        off = offset_or_val;
+        val = maybe_val;
+    }
+    let clean_off = _check_ptr_bounds(p, off, 4, "ffi_ptr_write_i32");
+    let packed = ffi_struct_pack("<i", [num_floor(val)]);
+    return ffi_ptr_write(p["addr"] + clean_off, packed, 4);
+}
+
+fn ffi_ptr_read_i64(p, offset = 0) {
+    let clean_off = _check_ptr_bounds(p, offset, 8, "ffi_ptr_read_i64");
+    // Exercise native `ffi_read_i64` AND read exact 8 raw bytes via `ffi_ptr_read` for 64-bit precision
+    let _fast = ffi_read_i64(p["addr"], clean_off);
+    let raw8 = ffi_ptr_read(p["addr"] + clean_off, 8);
+    return _i64_from_le_bytes(raw8);
+}
+
+fn ffi_ptr_write_i64(p, offset_or_val, maybe_val = "__UNSET__") {
+    let off = 0;
+    let val = offset_or_val;
+    if type(maybe_val) != "string" or maybe_val != "__UNSET__" {
+        off = offset_or_val;
+        val = maybe_val;
+    }
+    let clean_off = _check_ptr_bounds(p, off, 8, "ffi_ptr_write_i64");
+    let v64 = i64_new(val);
+    let b = v64["bits_le"];
+    let lo32 = b[0] + b[1] * 256 + b[2] * 65536 + b[3] * 16777216;
+    let hi32 = b[4] + b[5] * 256 + b[6] * 65536 + b[7] * 16777216;
+    let packed = ffi_struct_pack("<II", [lo32, hi32]);
+    return ffi_ptr_write(p["addr"] + clean_off, packed, 8);
+}
+
+fn ffi_ptr_read_f64(p, offset = 0) {
+    let clean_off = _check_ptr_bounds(p, offset, 8, "ffi_ptr_read_f64");
+    return ffi_read_f64(p["addr"], clean_off);
+}
+
+fn ffi_ptr_write_f64(p, offset_or_val, maybe_val = "__UNSET__") {
+    let off = 0;
+    let val = offset_or_val;
+    if type(maybe_val) != "string" or maybe_val != "__UNSET__" {
+        off = offset_or_val;
+        val = maybe_val;
+    }
+    let clean_off = _check_ptr_bounds(p, off, 8, "ffi_ptr_write_f64");
+    let packed = ffi_struct_pack("<d", [val]);
+    return ffi_ptr_write(p["addr"] + clean_off, packed, 8);
+}
+
+// ============================================================================
+// 5. Win32 Wide `UTF-16LE` (`*W`) & POSIX Direct OS Syscall Driver
+// ============================================================================
+
+fn utf8_to_utf16le_bytes(s, null_terminate = true) {
+    let u8 = str_to_bytes(str(s));
+    let n = len(u8);
+    let out = [];
+    let i = 0;
+    while i < n {
+        let b0 = u8[i];
+        let cp = 0xFFFD;
+        if b0 < 0x80 {
+            cp = b0;
+            i = i + 1;
+        } elif bit_and(b0, 0xE0) == 0xC0 and i + 1 < n {
+            cp = bit_shl(bit_and(b0, 0x1F), 6) + bit_and(u8[i + 1], 0x3F);
+            i = i + 2;
+        } elif bit_and(b0, 0xF0) == 0xE0 and i + 2 < n {
+            cp = bit_shl(bit_and(b0, 0x0F), 12) +
+                 bit_shl(bit_and(u8[i + 1], 0x3F), 6) +
+                 bit_and(u8[i + 2], 0x3F);
+            i = i + 3;
+        } elif bit_and(b0, 0xF8) == 0xF0 and i + 3 < n {
+            cp = bit_shl(bit_and(b0, 0x07), 18) +
+                 bit_shl(bit_and(u8[i + 1], 0x3F), 12) +
+                 bit_shl(bit_and(u8[i + 2], 0x3F), 6) +
+                 bit_and(u8[i + 3], 0x3F);
+            i = i + 4;
+        } else {
+            cp = 0xFFFD;
+            i = i + 1;
+        }
+
+        if cp >= 0xD800 and cp <= 0xDFFF {
+            cp = 0xFFFD;
+        }
+        if cp < 0x10000 {
+            array_push(out, bit_and(cp, 255));
+            array_push(out, bit_and(bit_shr(cp, 8), 255));
+        } elif cp <= 0x10FFFF {
+            let adj = cp - 0x10000;
+            let hi_sur = 0xD800 + bit_shr(adj, 10);
+            let lo_sur = 0xDC00 + bit_and(adj, 0x3FF);
+            array_push(out, bit_and(hi_sur, 255));
+            array_push(out, bit_and(bit_shr(hi_sur, 8), 255));
+            array_push(out, bit_and(lo_sur, 255));
+            array_push(out, bit_and(bit_shr(lo_sur, 8), 255));
+        } else {
+            array_push(out, 0xFD);
+            array_push(out, 0xFF);
+        }
+    }
+    if null_terminate {
+        array_push(out, 0);
+        array_push(out, 0);
+    }
+    return bytes_new(out);
+}
+
+fn utf16le_bytes_to_utf8(b) {
+    let n = _byte_len(b);
+    let u8 = [];
+    let i = 0;
+    while i + 1 < n {
+        let w1 = _byte_at(b, i) + _byte_at(b, i + 1) * 256;
+        if w1 == 0 {
+            break;
+        }
+        let cp = w1;
+        if w1 >= 0xD800 and w1 <= 0xDBFF {
+            if i + 3 < n {
+                let w2 = _byte_at(b, i + 2) + _byte_at(b, i + 3) * 256;
+                if w2 >= 0xDC00 and w2 <= 0xDFFF {
+                    cp = 0x10000 + bit_shl(w1 - 0xD800, 10) + (w2 - 0xDC00);
+                    i = i + 4;
+                } else {
+                    cp = 0xFFFD;
+                    i = i + 2;
+                }
+            } else {
+                cp = 0xFFFD;
+                i = i + 2;
+            }
+        } elif w1 >= 0xDC00 and w1 <= 0xDFFF {
+            cp = 0xFFFD;
+            i = i + 2;
+        } else {
+            i = i + 2;
+        }
+
+        if cp < 0x80 {
+            array_push(u8, cp);
+        } elif cp < 0x800 {
+            array_push(u8, bit_or(0xC0, bit_shr(cp, 6)));
+            array_push(u8, bit_or(0x80, bit_and(cp, 0x3F)));
+        } elif cp < 0x10000 {
+            array_push(u8, bit_or(0xE0, bit_shr(cp, 12)));
+            array_push(u8, bit_or(0x80, bit_and(bit_shr(cp, 6), 0x3F)));
+            array_push(u8, bit_or(0x80, bit_and(cp, 0x3F)));
+        } else {
+            array_push(u8, bit_or(0xF0, bit_shr(cp, 18)));
+            array_push(u8, bit_or(0x80, bit_and(bit_shr(cp, 12), 0x3F)));
+            array_push(u8, bit_or(0x80, bit_and(bit_shr(cp, 6), 0x3F)));
+            array_push(u8, bit_or(0x80, bit_and(cp, 0x3F)));
+        }
+    }
+    return bytes_to_str(u8);
+}
+
+fn pure_fs_fullpath_w(path) {
+    let p = str(path);
+    if platform() == "windows" {
+        let k32 = _get_kernel32();
+        let wp = utf8_to_utf16le_bytes(p, true);
+        let out_w = bytes_new(2048);
+        let n_chars = ffi_call_typed(k32, "GetFullPathNameW", "i64, u32, ptr, ptr -> u32", [
+            ffi_bytes_ptr(wp), 1024, out_w, 0
+        ]);
+        if n_chars == 0 { return p; }
+        return utf16le_bytes_to_utf8(bytes_slice(out_w, 0, n_chars * 2));
+    }
+    let lc = _get_libc();
+    let out_c = bytes_new(4096);
+    let rp = ffi_call_typed(lc, "realpath", "str, ptr -> i64", [p, out_c]);
+    if rp <= 0 { return p; }
+    return ffi_read_cstr(out_c);
+}
+
+fn pure_fs_exists(path) {
+    let p = str(path);
+    if len(p) == 0 { return false; }
+    if platform() == "windows" {
+        let k32 = _get_kernel32();
+        let wp = utf8_to_utf16le_bytes(p, true);
+        let attr = ffi_call_typed(k32, "GetFileAttributesW", "i64 -> u32", [ffi_bytes_ptr(wp)]);
+        return attr != 4294967295;
+    }
+    let lc = _get_libc();
+    let rc = ffi_call_typed(lc, "access", "str, i32 -> i32", [p, 0]);
+    return rc == 0;
+}
+
+fn pure_fs_mkdirs(path) {
+    let raw = str(path);
+    if len(raw) == 0 { return false; }
+    if platform() == "windows" {
+        let k32 = _get_kernel32();
+        let norm = str_replace_all(raw, "/", "\\");
+        let parts = str_split(norm, "\\");
+        let cur = "";
+        let i = 0;
+        while i < len(parts) {
+            let seg = parts[i];
+            if len(seg) > 0 {
+                if len(cur) == 0 {
+                    cur = seg;
+                } else {
+                    cur = cur + "\\" + seg;
+                }
+                if not (len(cur) == 2 and str_ends_with(cur, ":")) {
+                    let wc = utf8_to_utf16le_bytes(cur, true);
+                    ffi_call_typed(k32, "CreateDirectoryW", "i64, ptr -> i32", [ffi_bytes_ptr(wc), 0]);
+                }
+            }
+            i = i + 1;
+        }
+        return pure_fs_exists(norm);
+    }
+
+    let lc = _get_libc();
+    let norm = str_replace_all(raw, "\\", "/");
+    let parts = str_split(norm, "/");
+    let cur = if str_starts_with(norm, "/") { "/" } else { "" };
+    let i = 0;
+    while i < len(parts) {
+        let seg = parts[i];
+        if len(seg) > 0 {
+            if cur == "/" {
+                cur = "/" + seg;
+            } elif len(cur) == 0 {
+                cur = seg;
+            } else {
+                cur = cur + "/" + seg;
+            }
+            ffi_call_typed(lc, "mkdir", "str, u32 -> i32", [cur, 493]);
+        }
+        i = i + 1;
+    }
+    return pure_fs_exists(norm);
+}
+
+fn pure_fs_write_bytes(path, data) {
+    let p = str(path);
+    let buf = _to_bytes_obj(data);
+    let total = len(buf);
+
+    if platform() == "windows" {
+        let k32 = _get_kernel32();
+        let wp = utf8_to_utf16le_bytes(p, true);
+        // GENERIC_WRITE=0x40000000, FILE_SHARE_READ=1, CREATE_ALWAYS=2, FILE_ATTRIBUTE_NORMAL=0x80
+        let h = ffi_call_typed(k32, "CreateFileW", "i64, u32, u32, ptr, u32, u32, ptr -> i64", [
+            ffi_bytes_ptr(wp), 0x40000000, 1, 0, 2, 0x80, 0
+        ]);
+        if h == -1 or h == 0 {
+            throw "pure_fs_write_bytes(): CreateFileW failed for '" + p + "'";
+        }
+        let written_total = 0;
+        let base_ptr = ffi_bytes_ptr(buf);
+        let written_box = bytes_new(4);
+        while written_total < total {
+            let chunk = num_min(total - written_total, 1048576);
+            let ok = ffi_call_typed(k32, "WriteFile", "i64, i64, u32, ptr, ptr -> i32", [
+                h, base_ptr + written_total, chunk, written_box, 0
+            ]);
+            let nw = ffi_read_i32(written_box, 0);
+            if ok == 0 or nw <= 0 {
+                ffi_call_typed(k32, "CloseHandle", "i64 -> i32", [h]);
+                throw "pure_fs_write_bytes(): WriteFile failed";
+            }
+            written_total = written_total + nw;
+        }
+        ffi_call_typed(k32, "CloseHandle", "i64 -> i32", [h]);
+        return map{ "ok": true, "bytes_written": written_total };
+    }
+
+    let lc = _get_libc();
+    let plat = platform();
+    // O_WRONLY | O_CREAT | O_TRUNC: Linux = 1 | 64 | 512 = 577; macOS/BSD = 1 | 512 | 1024 = 1537
+    let oflags = if plat == "macos" or plat == "darwin" { 1537 } else { 577 };
+    let fd = ffi_call_typed(lc, "open", "str, i32, u32 -> i32", [p, oflags, 420]);
+    if fd < 0 {
+        throw "pure_fs_write_bytes(): POSIX open() failed for '" + p + "'";
+    }
+    let written_total = 0;
+    let base_ptr = ffi_bytes_ptr(buf);
+    while written_total < total {
+        let nw = ffi_call_typed(lc, "write", "i32, i64, u64 -> i64", [
+            fd, base_ptr + written_total, total - written_total
+        ]);
+        if nw <= 0 {
+            ffi_call_typed(lc, "close", "i32 -> i32", [fd]);
+            throw "pure_fs_write_bytes(): POSIX write() failed";
+        }
+        written_total = written_total + nw;
+    }
+    ffi_call_typed(lc, "close", "i32 -> i32", [fd]);
+    return map{ "ok": true, "bytes_written": written_total };
+}
+
+fn pure_fs_write(path, text) {
+    return pure_fs_write_bytes(path, bytes_from_str(str(text)));
+}
+
+fn pure_fs_read_bytes(path) {
+    let p = str(path);
+    if platform() == "windows" {
+        let k32 = _get_kernel32();
+        let wp = utf8_to_utf16le_bytes(p, true);
+        // GENERIC_READ=0x80000000, FILE_SHARE_READ|WRITE=3, OPEN_EXISTING=3, FILE_ATTRIBUTE_NORMAL=0x80
+        let h = ffi_call_typed(k32, "CreateFileW", "i64, u32, u32, ptr, u32, u32, ptr -> i64", [
+            ffi_bytes_ptr(wp), 0x80000000, 3, 0, 3, 0x80, 0
+        ]);
+        if h == -1 or h == 0 {
+            throw "pure_fs_read_bytes(): CreateFileW failed for '" + p + "'";
+        }
+        let out = [];
+        let chunk = bytes_new(65536);
+        let nread_box = bytes_new(4);
+        while true {
+            let ok = ffi_call_typed(k32, "ReadFile", "i64, ptr, u32, ptr, ptr -> i32", [
+                h, chunk, 65536, nread_box, 0
+            ]);
+            let nr = ffi_read_i32(nread_box, 0);
+            if ok == 0 or nr <= 0 { break; }
+            let k = 0;
+            while k < nr {
+                array_push(out, bytes_get(chunk, k));
+                k = k + 1;
+            }
+        }
+        ffi_call_typed(k32, "CloseHandle", "i64 -> i32", [h]);
+        return bytes_new(out);
+    }
+
+    let lc = _get_libc();
+    let fd = ffi_call_typed(lc, "open", "str, i32, u32 -> i32", [p, 0, 0]);
+    if fd < 0 {
+        throw "pure_fs_read_bytes(): POSIX open() failed for '" + p + "'";
+    }
+    let out = [];
+    let chunk = bytes_new(65536);
+    while true {
+        let nr = ffi_call_typed(lc, "read", "i32, ptr, u64 -> i64", [fd, chunk, 65536]);
+        if nr <= 0 { break; }
+        let k = 0;
+        while k < nr {
+            array_push(out, bytes_get(chunk, k));
+            k = k + 1;
+        }
+    }
+    ffi_call_typed(lc, "close", "i32 -> i32", [fd]);
+    return bytes_new(out);
+}
+
+fn pure_fs_read(path) {
+    return bytes_to_str(pure_fs_read_bytes(path));
+}
+
+fn pure_fs_listdir(path) {
+    let p = str(path);
+    let out = [];
+    if platform() == "windows" {
+        let k32 = _get_kernel32();
+        let clean = str_replace_all(p, "/", "\\");
+        let pat = if str_ends_with(clean, "\\") { clean + "*" } else { clean + "\\*" };
+        let wpat = utf8_to_utf16le_bytes(pat, true);
+        // WIN32_FIND_DATAW = 592 bytes; cFileName WCHAR[260] at byte offset 44
+        let fdata = bytes_new(592);
+        let hfind = ffi_call_typed(k32, "FindFirstFileW", "i64, ptr -> i64", [ffi_bytes_ptr(wpat), fdata]);
+        if hfind == -1 or hfind == 0 {
+            return out;
+        }
+        while true {
+            let nm = utf16le_bytes_to_utf8(bytes_slice(fdata, 44, 564));
+            if nm != "." and nm != ".." and len(nm) > 0 {
+                array_push(out, nm);
+            }
+            let more = ffi_call_typed(k32, "FindNextFileW", "i64, ptr -> i32", [hfind, fdata]);
+            if more == 0 { break; }
+        }
+        ffi_call_typed(k32, "FindClose", "i64 -> i32", [hfind]);
+        return array_sort(out);
+    }
+
+    let lc = _get_libc();
+    let dirp = ffi_call_typed(lc, "opendir", "str -> i64", [p]);
+    if dirp <= 0 {
+        return out;
+    }
+    let d_name_off = if platform() == "macos" or platform() == "darwin" { 21 } else { 19 };
+    while true {
+        let ent = ffi_call_typed(lc, "readdir", "i64 -> i64", [dirp]);
+        if ent <= 0 { break; }
+        let nm = ffi_read_cstr(ent + d_name_off);
+        if nm != nil and nm != "." and nm != ".." and len(nm) > 0 {
+            array_push(out, nm);
+        }
+    }
+    ffi_call_typed(lc, "closedir", "i64 -> i32", [dirp]);
+    return array_sort(out);
+}
+
+fn pure_fs_remove(path) {
+    let p = str(path);
+    if platform() == "windows" {
+        let k32 = _get_kernel32();
+        let wp = utf8_to_utf16le_bytes(p, true);
+        let wptr = ffi_bytes_ptr(wp);
+        let ok_file = ffi_call_typed(k32, "DeleteFileW", "i64 -> i32", [wptr]);
+        if ok_file != 0 { return true; }
+        let ok_dir = ffi_call_typed(k32, "RemoveDirectoryW", "i64 -> i32", [wptr]);
+        return ok_dir != 0;
+    }
+    let lc = _get_libc();
+    let rc = ffi_call_typed(lc, "unlink", "str -> i32", [p]);
+    if rc == 0 { return true; }
+    let rcd = ffi_call_typed(lc, "rmdir", "str -> i32", [p]);
+    return rcd == 0;
+}
+
+fn _quote_win32_arg(a) {
+    let s = str(a);
+    if len(s) == 0 { return "\"\""; }
+    if not str_contains(s, " ") and not str_contains(s, "\t") and not str_contains(s, "\"") {
+        return s;
+    }
+    return "\"" + str_replace_all(s, "\"", "\\\"") + "\"";
+}
+
+fn _cstr_nul_bytes(s) {
+    let bs = str_to_bytes(str(s));
+    array_push(bs, 0);
+    return bytes_new(bs);
+}
+
+fn pure_proc_spawn_w(exe, args = []) {
+    let exe_str = str(exe);
+    let arg_list = if args == nil { [] } else { args };
+
+    if platform() == "windows" {
+        let k32 = _get_kernel32();
+        let parts = [_quote_win32_arg(exe_str)];
+        let i = 0;
+        while i < len(arg_list) {
+            array_push(parts, _quote_win32_arg(arg_list[i]));
+            i = i + 1;
+        }
+        let cmd_line = str_join(parts, " ");
+        let wcmd = utf8_to_utf16le_bytes(cmd_line, true);
+        // STARTUPINFOW (Win64 = 104 bytes, cb = 104 at offset 0)
+        let si = bytes_new(104);
+        bytes_set(si, 0, 104);
+        // PROCESS_INFORMATION (Win64 = 24 bytes: hProcess@0, hThread@8, dwProcessId@16, dwThreadId@20)
+        let pi = bytes_new(24);
+        let ok = ffi_call_typed(k32, "CreateProcessW", "ptr, i64, ptr, ptr, i32, u32, ptr, ptr, ptr, ptr -> i32", [
+            0, ffi_bytes_ptr(wcmd), 0, 0, 0, 0, 0, 0, si, pi
+        ]);
+        if ok == 0 {
+            return map{ "ok": false, "exit_code": -1, "pid": 0, "error": "CreateProcessW failed" };
+        }
+        let pi_fields = ffi_struct_unpack("<QQII", pi, 0);
+        let h_proc = pi_fields[0];
+        let h_thr = pi_fields[1];
+        let pid = pi_fields[2];
+        ffi_call_typed(k32, "WaitForSingleObject", "i64, u32 -> u32", [h_proc, 0xFFFFFFFF]);
+        let ec_box = bytes_new(4);
+        ffi_call_typed(k32, "GetExitCodeProcess", "i64, ptr -> i32", [h_proc, ec_box]);
+        let exit_code = ffi_read_i32(ec_box, 0);
+        ffi_call_typed(k32, "CloseHandle", "i64 -> i32", [h_thr]);
+        ffi_call_typed(k32, "CloseHandle", "i64 -> i32", [h_proc]);
+        return map{ "ok": true, "exit_code": exit_code, "pid": pid };
+    }
+
+    // POSIX direct `posix_spawnp` + `waitpid` (zero shell invocation!)
+    let lc = _get_libc();
+    let pinned_args = [_cstr_nul_bytes(exe_str)];
+    let ptrs = [ffi_bytes_ptr(pinned_args[0])];
+    let i = 0;
+    while i < len(arg_list) {
+        let cb = _cstr_nul_bytes(arg_list[i]);
+        array_push(pinned_args, cb);
+        array_push(ptrs, ffi_bytes_ptr(cb));
+        i = i + 1;
+    }
+    array_push(ptrs, 0);
+    let argv_buf = ffi_struct_pack("<" + str(len(ptrs)) + "Q", ptrs);
+
+    let path_env = env_get("PATH");
+    let home_env = env_get("HOME");
+    let pinned_env = [
+        _cstr_nul_bytes("PATH=" + (if path_env == nil { "/usr/local/bin:/usr/bin:/bin" } else { path_env }))
+    ];
+    let env_ptrs = [ffi_bytes_ptr(pinned_env[0])];
+    if home_env != nil {
+        let hb = _cstr_nul_bytes("HOME=" + home_env);
+        array_push(pinned_env, hb);
+        array_push(env_ptrs, ffi_bytes_ptr(hb));
+    }
+    array_push(env_ptrs, 0);
+    let envp_buf = ffi_struct_pack("<" + str(len(env_ptrs)) + "Q", env_ptrs);
+
+    let pid_box = bytes_new(4);
+    let sp_rc = ffi_call_typed(lc, "posix_spawnp", "ptr, str, ptr, ptr, ptr, ptr -> i32", [
+        pid_box, exe_str, 0, 0, argv_buf, envp_buf
+    ]);
+    if sp_rc != 0 {
+        return map{ "ok": false, "exit_code": sp_rc, "pid": 0, "error": "posix_spawnp rc=" + str(sp_rc) };
+    }
+    let pid = ffi_read_i32(pid_box, 0);
+    let st_box = bytes_new(4);
+    ffi_call_typed(lc, "waitpid", "i32, ptr, i32 -> i32", [pid, st_box, 0]);
+    let raw_status = ffi_read_i32(st_box, 0);
+    let exit_code = bit_and(bit_shr(raw_status, 8), 255);
+    return map{ "ok": true, "exit_code": exit_code, "pid": pid };
+}
+
+// ============================================================================
+// 6A. `AF_UNIX` Domain Sockets + `SO_PEERCRED`
+// ============================================================================
+
+fn _unwrap_fd(fd_or_obj) {
+    if type(fd_or_obj) == "map" and map_has(fd_or_obj, "fd") {
+        return num_floor(fd_or_obj["fd"]);
+    }
+    return num_floor(fd_or_obj);
+}
+
+fn unix_sockaddr_pack(sock_path) {
+    let p = str(sock_path);
+    let plat = platform();
+    if plat == "macos" or plat == "darwin" {
+        if len(str_to_bytes(p)) >= 104 { throw "unix_sockaddr_pack(): socket path exceeds 103 bytes"; }
+        return ffi_struct_pack("<BB104s", [106, 1, p]);
+    }
+    if len(str_to_bytes(p)) >= 108 { throw "unix_sockaddr_pack(): socket path exceeds 107 bytes"; }
+    return ffi_struct_pack("<H108s", [1, p]);
+}
+
+fn unix_socket_listen(sock_path, backlog = 16) {
+    let p = str(sock_path);
+    if platform() == "windows" {
+        return map{ "ok": false, "fd": -1, "error": "AF_UNIX stream server uses POSIX libc" };
+    }
+    let lc = _get_libc();
+    ffi_call_typed(lc, "unlink", "str -> i32", [p]);
+    // AF_UNIX = 1, SOCK_STREAM = 1
+    let fd = ffi_call_typed(lc, "socket", "i32, i32, i32 -> i32", [1, 1, 0]);
+    if fd < 0 {
+        return map{ "ok": false, "fd": -1, "error": "socket(AF_UNIX) failed" };
+    }
+    let sun = unix_sockaddr_pack(p);
+    let brc = ffi_call_typed(lc, "bind", "i32, ptr, u32 -> i32", [fd, sun, len(sun)]);
+    if brc != 0 {
+        ffi_call_typed(lc, "close", "i32 -> i32", [fd]);
+        return map{ "ok": false, "fd": -1, "error": "bind() failed for " + p };
+    }
+    let lrc = ffi_call_typed(lc, "listen", "i32, i32 -> i32", [fd, num_floor(backlog)]);
+    if lrc != 0 {
+        ffi_call_typed(lc, "close", "i32 -> i32", [fd]);
+        ffi_call_typed(lc, "unlink", "str -> i32", [p]);
+        return map{ "ok": false, "fd": -1, "error": "listen() failed" };
+    }
+    return map{ "ok": true, "fd": fd, "path": p };
+}
+
+fn unix_socket_connect(sock_path) {
+    let p = str(sock_path);
+    if platform() == "windows" {
+        return map{ "ok": false, "fd": -1, "error": "AF_UNIX stream client uses POSIX libc" };
+    }
+    let lc = _get_libc();
+    let fd = ffi_call_typed(lc, "socket", "i32, i32, i32 -> i32", [1, 1, 0]);
+    if fd < 0 {
+        return map{ "ok": false, "fd": -1, "error": "socket(AF_UNIX) failed" };
+    }
+    let sun = unix_sockaddr_pack(p);
+    let crc = ffi_call_typed(lc, "connect", "i32, ptr, u32 -> i32", [fd, sun, len(sun)]);
+    if crc != 0 {
+        ffi_call_typed(lc, "close", "i32 -> i32", [fd]);
+        return map{ "ok": false, "fd": -1, "error": "connect() failed for " + p };
+    }
+    return map{ "ok": true, "fd": fd, "path": p };
+}
+
+fn unix_socket_accept(server_fd) {
+    let sfd = _unwrap_fd(server_fd);
+    let lc = _get_libc();
+    let cfd = ffi_call_typed(lc, "accept", "i32, ptr, ptr -> i32", [sfd, 0, 0]);
+    if cfd < 0 {
+        return map{ "ok": false, "fd": -1, "error": "accept() failed" };
+    }
+    return map{ "ok": true, "fd": cfd };
+}
+
+fn unix_socket_send(fd_or_obj, data) {
+    let fd = _unwrap_fd(fd_or_obj);
+    let lc = _get_libc();
+    let buf = _to_bytes_obj(data);
+    let flags = if platform() == "linux" { 0x4000 } else { 0 };
+    return ffi_call_typed(lc, "send", "i32, ptr, u64, i32 -> i64", [fd, buf, len(buf), flags]);
+}
+
+fn unix_socket_recv(fd_or_obj, max_bytes = 4096) {
+    let fd = _unwrap_fd(fd_or_obj);
+    let cap = num_max(1, num_floor(max_bytes));
+    let lc = _get_libc();
+    let buf = bytes_new(cap);
+    let n = ffi_call_typed(lc, "recv", "i32, ptr, u64, i32 -> i64", [fd, buf, cap, 0]);
+    if n <= 0 {
+        return map{ "ok": n == 0, "n": n, "bytes": bytes_new(0), "text": "" };
+    }
+    let sub = bytes_slice(buf, 0, n);
+    return map{ "ok": true, "n": n, "bytes": sub, "text": bytes_to_str(sub) };
+}
+
+fn unix_socket_close(fd_or_obj) {
+    let fd = _unwrap_fd(fd_or_obj);
+    if fd < 0 { return false; }
+    let lc = _get_libc();
+    return ffi_call_typed(lc, "close", "i32 -> i32", [fd]) == 0;
+}
+
+fn unix_peer_cred(fd_or_obj) {
+    let fd = _unwrap_fd(fd_or_obj);
+    let plat = platform();
+    if plat == "linux" {
+        let lc = _get_libc();
+        // SOL_SOCKET = 1, SO_PEERCRED = 17, struct ucred { pid_t pid; uid_t uid; gid_t gid; } (12 bytes)
+        let cred_buf = bytes_new(12);
+        let len_buf = ffi_struct_pack("<I", [12]);
+        let rc = ffi_call_typed(lc, "getsockopt", "i32, i32, i32, ptr, ptr -> i32", [
+            fd, 1, 17, cred_buf, len_buf
+        ]);
+        if rc != 0 {
+            return map{ "ok": false, "pid": -1, "uid": -1, "gid": -1, "error": "getsockopt(SO_PEERCRED) failed" };
+        }
+        let vals = ffi_struct_unpack("<iii", cred_buf, 0);
+        return map{ "ok": true, "pid": vals[0], "uid": vals[1], "gid": vals[2] };
+    }
+    if plat == "macos" or plat == "darwin" {
+        let lc = _get_libc();
+        let uid_buf = bytes_new(4);
+        let gid_buf = bytes_new(4);
+        let rc = ffi_call_typed(lc, "getpeereid", "i32, ptr, ptr -> i32", [fd, uid_buf, gid_buf]);
+        let pid_buf = bytes_new(4);
+        let plen = ffi_struct_pack("<I", [4]);
+        // SOL_LOCAL = 0, LOCAL_PEERPID = 2
+        ffi_call_typed(lc, "getsockopt", "i32, i32, i32, ptr, ptr -> i32", [fd, 0, 2, pid_buf, plen]);
+        return map{
+            "ok": rc == 0,
+            "pid": ffi_read_i32(pid_buf, 0),
+            "uid": ffi_read_i32(uid_buf, 0),
+            "gid": ffi_read_i32(gid_buf, 0)
+        };
+    }
+    return map{ "ok": false, "pid": -1, "uid": -1, "gid": -1, "error": "SO_PEERCRED unsupported on " + plat };
+}
+
+// ============================================================================
+// 6B. Async I/O Multiplexer (`epoll` / `kqueue` / `WSAPoll`)
+// ============================================================================
+
+fn async_mux_backend() {
+    let plat = platform();
+    if plat == "linux" { return "epoll"; }
+    if plat == "windows" { return "WSAPoll"; }
+    if plat == "macos" or plat == "darwin" or plat == "freebsd" { return "kqueue"; }
+    return "poll";
+}
+
+fn _epoll_is_packed_x64() {
+    let arch = os_arch();
+    return arch == "x86_64" or arch == "amd64";
+}
+
+fn async_mux_open() {
+    let backend = async_mux_backend();
+    if backend == "epoll" {
+        let lc = _get_libc();
+        let epfd = ffi_call_typed(lc, "epoll_create1", "i32 -> i32", [0]);
+        return map{
+            "ok": epfd >= 0,
+            "backend": "epoll",
+            "epfd": epfd,
+            "watched": map{},
+            "closed": false
+        };
+    }
+    if backend == "kqueue" {
+        let lc = _get_libc();
+        let kq = ffi_call_typed(lc, "kqueue", "void -> i32", []);
+        return map{
+            "ok": kq >= 0,
+            "backend": "kqueue",
+            "kq": kq,
+            "watched": map{},
+            "closed": false
+        };
+    }
+    if backend == "WSAPoll" {
+        _get_ws2_32();
+        return map{
+            "ok": true,
+            "backend": "WSAPoll",
+            "fds": [],
+            "watched": map{},
+            "closed": false
+        };
+    }
+    return map{ "ok": false, "backend": backend, "closed": true };
+}
+
+fn async_mux_ctl_add(mux, fd_or_obj, events = 1) {
+    let fd = _unwrap_fd(fd_or_obj);
+    let ev_mask = num_floor(events);
+    let backend = mux["backend"];
+
+    if backend == "epoll" {
+        let lc = _get_libc();
+        let ev_struct = if _epoll_is_packed_x64() {
+            ffi_struct_pack("<IQ", [ev_mask, fd])
+        } else {
+            ffi_struct_pack("<IIQ", [ev_mask, 0, fd])
+        };
+        // EPOLL_CTL_ADD = 1, fallback EPOLL_CTL_MOD = 3
+        let rc = ffi_call_typed(lc, "epoll_ctl", "i32, i32, i32, ptr -> i32", [mux["epfd"], 1, fd, ev_struct]);
+        if rc != 0 {
+            rc = ffi_call_typed(lc, "epoll_ctl", "i32, i32, i32, ptr -> i32", [mux["epfd"], 3, fd, ev_struct]);
+        }
+        mux["watched"][str(fd)] = ev_mask;
+        return map{ "ok": rc == 0, "fd": fd, "events": ev_mask };
+    }
+
+    if backend == "kqueue" {
+        let lc = _get_libc();
+        let rc = 0;
+        if bit_and(ev_mask, MUX_READ) != 0 {
+            // EVFILT_READ = -1, EV_ADD|EV_ENABLE = 0x0005
+            let kev_r = ffi_struct_pack("<QhhIQQ", [fd, -1, 5, 0, 0, 0]);
+            rc = ffi_call_typed(lc, "kevent", "i32, ptr, i32, ptr, i32, ptr -> i32", [mux["kq"], kev_r, 1, 0, 0, 0]);
+        }
+        if bit_and(ev_mask, MUX_WRITE) != 0 {
+            // EVFILT_WRITE = -2, EV_ADD|EV_ENABLE = 0x0005
+            let kev_w = ffi_struct_pack("<QhhIQQ", [fd, -2, 5, 0, 0, 0]);
+            rc = ffi_call_typed(lc, "kevent", "i32, ptr, i32, ptr, i32, ptr -> i32", [mux["kq"], kev_w, 1, 0, 0, 0]);
+        }
+        mux["watched"][str(fd)] = ev_mask;
+        return map{ "ok": rc >= 0, "fd": fd, "events": ev_mask };
+    }
+
+    if backend == "WSAPoll" {
+        if not map_has(mux["watched"], str(fd)) {
+            array_push(mux["fds"], fd);
+        }
+        mux["watched"][str(fd)] = ev_mask;
+        return map{ "ok": true, "fd": fd, "events": ev_mask };
+    }
+
+    return map{ "ok": false, "fd": fd, "events": ev_mask };
+}
+
+fn async_mux_wait(mux, timeout_ms = 0) {
+    let tms = num_floor(timeout_ms);
+    let backend = mux["backend"];
+    let ready = [];
+
+    if backend == "epoll" {
+        let lc = _get_libc();
+        let packed_x64 = _epoll_is_packed_x64();
+        let stride = if packed_x64 { 12 } else { 16 };
+        let max_ev = 32;
+        let out_buf = bytes_new(max_ev * stride);
+        let n = ffi_call_typed(lc, "epoll_wait", "i32, ptr, i32, i32 -> i32", [
+            mux["epfd"], out_buf, max_ev, tms
+        ]);
+        let i = 0;
+        while i < n {
+            let fields = if packed_x64 {
+                ffi_struct_unpack("<IQ", out_buf, i * stride)
+            } else {
+                let tmp = ffi_struct_unpack("<IIQ", out_buf, i * stride);
+                [tmp[0], tmp[2]]
+            };
+            let rev = fields[0];
+            let rfd = fields[1];
+            array_push(ready, map{
+                "fd": rfd,
+                "events": rev,
+                "readable": bit_and(rev, MUX_READ) != 0,
+                "writable": bit_and(rev, MUX_WRITE) != 0
+            });
+            i = i + 1;
+        }
+        return map{ "ok": n >= 0, "count": num_max(0, n), "ready": ready, "backend": "epoll" };
+    }
+
+    if backend == "kqueue" {
+        let lc = _get_libc();
+        let max_ev = 32;
+        let out_buf = bytes_new(max_ev * 32);
+        let sec = if tms <= 0 { 0 } else { num_floor(tms / 1000) };
+        let nsec = if tms <= 0 { 0 } else { num_mod(tms, 1000) * 1000000 };
+        let ts_buf = ffi_struct_pack("<qq", [sec, nsec]);
+        let n = ffi_call_typed(lc, "kevent", "i32, ptr, i32, ptr, i32, ptr -> i32", [
+            mux["kq"], 0, 0, out_buf, max_ev, ts_buf
+        ]);
+        let i = 0;
+        while i < n {
+            let kev = ffi_struct_unpack("<QhhIQQ", out_buf, i * 32);
+            let rfd = kev[0];
+            let filt = kev[1];
+            let rev = if filt == -1 { MUX_READ } elif filt == -2 { MUX_WRITE } else { MUX_READ };
+            array_push(ready, map{
+                "fd": rfd,
+                "events": rev,
+                "readable": filt == -1,
+                "writable": filt == -2
+            });
+            i = i + 1;
+        }
+        return map{ "ok": n >= 0, "count": num_max(0, n), "ready": ready, "backend": "kqueue" };
+    }
+
+    if backend == "WSAPoll" {
+        let ws2 = _get_ws2_32();
+        let fds = mux["fds"];
+        let nfds = len(fds);
+        if nfds == 0 {
+            return map{ "ok": true, "count": 0, "ready": [], "backend": "WSAPoll" };
+        }
+        // WSAPOLLFD on Win64: SOCKET fd (8B), SHORT events (2B), SHORT revents (2B), 4B tail pad = 16 bytes
+        let pfd_buf = bytes_new(nfds * 16);
+        let i = 0;
+        while i < nfds {
+            let fd = fds[i];
+            let mask = mux["watched"][str(fd)];
+            let w_ev = (if bit_and(mask, MUX_READ) != 0 { 0x0100 } else { 0 }) +
+                       (if bit_and(mask, MUX_WRITE) != 0 { 0x0010 } else { 0 });
+            let one = ffi_struct_pack("<QhhI", [fd, w_ev, 0, 0]);
+            ffi_ptr_write(ffi_bytes_ptr(pfd_buf) + i * 16, one, 16);
+            i = i + 1;
+        }
+        let n = ffi_call_typed(ws2, "WSAPoll", "ptr, u32, i32 -> i32", [pfd_buf, nfds, tms]);
+        i = 0;
+        while i < nfds and n > 0 {
+            let unp = ffi_struct_unpack("<QhhI", pfd_buf, i * 16);
+            let rev_w = unp[2];
+            if rev_w != 0 {
+                let rd = bit_and(rev_w, 0x0100) != 0;
+                let wr = bit_and(rev_w, 0x0010) != 0;
+                array_push(ready, map{
+                    "fd": unp[0],
+                    "events": (if rd { MUX_READ } else { 0 }) + (if wr { MUX_WRITE } else { 0 }),
+                    "readable": rd,
+                    "writable": wr
+                });
+            }
+            i = i + 1;
+        }
+        return map{ "ok": n >= 0, "count": len(ready), "ready": ready, "backend": "WSAPoll" };
+    }
+
+    return map{ "ok": false, "count": 0, "ready": [], "backend": backend };
+}
+
+fn async_mux_close(mux) {
+    if mux == nil or mux["closed"] {
+        return map{ "ok": true, "closed": true };
+    }
+    let backend = mux["backend"];
+    if backend == "epoll" and mux["epfd"] >= 0 {
+        let lc = _get_libc();
+        ffi_call_typed(lc, "close", "i32 -> i32", [mux["epfd"]]);
+    } elif backend == "kqueue" and mux["kq"] >= 0 {
+        let lc = _get_libc();
+        ffi_call_typed(lc, "close", "i32 -> i32", [mux["kq"]]);
+    }
+    mux["closed"] = true;
+    return map{ "ok": true, "closed": true };
+}
+
+// ============================================================================
+// 6C. OS Kernel Sandbox Probe & Enforcement (`sandbox_lock_os`)
+// ============================================================================
+
+fn sandbox_lock_os(opts = nil) {
+    let dry_run = _opt(opts, "dry_run", true);
+    let set_nnp = _opt(opts, "no_new_privs", true);
+    let plat = platform();
+
+    if plat == "linux" {
+        let lc = _get_libc();
+        // Linux Landlock ABI version probe:
+        //   syscall(__NR_landlock_create_ruleset = 444, NULL, 0, LANDLOCK_CREATE_RULESET_VERSION = 1)
+        let ll_abi = ffi_call_typed(lc, "syscall", "i64, i64, i64, u32 -> i64", [444, 0, 0, 1]);
+        // PR_GET_NO_NEW_PRIVS = 39, PR_SET_NO_NEW_PRIVS = 38
+        let nnp_before = ffi_call_typed(lc, "prctl", "i32, u64, u64, u64, u64 -> i32", [39, 0, 0, 0, 0]);
+        let nnp_after = nnp_before;
+        let nnp_rc = 0;
+        if not dry_run and set_nnp {
+            nnp_rc = ffi_call_typed(lc, "prctl", "i32, u64, u64, u64, u64 -> i32", [38, 1, 0, 0, 0]);
+            nnp_after = ffi_call_typed(lc, "prctl", "i32, u64, u64, u64, u64 -> i32", [39, 0, 0, 0, 0]);
+        }
+        return map{
+            "ok": if dry_run { true } else { nnp_rc == 0 },
+            "platform": "linux",
+            "dry_run": dry_run,
+            "enforced": not dry_run,
+            "landlock_supported": ll_abi > 0,
+            "landlock_abi": if ll_abi > 0 { ll_abi } else { 0 },
+            "no_new_privs_before": nnp_before,
+            "no_new_privs_after": nnp_after
+        };
+    }
+
+    if plat == "windows" {
+        let k32 = _get_kernel32();
+        let hjob = ffi_call_typed(k32, "CreateJobObjectW", "ptr, ptr -> i64", [0, 0]);
+        let job_ok = hjob > 0;
+        let enforced = false;
+        if job_ok and not dry_run {
+            let cur_proc = ffi_call_typed(k32, "GetCurrentProcess", "void -> i64", []);
+            let arc = ffi_call_typed(k32, "AssignProcessToJobObject", "i64, i64 -> i32", [hjob, cur_proc]);
+            enforced = arc != 0;
+        }
+        if job_ok and dry_run {
+            ffi_call_typed(k32, "CloseHandle", "i64 -> i32", [hjob]);
+        }
+        return map{
+            "ok": job_ok,
+            "platform": "windows",
+            "dry_run": dry_run,
+            "enforced": enforced,
+            "job_object_supported": job_ok
+        };
+    }
+
+    return map{
+        "ok": true,
+        "platform": plat,
+        "dry_run": dry_run,
+        "enforced": false,
+        "seatbelt_probe": plat == "macos" or plat == "darwin"
+    };
+}
+
+// ============================================================================
+// 6D. Pure-`.sapp` VM Line Hook & Live Instrumented Runner (`debug_*`)
+// ============================================================================
+
+let _DEBUG_STATE = map{
+    "hook": nil,
+    "events": []
+};
+
+fn debug_set_hook(cb) {
+    if cb != nil and not is_fn(cb) {
+        throw "debug_set_hook(): callback must be a function or nil";
+    }
+    _DEBUG_STATE["hook"] = cb;
+    return cb != nil;
+}
+
+fn debug_get_hook() {
+    return _DEBUG_STATE["hook"];
+}
+
+fn debug_fire_line(file, func, line, locals = nil, depth = 1) {
+    let ev = map{
+        "file": str(file),
+        "func": str(func),
+        "line": num_floor(line),
+        "depth": num_floor(depth),
+        "locals": if locals == nil { map{} } else { locals }
+    };
+    array_push(_DEBUG_STATE["events"], ev);
+    let cb = _DEBUG_STATE["hook"];
+    if cb != nil and is_fn(cb) {
+        cb(ev);
+    }
+    return ev;
+}
+
+fn _is_ident_ch(c) {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 95;
+}
+
+fn _extract_decl_ident(trimmed, kw_len) {
+    let rest = str_trim(str_slice(trimmed, kw_len, len(trimmed)));
+    let n = len(rest);
+    let i = 0;
+    while i < n and _is_ident_ch(strcharcodeat(rest, i)) {
+        i = i + 1;
+    }
+    if i == 0 { return nil; }
+    let after = str_trim(str_slice(rest, i, n));
+    if not str_starts_with(after, "=") { return nil; }
+    return str_slice(rest, 0, i);
+}
+
+fn _parse_fn_header(trimmed) {
+    // Matches `fn <name>(<p1>, <p2>, ...)`
+    let rest = str_trim(str_slice(trimmed, 3, len(trimmed)));
+    let lp = str_index_of(rest, "(");
+    let rp = str_index_of(rest, ")");
+    if lp <= 0 or rp < lp {
+        return map{ "name": "anon", "params": [] };
+    }
+    let fname = str_trim(str_slice(rest, 0, lp));
+    let pbody = str_trim(str_slice(rest, lp + 1, rp));
+    let params = [];
+    if len(pbody) > 0 {
+        let raw_ps = str_split(pbody, ",");
+        let i = 0;
+        while i < len(raw_ps) {
+            let seg = str_trim(raw_ps[i]);
+            let eq = str_index_of(seg, "=");
+            let pname = if eq >= 0 { str_trim(str_slice(seg, 0, eq)) } else { seg };
+            if len(pname) > 0 { array_push(params, pname); }
+            i = i + 1;
+        }
+    }
+    return map{ "name": fname, "params": params };
+}
+
+fn _visible_locals_expr(scope_stack) {
+    let seen = map{};
+    let pairs = [];
+    let si = 0;
+    while si < len(scope_stack) {
+        let vs = scope_stack[si]["vars"];
+        let vi = 0;
+        while vi < len(vs) {
+            let vname = vs[vi];
+            if not map_has(seen, vname) {
+                seen[vname] = true;
+                array_push(pairs, "\"" + vname + "\": " + vname);
+            }
+            vi = vi + 1;
+        }
+        si = si + 1;
+    }
+    return "map{ " + str_join(pairs, ", ") + " }";
+}
+
+fn _escape_sapp_str(s) {
+    return str_replace_all(str_replace_all(str(s), "\\", "\\\\"), "\"", "\\\"");
+}
+
+fn _scan_line_delims(ln, state, scope_stack) {
+    let n = len(ln);
+    let i = 0;
+    let in_str = false;
+    let quote = 0;
+    while i < n {
+        let c = strcharcodeat(ln, i);
+        if in_str {
+            if c == 92 {
+                i = i + 2;
+                continue;
+            }
+            if c == quote {
+                in_str = false;
+            }
+            i = i + 1;
+            continue;
+        }
+        if c == 47 and i + 1 < n and strcharcodeat(ln, i + 1) == 47 {
+            // Line comment `//`
+            break;
+        }
+        if c == 34 or c == 39 {
+            in_str = true;
+            quote = c;
+            i = i + 1;
+            continue;
+        }
+        if c == 40 { state["paren"] = state["paren"] + 1; }
+        elif c == 41 { state["paren"] = num_max(0, state["paren"] - 1); }
+        elif c == 91 { state["bracket"] = state["bracket"] + 1; }
+        elif c == 93 { state["bracket"] = num_max(0, state["bracket"] - 1); }
+        elif c == 123 {
+            // Check whether `{` is preceded by `map` (`map{` or `map {`)
+            let k = i - 1;
+            while k >= 0 and (strcharcodeat(ln, k) == 32 or strcharcodeat(ln, k) == 9) { k = k - 1; }
+            let is_map_lit = k >= 2 and str_slice(ln, k - 2, k + 1) == "map" and
+                             (k == 2 or not _is_ident_ch(strcharcodeat(ln, k - 3)));
+            if is_map_lit {
+                array_push(state["braces"], "expr");
+                state["expr_brace"] = state["expr_brace"] + 1;
+            } else {
+                array_push(state["braces"], "block");
+                if state["pending_fn"] != nil {
+                    let fh = state["pending_fn"];
+                    state["pending_fn"] = nil;
+                    array_push(scope_stack, map{
+                        "func": fh["name"],
+                        "depth": scope_stack[len(scope_stack) - 1]["depth"] + 1,
+                        "vars": fh["params"]
+                    });
+                } else {
+                    let top = scope_stack[len(scope_stack) - 1];
+                    array_push(scope_stack, map{
+                        "func": top["func"],
+                        "depth": top["depth"],
+                        "vars": []
+                    });
+                }
+            }
+        } elif c == 125 {
+            if len(state["braces"]) > 0 {
+                let bkind = array_pop(state["braces"]);
+                if bkind == "expr" {
+                    state["expr_brace"] = num_max(0, state["expr_brace"] - 1);
+                } elif len(scope_stack) > 1 {
+                    array_pop(scope_stack);
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn debug_instrument_source(source_text, file_name = "<debug>") {
+    let clean_file = _escape_sapp_str(file_name);
+    let norm = str_replace_all(str(source_text), "\r\n", "\n");
+    let lines = str_split(norm, "\n");
+    let out = ["const __pb_mk = import(\"vm/sovereign_pure_microkernel.sapp\");"];
+
+    let scope_stack = [map{ "func": "<script>", "depth": 1, "vars": [] }];
+    let dstate = map{
+        "paren": 0,
+        "bracket": 0,
+        "expr_brace": 0,
+        "braces": [],
+        "pending_fn": nil
+    };
+
+    let last_exec_line = 1;
+    let ends_with_jump = false;
+    let i = 0;
+    while i < len(lines) {
+        let ln = lines[i];
+        let trimmed = str_trim(ln);
+        let line_no = i + 1;
+        let at_stmt_start = (dstate["paren"] == 0 and dstate["bracket"] == 0 and dstate["expr_brace"] == 0);
+
+        let is_fn_decl = at_stmt_start and str_starts_with(trimmed, "fn ");
+        if is_fn_decl {
+            dstate["pending_fn"] = _parse_fn_header(trimmed);
+        }
+
+        let should_trace = at_stmt_start and len(trimmed) > 0 and
+                           not str_starts_with(trimmed, "//") and
+                           not str_starts_with(trimmed, "}") and
+                           not str_starts_with(trimmed, "elif ") and
+                           not str_starts_with(trimmed, "else") and
+                           not str_starts_with(trimmed, "catch") and
+                           not str_starts_with(trimmed, "export ") and
+                           not str_starts_with(trimmed, "import ") and
+                           not is_fn_decl;
+
+        let new_decl = nil;
+        if at_stmt_start {
+            if str_starts_with(trimmed, "let ") {
+                new_decl = _extract_decl_ident(trimmed, 4);
+            } elif str_starts_with(trimmed, "const ") {
+                new_decl = _extract_decl_ident(trimmed, 6);
+            }
+        }
+
+        if should_trace {
+            let cur_top = scope_stack[len(scope_stack) - 1];
+            let locs_expr = _visible_locals_expr(scope_stack);
+            let trace_call = "__pb_mk.debug_fire_line(\"" + clean_file + "\", \"" +
+                             _escape_sapp_str(cur_top["func"]) + "\", " + str(line_no) + ", " +
+                             locs_expr + ", " + str(cur_top["depth"]) + "); ";
+            array_push(out, trace_call + ln);
+            last_exec_line = line_no;
+            ends_with_jump = str_starts_with(trimmed, "return") or str_starts_with(trimmed, "throw");
+        } else {
+            array_push(out, ln);
+        }
+
+        _scan_line_delims(ln, dstate, scope_stack);
+        if new_decl != nil and dstate["paren"] == 0 and dstate["bracket"] == 0 and dstate["expr_brace"] == 0 {
+            let cur_vars = scope_stack[len(scope_stack) - 1]["vars"];
+            array_push(cur_vars, new_decl);
+        }
+        i = i + 1;
+    }
+
+    if len(scope_stack) == 1 and not ends_with_jump and len(scope_stack[0]["vars"]) > 0 {
+        let final_locs = _visible_locals_expr(scope_stack);
+        array_push(out, "__pb_mk.debug_fire_line(\"" + clean_file + "\", \"<script>\", " +
+                        str(last_exec_line) + ", " + final_locs + ", 1);");
+    }
+
+    return str_join(out, "\n");
+}
+
+fn debug_run_instrumented(source_text, file_name = "<debug>") {
+    _DEBUG_STATE["events"] = [];
+    let instrumented = debug_instrument_source(source_text, file_name);
+    let rnd_hex = hex_encode(random_bytes(8));
+    let tmp_dir = if platform() == "windows" {
+        let t = env_get("TEMP");
+        if t == nil { "." } else { t }
+    } else {
+        "/tmp"
+    };
+    let tmp_path = path_join(tmp_dir, "pblang_dbg_inst_" + rnd_hex + ".sapp");
+    fs_write(tmp_path, instrumented);
+
+    let state = map{ "ok": true, "module": nil, "error": nil };
+    try {
+        state["module"] = import(tmp_path);
+    } catch err {
+        state["ok"] = false;
+        state["error"] = str(err);
+    }
+    if fs_exists(tmp_path) {
+        fs_remove(tmp_path);
+    }
+    return map{
+        "ok": state["ok"],
+        "file": str(file_name),
+        "events_fired": len(_DEBUG_STATE["events"]),
+        "events": slice(_DEBUG_STATE["events"], 0, len(_DEBUG_STATE["events"])),
+        "module": state["module"],
+        "error": state["error"]
+    };
+}
+
+// ============================================================================
+// Exports
+// ============================================================================
+
+export MICROKERNEL_VERSION, SLAB_PAGE_BYTES, INTERN_TABLE_CAP, INTERN_MAX_BYTES, MUX_READ, MUX_WRITE;
+export ffi_sym;
+export i64_new, is_i64, i64_to_str, i64_to_hex, i64_to_bigint, i64_eq, i64_cmp;
+export i64_add, i64_sub, i64_mul, i64_div, i64_mod;
+export i64_and, i64_or, i64_xor, i64_not, i64_shl, i64_shr, i64_sar, i64_rotl, i64_rotr;
+export i64_index, i64_jit_rexw_exec_live;
+export slab_alloc_os_page, slab_stats, region_enter, region_alloc, region_exit, with_region, gc_reclaim_os_pages;
+export intern_str, intern_stats;
+export siphash_csprng_seed, siphash13_bytes, siphash13_str, siphash24_bytes, siphash24_str;
+export sipmap_new, sipmap_set, sipmap_get, sipmap_has, sipmap_remove, sipmap_keys, sipmap_stats;
+export is_ffi_ptr, ffi_ptr_new, ffi_ptr_wrap, ffi_ptr_type, ffi_ptr_tag, ffi_ptr_addr, ffi_ptr_size, ffi_ptr_is_null, ffi_ptr_free;
+export ffi_ptr_read_bytes, ffi_ptr_write_bytes, ffi_ptr_read_i32, ffi_ptr_write_i32;
+export ffi_ptr_read_i64, ffi_ptr_write_i64, ffi_ptr_read_f64, ffi_ptr_write_f64;
+export utf8_to_utf16le_bytes, utf16le_bytes_to_utf8;
+export pure_fs_fullpath_w, pure_fs_mkdirs, pure_fs_write_bytes, pure_fs_write;
+export pure_fs_read_bytes, pure_fs_read, pure_fs_exists, pure_fs_listdir, pure_fs_remove, pure_proc_spawn_w;
+export unix_sockaddr_pack, unix_socket_listen, unix_socket_connect, unix_socket_accept;
+export unix_socket_send, unix_socket_recv, unix_socket_close, unix_peer_cred;
+export async_mux_backend, async_mux_open, async_mux_ctl_add, async_mux_wait, async_mux_close;
+export sandbox_lock_os;
+export debug_set_hook, debug_get_hook, debug_fire_line, debug_instrument_source, debug_run_instrumented;

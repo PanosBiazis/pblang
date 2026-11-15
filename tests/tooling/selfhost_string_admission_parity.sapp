@@ -1,0 +1,268 @@
+// Pure PBLang parity verifier comparing string primitives (str_repeat,
+// str_replace_all, str_pad_left, str_pad_right) against all six self-host
+// execution routes plus negative-width unbounded parity and secondary cleanup fault preservation.
+
+let F = import("stdlib:compiler/selfhost_frontend.sapp");
+let V = import("stdlib:compiler/vm.sapp");
+let O = import("stdlib:compiler/optimizer.sapp");
+let P = import("stdlib:selfhost_pbck.sapp");
+
+fn _rm_rf(target) {
+    if not fs_exists(target) { return; }
+    let entries = try fs_listdir(target) catch nil;
+    if entries != nil {
+        for name in entries {
+            _rm_rf(target + "/" + name);
+        }
+    }
+    let _ok = try fs_remove(target) catch false;
+}
+
+fn _parse_cli() {
+    let args = os_args();
+    let runtime = cwd() + "/pblang";
+    let repo = cwd();
+    let report = "";
+    let start_idx = 0;
+    let count = 21;
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if a == "--runtime" and i + 1 < len(args) {
+            runtime = args[i + 1];
+            i = i + 1;
+        } elif a == "--repo" and i + 1 < len(args) {
+            repo = args[i + 1];
+            i = i + 1;
+        } elif a == "--report" and i + 1 < len(args) {
+            report = args[i + 1];
+            i = i + 1;
+        } elif a == "--start" and i + 1 < len(args) {
+            start_idx = num_floor(parse_number(args[i + 1]));
+            i = i + 1;
+        } elif a == "--count" and i + 1 < len(args) {
+            count = num_floor(parse_number(args[i + 1]));
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return map{ runtime: runtime, repo: repo, report: report, start: start_idx, count: count };
+}
+
+fn _extract_host_error(stderr) {
+    let s = str_trim(stderr);
+    if str_starts_with(s, "Runtime error: ") {
+        s = str_slice(s, 15, len(s));
+        let idx = str_index_of(s, " (at ");
+        if idx >= 0 {
+            s = str_slice(s, 0, idx);
+        }
+        return s;
+    }
+    let lines = str_split(s, "\n");
+    for line in lines {
+        let idx = str_index_of(line, "]: ");
+        if str_starts_with(line, "error[") and idx >= 0 {
+            return str_slice(line, idx + 3, len(line));
+        }
+    }
+    return s;
+}
+
+fn _run_host(runtime, script_path) {
+    let res = proc_spawn_wait(runtime, [
+        "run", script_path,
+        "--deny-net", "--deny-http", "--deny-exec",
+        "--deny-ffi", "--deny-spawn", "--deny-gfx", "--deny-sqlite"
+    ]);
+    return map{
+        exit: res.exit_code,
+        stdout: res.stdout,
+        error: if res.exit_code == 0 { nil } else { _extract_host_error(res.stderr) }
+    };
+}
+
+fn _format_vm_output(items) {
+    if len(items) == 0 { return ""; }
+    let lines = [];
+    for item in items {
+        push(lines, str(item));
+    }
+    return str_join(lines, "\n") + "\n";
+}
+
+fn _run_vm_core(code, ctx, bounded) {
+    let res = if bounded {
+        V.run_seeded_bounded(code, map{}, nil, ctx)
+    } else {
+        V.run_seeded(code, map{}, ctx)
+    };
+    V.close_execution(ctx);
+    return _format_vm_output(res.output);
+}
+
+fn _run_vm_route(source, mode, bounded) {
+    let compiled = F.frontend_compile(source);
+    assert(compiled.ok, "fixture compile: " + source);
+    let code = compiled.chunk;
+    if mode == "optimized" {
+        code = O.optimize_safe(code).chunk;
+    } elif mode == "pbcs" {
+        code = P.deserialize_chunk(P.serialize_chunk(code));
+    }
+    let ctx = V.execution_context(true);
+    let _seed = V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk, map{}, ctx);
+    let ok = true;
+    let out_str = "";
+    let err_str = "";
+    try {
+        out_str = _run_vm_core(code, ctx, bounded);
+    } catch e {
+        ok = false;
+        err_str = str(e);
+    }
+    return map{
+        exit: if ok { 0 } else { 1 },
+        stdout: out_str,
+        error: if ok { nil } else { err_str }
+    };
+}
+
+fn _run_secondary_close_fault(source) {
+    let ctx = V.execution_context(true);
+    let _seed = V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk, map{}, ctx);
+    ctx.memory.reclaimed = map{};
+    let ok = true;
+    let err_str = "";
+    try {
+        let _r = V.run_seeded(F.frontend_compile(source).chunk, map{}, ctx);
+    } catch e {
+        ok = false;
+        err_str = str(e);
+    }
+    return map{
+        exit: if ok { 0 } else { 1 },
+        stdout: "",
+        error: if ok { nil } else { err_str }
+    };
+}
+
+fn _execute_suite(cli, cases, scratch, rows) {
+    let native_file = scratch + "/native.sapp";
+    let modes = ["plain", "optimized", "pbcs"];
+    let bounds = [false, true];
+    let end_idx = cli.start + cli.count;
+    if end_idx > len(cases) { end_idx = len(cases); }
+
+    let idx = cli.start;
+    while idx < end_idx {
+        let entry = cases[idx];
+        let name = entry[0];
+        let source = entry[1];
+        let valid = entry[2];
+
+        fs_write(native_file, source);
+        let expected = _run_host(cli.runtime, native_file);
+        assert((expected.exit == 0) == valid, "host validity mismatch on " + name + ": " + json_stringify(expected));
+
+        for mode in modes {
+            for bounded in bounds {
+                let actual = _run_vm_route(source, mode, bounded);
+                let passed = actual.exit == expected.exit and actual.stdout == expected.stdout and actual.error == expected.error;
+                assert(passed, "string parity mismatch on " + name + "/" + mode + "/" + str(bounded) + ": expected=" + json_stringify(expected) + " actual=" + json_stringify(actual));
+                push(rows, map{ case: name, mode: mode, bounded: bounded, passed: true });
+            }
+        }
+        idx = idx + 1;
+    }
+
+    if end_idx >= len(cases) {
+        let neg_width_src = "print str_pad_left(\"a\",-1,\"x\");print str_pad_right(\"a\",-num_pow(10,1000),\"x\");";
+        fs_write(native_file, neg_width_src);
+        let expected_neg = _run_host(cli.runtime, native_file);
+        let actual_neg_res = F.frontend_run(neg_width_src);
+        let actual_neg_out = _format_vm_output(actual_neg_res.output);
+        assert(expected_neg.exit == 0 and actual_neg_res.ok and actual_neg_out == expected_neg.stdout, "negative width unbounded parity");
+        push(rows, map{ case: "accepted negative width unbounded", passed: true });
+
+        let fault_src = "str_repeat(nil,2);";
+        fs_write(native_file, fault_src);
+        let expected_fault = _run_host(cli.runtime, native_file);
+        let actual_fault = _run_secondary_close_fault(fault_src);
+        assert(actual_fault.exit != 0 and actual_fault.error == expected_fault.error, "first error survives secondary close fault");
+        push(rows, map{ case: "first error survives cleanup fault", passed: true, error: actual_fault.error });
+    }
+
+    if cli.report != "" {
+        fs_write(cli.report, json_stringify(rows));
+    }
+}
+
+fn main() {
+    let cli = _parse_cli();
+    assert(fs_exists(cli.repo + "/stdlib/compiler/vm.sapp"), "repo stdlib/compiler/vm.sapp must exist");
+    let cases = [
+        ["repeat nil", "str_repeat(nil,2);", false],
+        ["repeat count type", "str_repeat(\"a\",nil);", false],
+        ["repeat negative", "str_repeat(\"a\",-1);", false],
+        ["repeat nan", "str_repeat(\"a\",num_sqrt(-1));", false],
+        ["repeat boxed text", "str_repeat(bigint(\"2\"),2);", false],
+        ["repeat boxed count", "str_repeat(\"a\",rational(2,1));", false],
+        ["replace source", "str_replace_all(nil,\"a\",\"b\");", false],
+        ["replace search", "str_replace_all(\"a\",nil,\"b\");", false],
+        ["replace boxed", "str_replace_all(\"a\",\"a\",decimal(\"1\"));", false],
+        ["left source", "str_pad_left(nil,2,\"b\");", false],
+        ["left width", "str_pad_left(\"a\",bigint(\"2\"),\"b\");", false],
+        ["left default nil padding", "print str_pad_left(\"a\",2,nil);", true],
+        ["right source", "str_pad_right(nil,2,\"b\");", false],
+        ["right width", "str_pad_right(\"a\",nil,\"b\");", false],
+        ["right coerced padding", "print str_pad_right(\"a\",2,bigint(\"2\"));", true],
+        ["first bad argument", "str_repeat(nil,map{});", false],
+        ["generic operator", "let receiver=map{__add__:str_repeat};receiver+2;", false],
+        [
+            "accepted strings",
+            "print str_repeat(\"α\",2.9);print str_repeat(\"a\",0);print str_repeat(\"a\",-0);print str_replace_all(\"aba\",\"a\",\"λ\");print str_replace_all(\"a\",\"\",\"x\");print str_pad_left(\"a\",3.9,\"λβ\");print str_pad_right(\"a\",3,\"\");",
+            true
+        ],
+        [
+            "accepted nan width",
+            "print str_pad_left(\"a\",num_sqrt(-1),\"x\");print str_pad_right(\"a\",num_sqrt(-1),\"x\");",
+            true
+        ],
+        [
+            "empty search boundaries",
+            "print str_replace_all(\"\",\"\",\"xyz\");print str_replace_all(\"α🙂\",\"\",\"λβ\");print str_replace_all(\"á\",\"\",\"x\");",
+            true
+        ],
+        [
+            "handled and shadowed",
+            "print (try str_repeat(nil,2) catch false);fn str_pad_left(a,b,c){return nil;}print str_pad_left(nil,nil,nil);",
+            true
+        ]
+    ];
+
+    let scratch = "/tmp/pblang_tooling_s2_str_parity_" + str(now_ms());
+    fs_mkdirs(scratch);
+    let rows = [];
+    let err_msg = "";
+
+    try {
+        _execute_suite(cli, cases, scratch, rows);
+    } catch e {
+        err_msg = str(e);
+    }
+
+    _rm_rf(scratch);
+    if err_msg != "" {
+        throw err_msg;
+    }
+
+    print json_stringify(map{
+        runner: "tests/tooling/selfhost_string_admission_parity.sapp",
+        language: "PBLang",
+        passed: true,
+        checks: len(rows)
+    });
+}
+
+main();

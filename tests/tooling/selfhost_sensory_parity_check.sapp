@@ -1,0 +1,285 @@
+// Pure PBLang sensory self-host parity, focused semantic & data-bounds checks,
+// import-root resolver contract, cross-root compiler-identity cache guard, and
+// cache-adapter preflight verifier.
+
+let F = import("stdlib:compiler/selfhost_frontend.sapp");
+let IMPORT_ROOTS = import("stdlib:compiler/import_roots.sapp");
+let CACHE_FILE = import("stdlib:compiler/module_cache_file.sapp");
+let LINUX_DIRFS = import("stdlib:linux_dirfs.sapp");
+
+fn _rm_rf(target) {
+    if not fs_exists(target) { return; }
+    let entries = try fs_listdir(target) catch nil;
+    if entries != nil {
+        for name in entries {
+            _rm_rf(target + "/" + name);
+        }
+    }
+    let _ok = try fs_remove(target) catch false;
+}
+
+fn _parse_cli() {
+    let args = os_args();
+    let repo = cwd();
+    let runtime = cwd() + "/pblang";
+    let report = "";
+    let group = "all";
+    let design = "";
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if a == "--repo" and i + 1 < len(args) {
+            repo = args[i + 1];
+            i = i + 1;
+        } elif a == "--runtime" and i + 1 < len(args) {
+            runtime = args[i + 1];
+            i = i + 1;
+        } elif a == "--report" and i + 1 < len(args) {
+            report = args[i + 1];
+            i = i + 1;
+        } elif a == "--group" and i + 1 < len(args) {
+            group = args[i + 1];
+            i = i + 1;
+        } elif a == "--design" and i + 1 < len(args) {
+            design = args[i + 1];
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return map{ repo: repo, runtime: runtime, report: report, group: group, design: design };
+}
+
+fn _pin_fixtures(repo) {
+    let base = repo + "/tests/fixtures/selfhost_sensory";
+    let files = [
+        "original.sapp",
+        "native-original.sapp",
+        "src/sensory_tools.sapp",
+        "src/sensory_series.sapp"
+    ];
+    let pins = map{};
+    for name in files {
+        let p = base + "/" + name;
+        assert(fs_exists(p), "missing sensory fixture: " + p);
+        pins[name] = sha256(fs_read(p));
+    }
+    return pins;
+}
+
+fn _verify_original_group(repo, runtime, scratch, cases) {
+    let series_rel = "tests/fixtures/selfhost_sensory/src/sensory_series.sapp";
+    let raw_series = fs_read(repo + "/" + series_rel);
+    let adapted_series = str_replace_all(
+        str_replace_all(raw_series, "export review;", ""),
+        "fn review(document) {",
+        "fn review(document, Units, Series) {"
+    );
+    let invoke_tail = "\nlet d=map{modality:\"pressure\",unit:\"kPa\",summary_unit:\"Pa\",provenance:\"synthetic\","
+        + "sample_rate_hz:2,calibration:map{scale:1,offset:0},range:map{minimum:0,maximum:5000},"
+        + "samples:[map{sequence:0,time_us:0,value:1},map{sequence:1,time_us:500000,value:3}],replay_count:2}; "
+        + "let r=review(d, Units, Series); print r.metrics.mean; print r.replayed_samples; print r.acquisition_performed;\n";
+    let payload_code = adapted_series + invoke_tail;
+
+    let self_series = F.frontend_run(payload_code);
+    assert(self_series.ok and self_series.output == [2000, 2, false], "selfhost sensory_series.review output == [2000, 2, false]");
+
+    let host_script = scratch + "/native_series.sapp";
+    fs_write(host_script, payload_code);
+    let host_series = proc_spawn_wait(runtime, ["run", host_script, "--allow-all"]);
+    assert(host_series.exit_code == 0 and str_trim(host_series.stdout) == "2000\n2\nfalse", "native sensory_series oracle == 2000 / 2 / false");
+    push(cases, map{ name: "sensory-series-selfhost-and-native", assertion_passed: true, output: self_series.output });
+
+    let rel_tools = "tests/fixtures/selfhost_sensory/src/sensory_tools.sapp";
+    let compiled_tools = F.frontend_compile(fs_read(repo + "/" + rel_tools));
+    assert(compiled_tools.ok, "sensory_tools.sapp compiles cleanly in selfhost_frontend");
+
+    let native_tools_file = scratch + "/sensory_tools_local.sapp";
+    fs_write(native_tools_file, str_replace_all(
+        fs_read(repo + "/" + rel_tools),
+        "\"src/sensory_series.sapp\"",
+        "\"" + repo + "/" + series_rel + "\""
+    ));
+    let native_orig_code = str_replace_all(
+        fs_read(repo + "/tests/fixtures/selfhost_sensory/native-original.sapp"),
+        "\"src/sensory_tools.sapp\"",
+        "\"" + native_tools_file + "\""
+    );
+    let native_orig_script = scratch + "/native_original_run.sapp";
+    fs_write(native_orig_script, native_orig_code);
+    let native_res = proc_spawn_wait(runtime, ["run", native_orig_script, "--allow-all"]);
+    assert(native_res.exit_code == 0 and str_trim(native_res.stdout) == "2000\n2\nfalse", "native-original.sapp oracle == 2000 / 2 / false");
+    push(cases, map{ name: "native-original-oracle", assertion_passed: true, stdout: str_trim(native_res.stdout) });
+}
+
+fn _assert_bounded_data_rejected(src, opts) {
+    let failed = false;
+    try {
+        let _r = F.frontend_run_bounded(src, opts);
+    } catch {
+        failed = true;
+    }
+    assert(failed, "bounded data limit exceeded must be rejected");
+}
+
+fn _verify_focused_suites(repo, runtime, scratch, cases) {
+    let roots_suite = repo + "/tests/semantics/selfhost_import_roots_test.sapp";
+    assert(fs_exists(roots_suite), "focused suite exists: " + roots_suite);
+    let res = proc_spawn_wait(runtime, [
+        "run", roots_suite,
+        "--deny-net", "--deny-http", "--deny-exec",
+        "--deny-ffi", "--deny-spawn", "--deny-gfx", "--deny-sqlite"
+    ]);
+    assert(res.exit_code == 0 and str_contains(res.stdout, "selfhost_import_roots_pass"), "selfhost_import_roots_test passed");
+    push(cases, map{ name: "selfhost_import_roots", assertion_passed: true, exit: res.exit_code });
+
+    // Data builtins parity (range, bytes_to_str, json_parse, json_stringify, regex_match, regex_replace_all)
+    let data_src = "let obj = json_parse(\"{\\\"a\\\":42,\\\"b\\\":[1,2]}\"); "
+        + "print obj.a; "
+        + "print range(1, 4); "
+        + "print bytes_to_str([206, 187]); "
+        + "print regex_match(\"sensor_2000\", \"^sensor_[0-9]+$\"); "
+        + "print regex_replace_all(\"a-b-c\", \"-\", \":\"); "
+        + "print json_parse(json_stringify([2, 3]));";
+    let self_data = F.frontend_run(data_src);
+    assert(self_data.ok, "selfhost data builtins run succeeded");
+    let data_script = scratch + "/data_builtins.sapp";
+    fs_write(data_script, data_src);
+    let host_data = proc_spawn_wait(runtime, ["run", data_script, "--allow-all"]);
+    let self_lines = [];
+    for v in self_data.output { push(self_lines, str(v)); }
+    assert(host_data.exit_code == 0 and str_trim(host_data.stdout) == str_join(self_lines, "\n"), "selfhost data builtins match host");
+    push(cases, map{ name: "selfhost_data_builtins_parity", assertion_passed: true });
+
+    // Data bounds enforcement in frontend_run_bounded
+    _assert_bounded_data_rejected("let x = str_repeat(\"a\", 5000); print x;", map{ max_value_items: 64 });
+    _assert_bounded_data_rejected("while true { }", map{ max_steps: 200 });
+    push(cases, map{ name: "selfhost_data_bounds_enforcement", assertion_passed: true });
+}
+
+fn _assert_manifest_rejected(bad_manifest) {
+    let rejected = false;
+    try {
+        let _r = IMPORT_ROOTS.from_manifest(bad_manifest);
+    } catch {
+        rejected = true;
+    }
+    assert(rejected, "quoted/malformed [dependencies] declaration must be rejected");
+}
+
+fn _assert_cross_root_cache_rejected(src, guest_b, unproven_cache) {
+    let rejected = false;
+    let err_text = "";
+    try {
+        let _r = F.frontend_run_bounded(src, map{
+            stdlib_root: guest_b,
+            module_cache_root: unproven_cache
+        });
+    } catch e {
+        rejected = true;
+        err_text = str(e);
+    }
+    assert(rejected, "cross-root module cache must be rejected");
+    assert(
+        str_contains(err_text, "executing compiler origin unavailable for selected stdlib root"),
+        "expected cross-root cache diagnostic, got: " + err_text
+    );
+    assert(not fs_exists(unproven_cache), "cross-root rejection must occur before cache directory I/O");
+}
+
+fn _verify_resolver_and_cache(scratch, cases) {
+    let valid_manifest = "[package]\nname=\"selfhost-sensory\"\nversion=\"0.0.0\"\nentry=\"original.sapp\"\n[dependencies]\nstdlib={path=\"../pblang/stdlib\",paths=[\"stdlib\"]}\n";
+    let parsed_valid = IMPORT_ROOTS.from_manifest(valid_manifest);
+    assert(parsed_valid.selected == true and parsed_valid.root == "../pblang/stdlib", "valid manifest stdlib root parsed");
+
+    let malformed_manifest = str_replace_all(valid_manifest, "stdlib={", "\"stdlib\"={");
+    _assert_manifest_rejected(malformed_manifest);
+    push(cases, map{ name: "import-roots-manifest-contract", assertion_passed: true });
+
+    let pure_res = F.frontend_run("print 7;");
+    assert(pure_res.ok and pure_res.output == [7], "pure import-free execution == [7]");
+    push(cases, map{ name: "pure-import-free-execution", assertion_passed: true });
+
+    let guest_b = scratch + "/guest-b";
+    fs_mkdirs(guest_b);
+    fs_write(guest_b + "/value.sapp", "let value = 42;\nexport value;\n");
+    let unproven_cache = scratch + "/unproven-cache";
+    let guest_src = "let m = import(\"stdlib:value.sapp\"); print m.value;";
+
+    _assert_cross_root_cache_rejected(guest_src, guest_b, unproven_cache);
+    let uncached = F.frontend_run(guest_src, map{ stdlib_root: guest_b });
+    assert(uncached.ok and uncached.output == [42], "uncached guest root B output == [42]");
+    push(cases, map{ name: "compiler-identity-cross-root-cache-guard", assertion_passed: true });
+
+    let dirfs_avail = LINUX_DIRFS.available();
+    assert(type(dirfs_avail) == "map", "linux_dirfs.available() returns status map");
+    let atomic_res = CACHE_FILE.write_text_atomic(scratch + "/cache-preflight/value", "x");
+    assert(type(atomic_res) == "map", "module_cache_file.write_text_atomic returns result map");
+    push(cases, map{ name: "cache-adapter-preflight", assertion_passed: true });
+}
+
+fn _execute_groups(cli, scratch, cases) {
+    if cli.group == "original" or cli.group == "all" {
+        _verify_original_group(cli.repo, cli.runtime, scratch, cases);
+    }
+    if cli.group == "focused" or cli.group == "regression" or cli.group == "all" {
+        _verify_focused_suites(cli.repo, cli.runtime, scratch, cases);
+    }
+    if cli.group == "resolver" or cli.group == "cache" or cli.group == "all" {
+        _verify_resolver_and_cache(scratch, cases);
+    }
+}
+
+fn main() {
+    let cli = _parse_cli();
+    let pins_before = _pin_fixtures(cli.repo);
+    let scratch = "/tmp/pblang_tooling_s2_sensory_" + str(now_ms());
+    fs_mkdirs(scratch);
+    let cases = [];
+    let err_msg = "";
+
+    try {
+        _execute_groups(cli, scratch, cases);
+    } catch e {
+        err_msg = str(e);
+    }
+
+    _rm_rf(scratch);
+    let pins_after = _pin_fixtures(cli.repo);
+    for k in map_keys(pins_before) {
+        assert(pins_after[k] == pins_before[k], "fixture pin unchanged: " + k);
+    }
+
+    if err_msg != "" {
+        throw err_msg;
+    }
+
+    let receipt = map{
+        runner: "tests/tooling/selfhost_sensory_parity_check.sapp",
+        language: "PBLang",
+        format: "pblang.selfhost.sensory.qualification.v1",
+        group: cli.group,
+        design_sha256: if cli.design != "" and fs_exists(cli.design) { sha256(fs_read(cli.design)) } else { nil },
+        fixture_pins: pins_before,
+        source_unchanged: true,
+        all_passed: len(cases) > 0,
+        cases_count: len(cases),
+        cases: cases
+    };
+
+    if cli.report != "" {
+        if not fs_exists(cli.report) {
+            fs_mkdirs(cli.report);
+        }
+        fs_write(cli.report + "/receipt.json", json_stringify(receipt));
+    }
+
+    print json_stringify(map{
+        runner: receipt.runner,
+        language: "PBLang",
+        passed: receipt.all_passed,
+        source_unchanged: receipt.source_unchanged,
+        cases_count: receipt.cases_count
+    });
+}
+
+main();

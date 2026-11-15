@@ -1,0 +1,504 @@
+// Opt-in retained-source preflight verification (--check --via-pblang --retained-source)
+// across source, argv, permissions, and PBCK parity groups in pure PBLang.
+// Exercises tools/native_bundle_guard.sapp, stdlib/compiler/retained_source_check.sapp,
+// stdlib/compiler/bounded_source.sapp, and tools/pbc.sapp inside isolated temp trees.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _find_libc() {
+    let paths = [
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/usr/lib/libc.so.6",
+        "/lib/libc.so.6"
+    ];
+    let i = 0;
+    while i < len(paths) {
+        if fs_exists(paths[i]) { return paths[i]; }
+        i = i + 1;
+    }
+    throw "public_retained_source_check: libc.so.6 not found";
+}
+
+fn _rm_tree_libc(libc, path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            let child = path + "/" + entries[i];
+            if ffi_call_typed(libc, "unlink", "i32(cstr)", [child]) != 0 {
+                _rm_tree_libc(libc, child);
+            }
+            i = i + 1;
+        }
+    }
+    let _u = ffi_call_typed(libc, "unlink", "i32(cstr)", [path]);
+    let _d = ffi_call_typed(libc, "rmdir", "i32(cstr)", [path]);
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _copy_tree(src, dst) {
+    fs_mkdirs(dst);
+    let entries = fs_listdir(src);
+    let i = 0;
+    while i < len(entries) {
+        let nm = entries[i];
+        let s = src + "/" + nm;
+        let d = dst + "/" + nm;
+        let sub = try fs_listdir(s) catch nil;
+        if sub != nil {
+            _copy_tree(s, d);
+        } else {
+            fs_write_bytes(d, fs_read_bytes(s));
+        }
+        i = i + 1;
+    }
+}
+
+fn _concat_arr(a, b) {
+    let out = [];
+    let i = 0;
+    while i < len(a) { array_push(out, a[i]); i = i + 1; }
+    let j = 0;
+    while j < len(b) { array_push(out, b[j]); j = j + 1; }
+    return out;
+}
+
+fn _snapshot_sapp_files(dir_path) {
+    let acc = map{};
+    let entries = try fs_listdir(dir_path) catch [];
+    let i = 0;
+    while i < len(entries) {
+        let nm = entries[i];
+        if str_ends_with(nm, ".sapp") {
+            let full = dir_path + "/" + nm;
+            let sub = try fs_listdir(full) catch nil;
+            if sub == nil {
+                acc[nm] = SHA256.sha256_hex_bytes(fs_read_bytes(full));
+            }
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn _maps_equal(a, b) {
+    let ak = array_sort(map_keys(a));
+    let bk = array_sort(map_keys(b));
+    if ak != bk { return false; }
+    let i = 0;
+    while i < len(ak) {
+        let k = ak[i];
+        if a[k] != b[k] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() {
+    let raw_args = os_args();
+    let candidate_arg = "";
+    let runtime_arg = "";
+    let report_arg = "";
+    let group_arg = "";
+    let idx = 0;
+    while idx < len(raw_args) {
+        let a = raw_args[idx];
+        if a == "--candidate" and idx + 1 < len(raw_args) {
+            candidate_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--runtime" and idx + 1 < len(raw_args) {
+            runtime_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--report" and idx + 1 < len(raw_args) {
+            report_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--group" and idx + 1 < len(raw_args) {
+            group_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        }
+        idx = idx + 1;
+    }
+
+    let repo = cwd();
+    let libc_path = _find_libc();
+    let libc = ffi_load(libc_path);
+
+    // Ensure outer --allow-all or script args never pollute child capability checks
+    let _u1 = ffi_call_typed(libc, "unsetenv", "i32(cstr)", ["PBLANG_ALLOW_ALL"]);
+    let _u2 = ffi_call_typed(libc, "unsetenv", "i32(cstr)", ["PBLANG_SCRIPT_ARGS"]);
+    let _u3 = ffi_call_typed(libc, "unsetenv", "i32(cstr)", ["PBLANG_SANDBOX"]);
+    let _u4 = ffi_call_typed(libc, "unsetenv", "i32(cstr)", ["PBLANG_DENY_IMPORT"]);
+    let _u5 = ffi_call_typed(libc, "unsetenv", "i32(cstr)", ["PBLANG_DENY_ENV"]);
+    let _u6 = ffi_call_typed(libc, "unsetenv", "i32(cstr)", ["PBLANG_CHECK_PROFILE"]);
+
+    let base = "/tmp/pblang_tooling_s1_retained_chk_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(base).ok, "create private base");
+
+    // Stage an isolated candidate release directory if --candidate was not supplied
+    let release_dir = if candidate_arg != "" { candidate_arg } else { base + "/release" };
+    if candidate_arg == "" {
+        let host_bin = if runtime_arg != "" {
+            runtime_arg
+        } elif fs_exists(repo + "/target/release/pblang") {
+            repo + "/target/release/pblang"
+        } else {
+            repo + "/pblang"
+        };
+        assert(fs_exists(host_bin), "public_retained_source_check: host binary missing");
+
+        fs_mkdirs(release_dir + "/bin");
+        fs_mkdirs(release_dir + "/libexec");
+        fs_mkdirs(release_dir + "/tools");
+        fs_mkdirs(release_dir + "/examples");
+
+        fs_write_bytes(release_dir + "/bin/pblang-native", fs_read_bytes(host_bin));
+        let _chm = ffi_call_typed(libc, "chmod", "i32(cstr,i32)", [release_dir + "/bin/pblang-native", 493]);
+        _copy_tree(repo + "/stdlib", release_dir + "/stdlib");
+        fs_write(release_dir + "/libexec/native_bundle_guard.sapp", fs_read(repo + "/tools/native_bundle_guard.sapp"));
+        fs_write(release_dir + "/tools/pbc.sapp", fs_read(repo + "/tools/pbc.sapp"));
+        fs_write(release_dir + "/tools/pblock_install.sapp", fs_read(repo + "/tools/pblock_install.sapp"));
+        if fs_exists(repo + "/examples/retained_nested_method.sapp") {
+            fs_write(release_dir + "/examples/retained_nested_method.sapp", fs_read(repo + "/examples/retained_nested_method.sapp"));
+        } else {
+            fs_write(release_dir + "/examples/retained_nested_method.sapp",
+                "for i 1 { let p = map{ run: fn(self) { return 7; } }; print (try { p:run() } catch 9); }\n");
+        }
+        fs_write(release_dir + "/main.sapp", "print 0;");
+        fs_write(release_dir + "/pblang.toml",
+            "[package]\nname=\"retained-release\"\nversion=\"1.0.0\"\nentry=\"main.sapp\"\n[dependencies]\nstdlib={path=\"stdlib\"}\n");
+
+        let _c_rel = ffi_call_typed(libc, "chdir", "i32(cstr)", [release_dir]);
+        let b_rel = proc_spawn_wait(release_dir + "/bin/pblang-native", ["build"]);
+        let l_rel = proc_spawn_wait(release_dir + "/bin/pblang-native", ["run", "tools/pblock_install.sapp", "--allow-all", "--", "."]);
+        let _c_back = ffi_call_typed(libc, "chdir", "i32(cstr)", [repo]);
+        assert(b_rel.exit_code == 0 and l_rel.exit_code == 0, "stage candidate release lock");
+    }
+
+    let staged_native = release_dir + "/bin/pblang-native";
+    let staged_launcher_bin = release_dir + "/bin/pblang";
+    let has_launcher_bin = fs_exists(staged_launcher_bin);
+    let staged_guard = release_dir + "/libexec/native_bundle_guard.sapp";
+
+    let rows = [];
+    let record_row = fn(name, passed, proc_res, preserved) {
+        let row = map{
+            name: name,
+            passed: passed,
+            exit: proc_res.exit_code,
+            stdout: proc_res.stdout,
+            stderr: proc_res.stderr,
+            source_preserved: preserved
+        };
+        array_push(rows, row);
+        if report_arg != "" {
+            fs_write(report_arg, json_stringify(rows) + "\n");
+        }
+        if not passed {
+            print "FAIL_RETAINED_CHECK: " + name + " -> " + json_stringify(row);
+            _rm_tree_libc(libc, base);
+        }
+        assert(passed, "public_retained_source_check failed: " + name);
+    };
+
+    let run_in_dir = fn(exe_path, argv, work_dir, extra_env) {
+        let env_keys = if extra_env != nil { map_keys(extra_env) } else { [] };
+        let ei = 0;
+        while ei < len(env_keys) {
+            let ek = env_keys[ei];
+            let _se = ffi_call_typed(libc, "setenv", "i32(cstr,cstr,i32)", [ek, str(extra_env[ek]), 1]);
+            ei = ei + 1;
+        }
+        let _c1 = ffi_call_typed(libc, "chdir", "i32(cstr)", [work_dir]);
+        let r = proc_spawn_wait(exe_path, argv);
+        let _c2 = ffi_call_typed(libc, "chdir", "i32(cstr)", [repo]);
+        let ui = 0;
+        while ui < len(env_keys) {
+            let _ue = ffi_call_typed(libc, "unsetenv", "i32(cstr)", [env_keys[ui]]);
+            ui = ui + 1;
+        }
+        return r;
+    };
+
+    let invoke_candidate = fn(args, use_native, work_dir, extra_env) {
+        if use_native {
+            return run_in_dir(staged_native, args, work_dir, extra_env);
+        }
+        if has_launcher_bin {
+            return run_in_dir(staged_launcher_bin, args, work_dir, extra_env);
+        }
+        // Two-phase launcher execution matching pblang_launch.sapp + native_bundle_guard.sapp
+        let adm_cmd = _concat_arr(["run", staged_guard, "--sandbox", "--", "pblang-launch-argv-v2"], args);
+        let adm = run_in_dir(staged_native, adm_cmd, work_dir, nil);
+        if adm.exit_code != 0 {
+            return map{ exit_code: adm.exit_code, stdout: "", stderr: adm.stderr };
+        }
+        let dec = str_trim(adm.stdout);
+        if dec == "pblang-launch-admit-v1" {
+            return run_in_dir(staged_native, args, work_dir, extra_env);
+        }
+        if dec == "pblang-launch-check-v1" {
+            let chk_cmd = _concat_arr(["run", staged_guard], args);
+            return run_in_dir(staged_native, chk_cmd, work_dir, extra_env);
+        }
+        if dec == "pblang-launch-check-usage-v1" {
+            return map{
+                exit_code: 2,
+                stdout: "",
+                stderr: "pblang --check: expected --check --via-pblang (or --self-host), supported capability options, optional --retained-source compatibility preflight, optional --bounded-source=BYTES, and one filename\n"
+            };
+        }
+        return map{ exit_code: 126, stdout: "", stderr: "pblang launcher: no valid admission decision\n" };
+    };
+
+    let groups = if group_arg != "" {
+        [group_arg]
+    } else {
+        ["source", "argv", "permissions", "parity"]
+    };
+
+    let profile = ["--check", "--via-pblang", "--retained-source"];
+    let colon_src = "for i 1 {let p=map{run:fn(self){return 7;}};print (try {p:run()} catch 9);}";
+
+    let gi = 0;
+    while gi < len(groups) {
+        let grp = groups[gi];
+        let root = base + "/work_" + grp;
+        fs_mkdirs(root);
+
+        let fixtures = map{
+            "colon.sapp": colon_src,
+            "explicit.sapp": str_replace_all(colon_src, "p:run()", "p.run(p)"),
+            "valid.sapp": "fn add(x){return x+1;}print add(6);",
+            "plain-method.sapp": "let p=map{run:fn(self){return 7;}};print p:run();",
+            "comment.sapp": "// for i 1 { try p:run() catch 9; } import\nprint 7;",
+            "string.sapp": "print \"try p:run() catch 9 import\";",
+            "effect.sapp": "fs_write(\"must-not-execute\", \"PRIVATE_CANARY\");",
+            "semantic.sapp": "print unknown_variable;",
+            "type.sapp": "let n:number=\"wrong\";",
+            "import.sapp": "let m=import(\"PRIVATE_CANARY\");",
+            "alias.sapp": "let m=import;",
+            "empty.sapp": "",
+            "broken.sapp": "let = ;"
+        };
+        let fkeys = map_keys(fixtures);
+        let fi = 0;
+        while fi < len(fkeys) {
+            let fnm = fkeys[fi];
+            fs_write(root + "/" + fnm, fixtures[fnm]);
+            fi = fi + 1;
+        }
+
+        let check_case = fn(name, args, exp_code, exp_text, use_native, extra_env) {
+            let before = _snapshot_sapp_files(root);
+            let p = invoke_candidate(args, use_native, root, extra_env);
+            let after = _snapshot_sapp_files(root);
+            let preserved = _maps_equal(before, after);
+            let code_ok = if exp_code == nil { p.exit_code != 0 } else { p.exit_code == exp_code };
+            let combined = p.stdout + p.stderr;
+            let text_ok = exp_text == "" or str_contains(combined, exp_text);
+            let good = code_ok and text_ok and preserved and (not fs_exists(root + "/must-not-execute"));
+            record_row(grp + ":" + name, good, p, preserved);
+            return p;
+        };
+
+        if grp == "source" {
+            let ok_names = ["valid.sapp", "plain-method.sapp", "comment.sapp", "string.sapp", "effect.sapp"];
+            let i1 = 0;
+            while i1 < len(ok_names) {
+                let nm = ok_names[i1];
+                let _p = check_case(nm, _concat_arr(profile, [nm]), 0, "self-hosted check ok", false, nil);
+                i1 = i1 + 1;
+            }
+            let nested_names = ["colon.sapp", "explicit.sapp"];
+            let i2 = 0;
+            while i2 < len(nested_names) {
+                let nm = nested_names[i2];
+                let p = check_case(nm, _concat_arr(profile, [nm]), 1, "retained-nested-try", false, nil);
+                assert(str_contains(p.stdout, "source was not executed") and str_contains(p.stdout, "PBCK"), "retained-nested-try guidance");
+                i2 = i2 + 1;
+            }
+            let imp_names = ["import.sapp", "alias.sapp"];
+            let i3 = 0;
+            while i3 < len(imp_names) {
+                let nm = imp_names[i3];
+                let p = check_case(nm, _concat_arr(profile, [nm]), 1, "retained-unchecked-import", false, nil);
+                assert(not str_contains(p.stdout + p.stderr, "PRIVATE_CANARY"), "must not leak import specifier");
+                i3 = i3 + 1;
+            }
+            let sem_names = ["semantic.sapp", "type.sapp"];
+            let i4 = 0;
+            while i4 < len(sem_names) {
+                let nm = sem_names[i4];
+                let _p = check_case(nm, _concat_arr(profile, [nm]), 1, "self-hosted check failed", false, nil);
+                i4 = i4 + 1;
+            }
+            let inv_names = ["empty.sapp", "broken.sapp"];
+            let i5 = 0;
+            while i5 < len(inv_names) {
+                let nm = inv_names[i5];
+                let _p = check_case(nm, _concat_arr(profile, [nm]), 1, "retained-invalid-source", false, nil);
+                i5 = i5 + 1;
+            }
+            let _pm = check_case("missing", _concat_arr(profile, ["missing.sapp"]), 1, "failed to read source file", false, nil);
+
+            // Caller decoy modules/manifests must not replace the installed checker
+            fs_mkdirs(root + "/stdlib/compiler");
+            fs_write(root + "/stdlib/compiler/retained_source_check.sapp",
+                "print \"DECOY_EXECUTED\";fn check(s){return map{ok:true};}export check;");
+            fs_write(root + "/pblang.toml",
+                "[package]\nname=\"decoy\"\nversion=\"0.1.0\"\nentry=\"valid.sapp\"\n[dependencies]\nstdlib={path=\"stdlib\"}\n");
+            fs_write(root + "/pblang.lock", "intentionally invalid caller lock");
+            let pd = check_case("trusted installed origin", _concat_arr(profile, ["colon.sapp"]), 1, "retained-nested-try", false, nil);
+            assert(not str_contains(pd.stdout + pd.stderr, "DECOY_EXECUTED"), "caller decoy must not execute");
+        } elif grp == "argv" {
+            let valid_orders = [
+                ["--self-host", "--retained-source", "--check", "valid.sapp"],
+                ["--deny-net", "--check", "valid.sapp", "--retained-source", "--via-pblang"],
+                ["--check", "--via-pblang", "--self-host", "--retained-source", "valid.sapp"]
+            ];
+            let oi = 0;
+            while oi < len(valid_orders) {
+                let _po = check_case("supported order " + str(oi), valid_orders[oi], 0, "self-hosted check ok", false, nil);
+                oi = oi + 1;
+            }
+            let literals = ["δύο λέξεις.sapp", "line\nnext.sapp", "--retained-source"];
+            let li = 0;
+            while li < len(literals) {
+                let lnm = literals[li];
+                fs_write(root + "/" + lnm, fixtures["valid.sapp"]);
+                let _pl = check_case("literal " + str(li), _concat_arr(profile, ["--", lnm]), 0, "self-hosted check ok", false, nil);
+                fs_remove(root + "/" + lnm);
+                li = li + 1;
+            }
+            let invalid_orders = [
+                ["--retained-source", "--check", "--via-pblang", "valid.sapp"],
+                ["--retained-source", "valid.sapp"],
+                ["--check", "--retained-source", "valid.sapp"],
+                ["--via-pblang", "--retained-source", "valid.sapp"],
+                _concat_arr(profile, ["--retained-source", "valid.sapp"]),
+                _concat_arr(profile, ["valid.sapp", "other.sapp"]),
+                _concat_arr(profile, ["--unknown", "valid.sapp"]),
+                _concat_arr(profile, [""]),
+                profile
+            ];
+            let ii = 0;
+            while ii < len(invalid_orders) {
+                let _pi = check_case("invalid order " + str(ii), invalid_orders[ii], 2, "--retained-source", false, nil);
+                ii = ii + 1;
+            }
+        } elif grp == "permissions" {
+            let ok_denies = ["exec", "ffi", "net", "http", "env", "spawn", "gfx", "sqlite"];
+            let di = 0;
+            while di < len(ok_denies) {
+                let dn = ok_denies[di];
+                let _pd = check_case("deny " + dn, _concat_arr(profile, ["--deny-" + dn, "valid.sapp"]), 0, "self-hosted check ok", false, nil);
+                di = di + 1;
+            }
+            let fail_denies = ["fs", "import"];
+            let fdi = 0;
+            while fdi < len(fail_denies) {
+                let fdn = fail_denies[fdi];
+                let _pfd = check_case("deny " + fdn, _concat_arr(profile, ["--deny-" + fdn, "valid.sapp"]), nil, "", false, nil);
+                fdi = fdi + 1;
+            }
+            let _psb = check_case("locked sandbox", _concat_arr(profile, ["--sandbox", "--allow-all", "valid.sapp"]), nil, "", false, nil);
+            let _pe1 = check_case(
+                "env cannot select profile",
+                ["--check", "--via-pblang", "colon.sapp"],
+                0,
+                "self-hosted check ok",
+                false,
+                map{ PBLANG_CHECK_PROFILE: "retained-source" }
+            );
+            let _pe2 = check_case(
+                "env cannot disable explicit profile",
+                _concat_arr(profile, ["colon.sapp"]),
+                1,
+                "retained-nested-try",
+                false,
+                map{ PBLANG_CHECK_PROFILE: "default" }
+            );
+            let grants = ["--ffi-lib=" + libc_path];
+            let syms = ["free", "close", "dup", "strdup", "openat", "memfd_create", "sendfile", "lseek"];
+            let si = 0;
+            while si < len(syms) {
+                array_push(grants, "--ffi-symbol=" + syms[si]);
+                si = si + 1;
+            }
+            let _pb1 = check_case(
+                "bounded valid composition",
+                _concat_arr(_concat_arr(profile, ["--bounded-source=4096"]), _concat_arr(grants, ["valid.sapp"])),
+                0,
+                "self-hosted check ok",
+                false,
+                nil
+            );
+            let _pb2 = check_case(
+                "bounded retained rejection",
+                _concat_arr(_concat_arr(profile, ["--bounded-source=4096"]), _concat_arr(grants, ["colon.sapp"])),
+                1,
+                "retained-nested-try",
+                false,
+                nil
+            );
+            let _pb3 = check_case(
+                "byte bound before profile",
+                _concat_arr(_concat_arr(profile, ["--bounded-source=1"]), _concat_arr(grants, ["colon.sapp"])),
+                1,
+                "exceeds byte limit",
+                false,
+                nil
+            );
+        } elif grp == "parity" {
+            let native_sha = SHA256.sha256_hex_bytes(fs_read_bytes(staged_native));
+            let expected_colon = if str_starts_with(native_sha, "7f1b97c003773655") { "9\n" } else { "7\n" };
+            let modes = [false, true];
+            let mi = 0;
+            while mi < len(modes) {
+                let nat_flag = modes[mi];
+                let _pc1 = check_case("retained colon " + str(nat_flag), ["run", "colon.sapp", "--sandbox"], 0, expected_colon, nat_flag, nil);
+                let _pc2 = check_case("explicit call still 7 " + str(nat_flag), ["run", "explicit.sapp", "--sandbox"], 0, "7\n", nat_flag, nil);
+                mi = mi + 1;
+            }
+            let _pdef = check_case("default checker unchanged", ["--check", "--via-pblang", "colon.sapp"], 0, "self-hosted check ok", false, nil);
+            let _ppbc1 = check_case(
+                "PBLang PBCK compile",
+                ["run", release_dir + "/tools/pbc.sapp", "--", "colon.sapp", "--target", "pbck", "--out", "out.pbck"],
+                0,
+                "compiled native PBCK",
+                false,
+                nil
+            );
+            let _ppbc2 = check_case("PBCK yields 7", ["run", "out.pbck", "--sandbox"], 0, "7\n", false, nil);
+
+            let example = release_dir + "/examples/retained_nested_method.sapp";
+            let _pex1 = check_case("documented example preflight", _concat_arr(profile, [example]), 1, "retained-nested-try", false, nil);
+            let _pex2 = check_case(
+                "documented example compilation",
+                ["run", release_dir + "/tools/pbc.sapp", "--", example, "--target", "pbck", "--out", "example.pbck"],
+                0,
+                "compiled native PBCK",
+                false,
+                nil
+            );
+            let _pex3 = check_case("documented example PBCK", ["run", "example.pbck", "--sandbox"], 0, "7\n", false, nil);
+            let _pbar = check_case("bare script remains retained", ["colon.sapp", "--sandbox"], 0, expected_colon, false, nil);
+            let _parg = check_case("program argument is not a profile", ["run", "valid.sapp", "--", "--retained-source"], 0, "7\n", false, nil);
+        } else {
+            _rm_tree_libc(libc, base);
+            throw "public_retained_source_check: unknown --group " + grp;
+        }
+
+        gi = gi + 1;
+    }
+
+    _rm_tree_libc(libc, base);
+    assert(not fs_exists(base), "public_retained_source_check: temporary base directory must be cleaned up");
+    print "public_retained_source_check_pass: rows=" + str(len(rows));
+}
+
+main();

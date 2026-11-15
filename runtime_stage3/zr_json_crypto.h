@@ -221,7 +221,6 @@ static bool zj_parse_value(ZrJsonParser *p, PbValue *out) {
     }
     if (c == '-' || (c >= '0' && c <= '9')) {
         size_t start = p->pos;
-        bool has_frac_or_exp = false;
         if (p->s[p->pos] == '-') p->pos++;
         if (p->pos >= p->len || p->s[p->pos] < '0' || p->s[p->pos] > '9') {
             p->depth--;
@@ -234,7 +233,6 @@ static bool zj_parse_value(ZrJsonParser *p, PbValue *out) {
             while (p->pos < p->len && p->s[p->pos] >= '0' && p->s[p->pos] <= '9') p->pos++;
         }
         if (p->pos < p->len && p->s[p->pos] == '.') {
-            has_frac_or_exp = true;
             p->pos++;
             if (p->pos >= p->len || p->s[p->pos] < '0' || p->s[p->pos] > '9') {
                 p->depth--;
@@ -244,7 +242,6 @@ static bool zj_parse_value(ZrJsonParser *p, PbValue *out) {
             while (p->pos < p->len && p->s[p->pos] >= '0' && p->s[p->pos] <= '9') p->pos++;
         }
         if (p->pos < p->len && (p->s[p->pos] == 'e' || p->s[p->pos] == 'E')) {
-            has_frac_or_exp = true;
             p->pos++;
             if (p->pos < p->len && (p->s[p->pos] == '+' || p->s[p->pos] == '-')) p->pos++;
             if (p->pos >= p->len || p->s[p->pos] < '0' || p->s[p->pos] > '9') {
@@ -263,17 +260,6 @@ static bool zj_parse_value(ZrJsonParser *p, PbValue *out) {
         }
         memcpy(nbuf, p->s + start, nlen);
         nbuf[nlen] = '\0';
-        if (!has_frac_or_exp && nlen >= 16) {
-            errno = 0;
-            char *iend = NULL;
-            long long iv = strtoll(nbuf, &iend, 10);
-            if (errno == 0 && iend && *iend == '\0' &&
-                (iv < -9007199254740991LL || iv > 9007199254740991LL)) {
-                *out = val_i64((int64_t)iv);
-                p->depth--;
-                return true;
-            }
-        }
         char *endp = NULL;
         double d = strtod(nbuf, &endp);
         if (!isfinite(d)) {
@@ -361,9 +347,6 @@ static bool zr_json_stringify_into(PbVM *vm, PbValue v, ZrBuf *b, int depth) {
             return true;
         case VAL_BOOL:
             zr_buf_append_cstr(b, v.u.b ? "true" : "false");
-            return true;
-        case VAL_I64:
-            zr_buf_printf(b, "%" PRId64, v.u.i64);
             return true;
         case VAL_NUM: {
             if (!isfinite(v.u.num)) {

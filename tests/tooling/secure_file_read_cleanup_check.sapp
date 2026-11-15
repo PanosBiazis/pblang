@@ -1,0 +1,191 @@
+// Pure PBLang qualification runner for secure_file read_bytes and read_text
+// parent ownership, single-close verification, exception redaction, and Linux FD checks.
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _replace_once(source, needle, replacement) {
+    let parts = str_split(source, needle);
+    assert(len(parts) == 2, "expected exactly one occurrence of needle");
+    return parts[0] + replacement + parts[1];
+}
+
+fn _rm_rf(target) {
+    if not fs_exists(target) { return; }
+    let entries = try fs_listdir(target) catch nil;
+    if type(entries) == "array" {
+        for entry in entries {
+            _rm_rf(target + "/" + entry);
+        }
+    }
+    let _removed = try fs_remove(target) catch nil;
+}
+
+let raw_args = os_args();
+let report_path = "";
+let idx = 0;
+while idx < len(raw_args) {
+    if raw_args[idx] == "--report" and idx + 1 < len(raw_args) {
+        report_path = raw_args[idx + 1];
+    }
+    idx = idx + 1;
+}
+
+let repo_root = cwd();
+let stdlib_root = repo_root + "/stdlib/";
+let candidate_raw = fs_read(stdlib_root + "secure_file.sapp");
+let semantic_raw = fs_read(repo_root + "/tests/semantics/secure_file_read_cleanup_test.sapp");
+let unguarded_raw = _replace_once(
+    candidate_raw,
+    "let result = try _read_backend(parent.fs, parent.name, max_bytes)\n        catch _error(\"secure read backend failed\");\n    let closed = try _close(parent.fs) catch false;\n    if type(closed) != \"bool\" or not closed {\n        return map{ ok: false, error: \"secure read parent cleanup could not be verified\",\n            cleanup_uncertain: true, parent_close_confirmed: false };\n    }",
+    "let result = _read_backend(parent.fs, parent.name, max_bytes);\n    let _ignored_closed = _close(parent.fs);"
+);
+
+let scratch = "/tmp/pblang_tooling_s2_read_cleanup_" + str(num_floor(now_ms()));
+assert(SECURE.create_private_temporary_directory_new(scratch).ok, "private temporary qualification directory created");
+assert(SECURE.create_private_directory_new(scratch + "/work").ok, "private work subdirectory created");
+
+let backend_src = "let state = map{};\n"
+    + "fn configure(read_mode, close_mode) {\n"
+    + "    state.read_mode = read_mode; state.close_mode = close_mode;\n"
+    + "    state.opens = 0; state.reads = 0; state.closes = 0; state.admit = true;\n"
+    + "}\n"
+    + "fn open(path, create = false, protect = false) {\n"
+    + "    let _p = path; let _c = create; let _pr = protect;\n"
+    + "    state.opens = state.opens + 1; return map{ ok: state.admit };\n"
+    + "}\n"
+    + "fn open_absolute(path, create = false, protect = false) { return open(path, create, protect); }\n"
+    + "fn close(fs) {\n"
+    + "    let _f = fs;\n"
+    + "    state.closes = state.closes + 1;\n"
+    + "    if state.close_mode == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.close_mode == \"nil\" { return nil; }\n"
+    + "    if state.close_mode == \"number\" { return 1; }\n"
+    + "    if state.close_mode == \"map\" { return map{ ok: true }; }\n"
+    + "    return state.close_mode == \"success\";\n"
+    + "}\n"
+    + "fn read_bytes(fs, name, limit) {\n"
+    + "    let _f = fs; let _n = name; let _l = limit;\n"
+    + "    state.reads = state.reads + 1;\n"
+    + "    if state.read_mode == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.read_mode == \"failure\" { return map{ ok: false, error: \"synthetic failure\" }; }\n"
+    + "    return map{ ok: true, bytes: [206, 177], size: 2 };\n"
+    + "}\n"
+    + "export state, configure, open, open_absolute, close, read_bytes;\n";
+
+fs_write(scratch + "/backend.sapp", backend_src);
+fs_write(scratch + "/semantic.sapp", semantic_raw);
+
+let cand_bound = str_replace_all(candidate_raw, "\"stdlib:", "\"" + stdlib_root);
+let base_bound = str_replace_all(unguarded_raw, "\"stdlib:", "\"" + stdlib_root);
+
+let cand_model = _replace_once(
+    cand_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/cand_model.sapp", cand_model);
+
+let base_model = _replace_once(
+    base_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/base_model.sapp", base_model);
+
+let cand_throw = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.read_bytes(fs, name, max_bytes); }",
+    "if platform() == \"linux\" { throw \"synthetic-private-value\"; }"
+);
+fs_write(scratch + "/cand_throw.sapp", cand_throw);
+
+let cand_close_false = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); return false; }"
+);
+fs_write(scratch + "/cand_close_false.sapp", cand_close_false);
+
+let cand_close_throw = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); throw \"synthetic-private-value\"; }"
+);
+fs_write(scratch + "/cand_close_throw.sapp", cand_close_throw);
+
+let B = import(scratch + "/backend.sapp");
+let SEM = import(scratch + "/semantic.sapp");
+let S_CAND_MODEL = import(scratch + "/cand_model.sapp");
+let S_BASE_MODEL = import(scratch + "/base_model.sapp");
+let S_CAND_THROW = import(scratch + "/cand_throw.sapp");
+let S_CLOSE_FALSE = import(scratch + "/cand_close_false.sapp");
+let S_CLOSE_THROW = import(scratch + "/cand_close_throw.sapp");
+
+let rows = [];
+
+// Group 1: Candidate modeled matrix (36 matrix cases + 4 admission cases)
+let m_res = SEM.run(S_CAND_MODEL, B);
+assert(m_res.ok and m_res.matrix_cases == 36 and m_res.admission_cases == 4, "candidate read cleanup matrix passed");
+array_push(rows, map{ label: "candidate_modeled_matrix", passed: true, result: m_res });
+
+// Group 2: Unguarded facade rejected by ownership contract
+let base_rejected = true;
+try { SEM.run(S_BASE_MODEL, B); base_rejected = false; } catch {}
+assert(base_rejected, "unguarded facade rejected by read ownership contract");
+array_push(rows, map{ label: "unguarded_facade_rejected", passed: true, rejected: base_rejected });
+
+// Group 3: Real Linux read_bytes and read_text with FD delta 0
+let sample_utf8 = scratch + "/work/sample.txt";
+let sample_raw = scratch + "/work/raw.bin";
+let sample_dir = scratch + "/work/subdir";
+assert(SECURE.write_text_atomic(sample_utf8, "α", false, true).ok, "seed sample utf8");
+assert(SECURE.write_atomic(sample_raw, [0, 127, 255], false, true).ok, "seed raw bytes");
+fs_mkdirs(sample_dir);
+
+let fd_before_real = len(fs_listdir("/proc/self/fd"));
+let rb = SECURE.read_bytes(sample_utf8, 8, true);
+assert(rb.ok and rb.bytes == [206, 177] and rb.size == 2, "real read_bytes");
+let rraw = SECURE.read_bytes(sample_raw, 8, true);
+assert(rraw.ok and rraw.bytes == [0, 127, 255] and rraw.size == 3, "real raw read_bytes");
+let rt = SECURE.read_text(sample_utf8, 8, true);
+assert(rt.ok and rt.text == "α" and rt.size == 2, "real read_text");
+assert(not SECURE.read_text(sample_dir, 8, true).ok, "directory target rejected in read_text");
+assert(not SECURE.read_bytes(sample_utf8, 1, true).ok, "over-limit read_bytes rejected");
+assert(not SECURE.read_bytes(scratch + "/work/absent.txt", 8, true).ok, "missing read_bytes rejected");
+let fd_delta_real = len(fs_listdir("/proc/self/fd")) - fd_before_real;
+assert(fd_delta_real == 0, "zero fd delta on real read operations");
+array_push(rows, map{ label: "real_linux_read_io", passed: true, fd_delta: fd_delta_real });
+
+// Group 4: Real Linux exception and close uncertainty checks with FD delta 0
+let fd_before_fault = len(fs_listdir("/proc/self/fd"));
+for _i 4 {
+    let re = S_CAND_THROW.read_text(sample_utf8, 8, false);
+    assert(not re.ok and re.error == "secure read backend failed"
+        and not map_has(re, "text") and not map_has(re, "bytes"), "backend exception redacted");
+    let rf = S_CLOSE_FALSE.read_text(sample_utf8, 8, false);
+    assert(not rf.ok and rf.cleanup_uncertain and not rf.parent_close_confirmed
+        and not map_has(rf, "text") and not map_has(rf, "bytes"), "close false suppresses read");
+    let rth = S_CLOSE_THROW.read_bytes(sample_utf8, 8, false);
+    assert(not rth.ok and rth.cleanup_uncertain and not rth.parent_close_confirmed
+        and not map_has(rth, "text") and not map_has(rth, "bytes"), "close throw suppresses read_bytes");
+}
+let fd_delta_fault = len(fs_listdir("/proc/self/fd")) - fd_before_fault;
+assert(fd_delta_fault == 0, "zero fd delta on exception and close uncertainty checks");
+array_push(rows, map{ label: "real_fault_and_close_uncertainty", passed: true, fd_delta: fd_delta_fault });
+
+let report = map{
+    passed: true,
+    runner: "tests/tooling/secure_file_read_cleanup_check.sapp",
+    language: "PBLang",
+    result: m_res,
+    source_sha256: SHA256.sha256_hex(candidate_raw),
+    semantic_sha256: SHA256.sha256_hex(semantic_raw),
+    groups_passed: len(rows),
+    rows: rows
+};
+if report_path != "" {
+    fs_write(report_path, json_stringify(report) + "\n");
+}
+_rm_rf(scratch);
+assert(not fs_exists(scratch), "scratch cleaned up");
+print json_stringify(report);

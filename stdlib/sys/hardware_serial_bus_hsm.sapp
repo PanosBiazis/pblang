@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
 //
-// stdlib/sys/hardware_serial_bus_hsm.sapp — PBLang v5.0.0 Industrial Bus, Embedded Peripheral,
+// stdlib/sys/hardware_serial_bus_hsm.sapp — PBLang v5.1.0 Industrial Bus, Embedded Peripheral,
+// Live Kernel PTY/Loopback/SocketCAN Transceiver, Live USB/TPM 2.0/PC-SC/PKCS#11 Prober,
 // USB HID, FIDO2/WebAuthn CTAP2 & OASIS PKCS#11 v3.0/v3.2 HSM Token Bridge Engine.
 //
 // 100% Pure-PBLang implementation:
@@ -15,11 +16,14 @@
 //      - `build_fido2_webauthn_assertion`, `verify_fido2_webauthn_assertion`
 //        (32-byte `rpIdHash` SHA-256 + `UP|UV|AT` flags + BE32 `signCount` + `attestedCredentialData` + `clientDataJSON`)
 //      - `pkcs11_build_mechanism_session` (`CKM_ECDSA`, `CKM_EDDSA`, `CKM_ML_DSA` non-extractable HSM slot policy)
+//   3. Live Kernel & Silicon Bus/HSM Execution (`v5.1.0`):
+//      - `modbus_rtu_live_pty_transceive`, `modbus_tcp_live_loopback_transceive`, `socketcan_probe_and_transceive_live`,
+//        `usb_enumerate_live_devices`, `tpm2_and_pkcs11_probe_live`
 
 let Sha256 = import("stdlib:sha256_pb.sapp");
 let Ed25519 = import("stdlib:ed25519_verify.sapp");
 
-let HW_HSM_VERSION = "5.0.0";
+let HW_HSM_VERSION = "5.1.0";
 let FORMAT_BUS = "pblang.sys.hardware_bus.v5";
 let FORMAT_WEBAUTHN = "pblang.sys.fido2_webauthn.v5";
 let FORMAT_PKCS11 = "pblang.sys.pkcs11_v3.v5";
@@ -856,6 +860,619 @@ fn pkcs11_build_mechanism_session(slot_id = 0, mechanism_name = "CKM_EDDSA", pin
     };
 }
 
+// ── 3. Live Kernel PTY / TCP / SocketCAN Transceivers & USB / TPM 2.0 / PKCS#11 Probers ──
+
+fn _get_u32_le(buf, off) {
+    return bytes_get(buf, off)
+        + bytes_get(buf, off + 1) * 256
+        + bytes_get(buf, off + 2) * 65536
+        + bytes_get(buf, off + 3) * 16777216;
+}
+
+fn _get_i32_le(buf, off) {
+    let u = _get_u32_le(buf, off);
+    if u >= 2147483648 { return u - 4294967296; }
+    return u;
+}
+
+fn _get_u64_le(buf, off) {
+    let lo = _get_u32_le(buf, off);
+    let hi = _get_u32_le(buf, off + 4);
+    return hi * 4294967296.0 + lo;
+}
+
+fn _bytes_prefix_to_array(buf, count) {
+    let out = [];
+    let lim = min_of(count, len(buf));
+    let i = 0;
+    while i < lim {
+        array_push(out, bytes_get(buf, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _cstr_from_bytes(buf, start_off, max_len) {
+    let raw = [];
+    let total = len(buf);
+    let i = 0;
+    while i < max_len and (start_off + i) < total {
+        let b = bytes_get(buf, start_off + i);
+        if b == 0 { break; }
+        array_push(raw, b);
+        i = i + 1;
+    }
+    return bytes_to_str(raw);
+}
+
+fn _utf16le_zbytes(s) {
+    let sb = str_to_bytes(s);
+    let out = [];
+    let i = 0;
+    while i < len(sb) {
+        array_push(out, sb[i]);
+        array_push(out, 0);
+        i = i + 1;
+    }
+    array_push(out, 0);
+    array_push(out, 0);
+    return bytes_new(out);
+}
+
+fn _decode_holding_registers(fc, payload) {
+    let regs = [];
+    if (fc == 3 or fc == 4) and is_array(payload) and len(payload) >= 1 {
+        let byte_cnt = payload[0];
+        let pos = 1;
+        while pos + 1 < len(payload) and (pos - 1) < byte_cnt {
+            let hi = bit_and(payload[pos], 255);
+            let lo = bit_and(payload[pos + 1], 255);
+            array_push(regs, bit_or(bit_shl(hi, 8), lo));
+            pos = pos + 2;
+        }
+    }
+    return regs;
+}
+
+fn _posix_read_exact(libc_h, fd, expected_len) {
+    let acc = [];
+    let tries = 0;
+    while len(acc) < expected_len and tries < 16 {
+        let rem = expected_len - len(acc);
+        let chunk_buf = bytes_new(rem);
+        let nr = ffi_call_typed(libc_h, "read", "i32, ptr, u64 -> i64", [fd, chunk_buf, rem]);
+        if nr <= 0 { break; }
+        let unpacked = _bytes_prefix_to_array(chunk_buf, nr);
+        let k = 0;
+        while k < len(unpacked) {
+            array_push(acc, unpacked[k]);
+            k = k + 1;
+        }
+        tries = tries + 1;
+    }
+    return acc;
+}
+
+fn modbus_rtu_live_pty_transceive(slave_id = 1, function_code = 3, req_payload = [0, 0, 0, 2], reg_values = [1234, 5678]) {
+    let req_frame = modbus_rtu_build_frame(slave_id, function_code, req_payload);
+    if type(req_frame) == "map" and req_frame.ok == false { return req_frame; }
+
+    let resp_pdu = [];
+    if function_code == 3 or function_code == 4 {
+        let rlist = if is_array(reg_values) { reg_values } else { [] };
+        array_push(resp_pdu, bit_and(len(rlist) * 2, 255));
+        let ri = 0;
+        while ri < len(rlist) {
+            let rv = bit_and(num_floor(rlist[ri]), 65535);
+            array_push(resp_pdu, bit_and(bit_shr(rv, 8), 255));
+            array_push(resp_pdu, bit_and(rv, 255));
+            ri = ri + 1;
+        }
+    } else {
+        let pi = 0;
+        while pi < len(req_payload) { array_push(resp_pdu, bit_and(req_payload[pi], 255)); pi = pi + 1; }
+    }
+    let resp_frame = modbus_rtu_build_frame(slave_id, function_code, resp_pdu);
+    if type(resp_frame) == "map" and resp_frame.ok == false { return resp_frame; }
+
+    let fallback_wire = fn(backend_tag, reason) {
+        let p_req = modbus_rtu_parse_frame(req_frame);
+        let p_resp = modbus_rtu_parse_frame(resp_frame);
+        let regs = _decode_holding_registers(function_code, p_resp.payload);
+        return map{
+            ok: p_req.ok and p_resp.ok,
+            live_kernel_tty: false,
+            backend: backend_tag,
+            fallback_reason: reason,
+            pts_device: "",
+            req_frame: req_frame,
+            resp_frame: resp_frame,
+            parsed_request: p_req,
+            parsed_response: p_resp,
+            registers: regs
+        };
+    };
+
+    if platform() != "linux" {
+        let btag = if platform() == "windows" { "win32_loopback_wire" } else { "loopback_wire_fallback" };
+        return fallback_wire(btag, "non_linux_platform");
+    }
+
+    let libc_h = try ffi_load("libc.so.6") catch 0;
+    if type(libc_h) != "number" or libc_h == 0 {
+        return fallback_wire("loopback_wire_fallback", "libc_unavailable");
+    }
+
+    // O_RDWR(2) | O_NOCTTY(256) = 258
+    let mfd = try ffi_call_typed(libc_h, "posix_openpt", "i32 -> i32", [258]) catch -1;
+    if mfd < 0 {
+        try ffi_close(libc_h) catch nil;
+        return fallback_wire("loopback_wire_fallback", "posix_openpt_unavailable");
+    }
+
+    let g_rc = ffi_call_typed(libc_h, "grantpt", "i32 -> i32", [mfd]);
+    let u_rc = ffi_call_typed(libc_h, "unlockpt", "i32 -> i32", [mfd]);
+    let pts_buf = bytes_new(128);
+    let n_rc = ffi_call_typed(libc_h, "ptsname_r", "i32, ptr, u64 -> i32", [mfd, pts_buf, 127]);
+    let pts_dev = if n_rc == 0 { _cstr_from_bytes(pts_buf, 0, 127) } else { "" };
+
+    if g_rc != 0 or u_rc != 0 or n_rc != 0 or len(pts_dev) == 0 {
+        try ffi_call_typed(libc_h, "close", "i32 -> i32", [mfd]) catch -1;
+        try ffi_close(libc_h) catch nil;
+        return fallback_wire("loopback_wire_fallback", "pts_setup_unavailable");
+    }
+
+    let sfd = try ffi_call_typed(libc_h, "open", "string, i32, i32 -> i32", [pts_dev, 258, 0]) catch -1;
+    if sfd < 0 {
+        try ffi_call_typed(libc_h, "close", "i32 -> i32", [mfd]) catch -1;
+        try ffi_close(libc_h) catch nil;
+        return fallback_wire("loopback_wire_fallback", "pts_slave_open_unavailable");
+    }
+
+    // Configure raw 8-bit transparent UART framing (cfmakeraw + TCSANOW=0) on both master & slave TTY fds
+    let tios_m = bytes_new(64);
+    let tios_s = bytes_new(64);
+    ffi_call_typed(libc_h, "tcgetattr", "i32, ptr -> i32", [mfd, tios_m]);
+    ffi_call_typed(libc_h, "cfmakeraw", "ptr -> void", [tios_m]);
+    let tc_m_rc = ffi_call_typed(libc_h, "tcsetattr", "i32, i32, ptr -> i32", [mfd, 0, tios_m]);
+
+    ffi_call_typed(libc_h, "tcgetattr", "i32, ptr -> i32", [sfd, tios_s]);
+    ffi_call_typed(libc_h, "cfmakeraw", "ptr -> void", [tios_s]);
+    let tc_s_rc = ffi_call_typed(libc_h, "tcsetattr", "i32, i32, ptr -> i32", [sfd, 0, tios_s]);
+
+    let req_pack = bytes_new(req_frame);
+    let wr_req = ffi_call_typed(libc_h, "write", "i32, ptr, u64 -> i64", [mfd, req_pack, len(req_frame)]);
+    let rx_req_bytes = _posix_read_exact(libc_h, sfd, len(req_frame));
+    let parsed_req = modbus_rtu_parse_frame(rx_req_bytes);
+
+    let resp_pack = bytes_new(resp_frame);
+    let wr_resp = ffi_call_typed(libc_h, "write", "i32, ptr, u64 -> i64", [sfd, resp_pack, len(resp_frame)]);
+    let rx_resp_bytes = _posix_read_exact(libc_h, mfd, len(resp_frame));
+    let parsed_resp = modbus_rtu_parse_frame(rx_resp_bytes);
+
+    // Deterministic fd & library cleanup
+    try ffi_call_typed(libc_h, "close", "i32 -> i32", [sfd]) catch -1;
+    try ffi_call_typed(libc_h, "close", "i32 -> i32", [mfd]) catch -1;
+    try ffi_close(libc_h) catch nil;
+
+    let regs = _decode_holding_registers(function_code, parsed_resp.payload);
+    let ok_all = (wr_req == len(req_frame)) and (wr_resp == len(resp_frame)) and parsed_req.ok and parsed_resp.ok;
+
+    return map{
+        ok: ok_all,
+        live_kernel_tty: true,
+        backend: "linux_kernel_pty_uart",
+        pts_device: pts_dev,
+        raw_termios_configured: (tc_m_rc == 0 and tc_s_rc == 0),
+        req_frame: rx_req_bytes,
+        resp_frame: rx_resp_bytes,
+        parsed_request: parsed_req,
+        parsed_response: parsed_resp,
+        registers: regs,
+        fds_closed: true
+    };
+}
+
+fn _tcp_read_exact_bytes(sock, expected_len) {
+    let out = [];
+    let guard = 0;
+    while len(out) < expected_len and guard < 16 {
+        let chunk_str = tcp_read(sock, expected_len - len(out));
+        let chunk_b = str_to_bytes(chunk_str);
+        if len(chunk_b) == 0 { break; }
+        let i = 0;
+        while i < len(chunk_b) {
+            array_push(out, chunk_b[i]);
+            i = i + 1;
+        }
+        guard = guard + 1;
+    }
+    return out;
+}
+
+fn modbus_tcp_live_loopback_transceive(tx_id = 42, unit_id = 1, function_code = 3, req_payload = [0, 0, 0, 2], resp_payload = [4, 4, 210, 22, 46]) {
+    let req_wire = modbus_tcp_build_mbap(tx_id, unit_id, function_code, req_payload);
+    if type(req_wire) == "map" and req_wire.ok == false { return req_wire; }
+    let resp_wire = modbus_tcp_build_mbap(tx_id, unit_id, function_code, resp_payload);
+    if type(resp_wire) == "map" and resp_wire.ok == false { return resp_wire; }
+
+    let srv = try tcp_listen("127.0.0.1:0") catch nil;
+    if srv == nil {
+        let pr = modbus_tcp_parse_mbap(req_wire);
+        let ps = modbus_tcp_parse_mbap(resp_wire);
+        return map{
+            ok: pr.ok and ps.ok,
+            live_kernel_tcp: false,
+            fallback_reason: "tcp_listen_restricted",
+            req_bytes: req_wire,
+            resp_bytes: resp_wire,
+            parsed_request: pr,
+            parsed_response: ps,
+            registers: _decode_holding_registers(function_code, ps.payload)
+        };
+    }
+
+    let addr = tcp_local_addr(srv);
+    let cli = tcp_connect(addr);
+    let acc = tcp_accept(srv);
+
+    tcp_write(cli, req_wire);
+    let rx_req = _tcp_read_exact_bytes(acc, len(req_wire));
+    let parsed_req = modbus_tcp_parse_mbap(rx_req);
+
+    tcp_write(acc, resp_wire);
+    let rx_resp = _tcp_read_exact_bytes(cli, len(resp_wire));
+    let parsed_resp = modbus_tcp_parse_mbap(rx_resp);
+
+    try tcp_close(cli) catch nil;
+    try tcp_close(acc) catch nil;
+    try tcp_close(srv) catch nil;
+
+    let regs = _decode_holding_registers(function_code, parsed_resp.payload);
+    return map{
+        ok: parsed_req.ok and parsed_resp.ok and parsed_resp.transaction_id == tx_id and parsed_resp.unit_id == unit_id,
+        live_kernel_tcp: true,
+        listen_addr: addr,
+        req_bytes: rx_req,
+        resp_bytes: rx_resp,
+        parsed_request: parsed_req,
+        parsed_response: parsed_resp,
+        registers: regs,
+        sockets_closed: true
+    };
+}
+
+fn socketcan_probe_and_transceive_live(can_id = 291, data_bytes = [222, 173, 190, 239]) {
+    let can16 = socketcan_encode_frame(can_id, data_bytes, map{ fd: false });
+    if type(can16) == "map" and can16.ok == false { return can16; }
+    let canfd72 = socketcan_encode_frame(can_id, data_bytes, map{ fd: true, brs: true });
+    if type(canfd72) == "map" and canfd72.ok == false { return canfd72; }
+
+    if platform() != "linux" {
+        let d16 = socketcan_decode_frame(can16);
+        let d72 = socketcan_decode_frame(canfd72);
+        return map{
+            ok: d16.ok and d72.ok,
+            live_kernel_socket: false,
+            pf_can_kernel_supported: false,
+            pf_can_errno: 0,
+            fallback_reason: "non_linux_platform",
+            can_frame_bytes: can16,
+            canfd_frame_bytes: canfd72,
+            decoded_can: d16,
+            decoded_canfd: d72
+        };
+    }
+
+    let libc_h = try ffi_load("libc.so.6") catch 0;
+    if type(libc_h) != "number" or libc_h == 0 {
+        let d16 = socketcan_decode_frame(can16);
+        let d72 = socketcan_decode_frame(canfd72);
+        return map{
+            ok: d16.ok and d72.ok,
+            live_kernel_socket: false,
+            pf_can_kernel_supported: false,
+            pf_can_errno: 0,
+            fallback_reason: "libc_unavailable",
+            can_frame_bytes: can16,
+            canfd_frame_bytes: canfd72,
+            decoded_can: d16,
+            decoded_canfd: d72
+        };
+    }
+
+    // Linux PF_CAN = 29, SOCK_RAW = 3, CAN_RAW = 1
+    let can_fd = try ffi_call_typed(libc_h, "socket", "i32, i32, i32 -> i32", [29, 3, 1]) catch -1;
+    let pf_can_ok = can_fd >= 0;
+    let pf_can_errno = 0;
+    if can_fd >= 0 {
+        try ffi_call_typed(libc_h, "close", "i32 -> i32", [can_fd]) catch -1;
+    } else {
+        let ep = try ffi_call_typed(libc_h, "__errno_location", "void -> u64", []) catch 0;
+        if ep != 0 {
+            let eb = bytes_new(4);
+            try ffi_call_typed(libc_h, "memcpy", "ptr, u64, u64 -> u64", [eb, ep, 4]) catch 0;
+            pf_can_errno = _get_i32_le(eb, 0);
+        }
+    }
+
+    // Live kernel datagram bus via socketpair(AF_UNIX=1, SOCK_DGRAM=2, 0, sv_fds)
+    let sv_buf = bytes_new(8);
+    let sp_rc = try ffi_call_typed(libc_h, "socketpair", "i32, i32, i32, ptr -> i32", [1, 2, 0, sv_buf]) catch -1;
+    if sp_rc != 0 {
+        try ffi_close(libc_h) catch nil;
+        let d16 = socketcan_decode_frame(can16);
+        let d72 = socketcan_decode_frame(canfd72);
+        return map{
+            ok: d16.ok and d72.ok,
+            live_kernel_socket: false,
+            pf_can_kernel_supported: pf_can_ok,
+            pf_can_errno: pf_can_errno,
+            fallback_reason: "socketpair_unavailable",
+            can_frame_bytes: can16,
+            canfd_frame_bytes: canfd72,
+            decoded_can: d16,
+            decoded_canfd: d72
+        };
+    }
+
+    let sv0 = _get_i32_le(sv_buf, 0);
+    let sv1 = _get_i32_le(sv_buf, 4);
+
+    let pack16 = bytes_new(can16);
+    let pack72 = bytes_new(canfd72);
+    let rx16_buf = bytes_new(16);
+    let rx72_buf = bytes_new(72);
+
+    let w16 = ffi_call_typed(libc_h, "write", "i32, ptr, u64 -> i64", [sv0, pack16, 16]);
+    let r16 = ffi_call_typed(libc_h, "read", "i32, ptr, u64 -> i64", [sv1, rx16_buf, 16]);
+    let w72 = ffi_call_typed(libc_h, "write", "i32, ptr, u64 -> i64", [sv1, pack72, 72]);
+    let r72 = ffi_call_typed(libc_h, "read", "i32, ptr, u64 -> i64", [sv0, rx72_buf, 72]);
+
+    try ffi_call_typed(libc_h, "close", "i32 -> i32", [sv0]) catch -1;
+    try ffi_call_typed(libc_h, "close", "i32 -> i32", [sv1]) catch -1;
+    try ffi_close(libc_h) catch nil;
+
+    let rx_can16 = _bytes_prefix_to_array(rx16_buf, 16);
+    let rx_canfd72 = _bytes_prefix_to_array(rx72_buf, 72);
+    let dec16 = socketcan_decode_frame(rx_can16);
+    let dec72 = socketcan_decode_frame(rx_canfd72);
+
+    return map{
+        ok: (w16 == 16) and (r16 == 16) and (w72 == 72) and (r72 == 72) and dec16.ok and dec72.ok,
+        live_kernel_socket: true,
+        pf_can_kernel_supported: pf_can_ok,
+        pf_can_errno: pf_can_errno,
+        can_frame_bytes: rx_can16,
+        canfd_frame_bytes: rx_canfd72,
+        decoded_can: dec16,
+        decoded_canfd: dec72,
+        fds_closed: true
+    };
+}
+
+fn _read_sysfs_trimmed(path) {
+    if not fs_exists(path) { return ""; }
+    let raw = try fs_read(path) catch "";
+    return str_trim(str(raw));
+}
+
+fn usb_enumerate_live_devices() {
+    let os_name = platform();
+    if os_name == "linux" {
+        let sys_usb = "/sys/bus/usb/devices";
+        let devs = [];
+        if fs_exists(sys_usb) {
+            let entries = array_sort(try fs_listdir(sys_usb) catch []);
+            let i = 0;
+            while i < len(entries) {
+                let en = str(entries[i]);
+                let base = sys_usb + "/" + en;
+                let vid_path = base + "/idVendor";
+                let pid_path = base + "/idProduct";
+                // Strict privacy/OPSEC hygiene: read ONLY vendor/product/class metadata, NEVER device serial numbers!
+                if fs_exists(vid_path) and fs_exists(pid_path) {
+                    let vid = _read_sysfs_trimmed(vid_path);
+                    let pid = _read_sysfs_trimmed(pid_path);
+                    let dclass = _read_sysfs_trimmed(base + "/bDeviceClass");
+                    let prod = _read_sysfs_trimmed(base + "/product");
+                    let mfg = _read_sysfs_trimmed(base + "/manufacturer");
+                    array_push(devs, map{
+                        bus_node: en,
+                        vendor_id: vid,
+                        product_id: pid,
+                        device_class: dclass,
+                        manufacturer: mfg,
+                        product: prod
+                    });
+                }
+                i = i + 1;
+            }
+        }
+        return map{
+            ok: true,
+            platform: "linux",
+            source: sys_usb,
+            serial_numbers_redacted: true,
+            device_count: len(devs),
+            devices: devs
+        };
+    }
+
+    if os_name == "windows" {
+        let sapi = try ffi_load("setupapi.dll") catch 0;
+        let sapi_ok = false;
+        let handle_valid = false;
+        if type(sapi) == "number" and sapi != 0 {
+            sapi_ok = true;
+            // DIGCF_PRESENT(2) | DIGCF_ALLCLASSES(4) = 6
+            let hdev = try ffi_call_typed(sapi, "SetupDiGetClassDevsW", "ptr, ptr, ptr, u32 -> ptr", [0, 0, 0, 6]) catch -1;
+            if hdev != 0 and hdev != -1 and hdev != 18446744073709551615 {
+                handle_valid = true;
+                try ffi_call_typed(sapi, "SetupDiDestroyDeviceInfoList", "ptr -> i32", [hdev]) catch 0;
+            }
+            try ffi_close(sapi) catch nil;
+        }
+        return map{
+            ok: true,
+            platform: "windows",
+            source: "setupapi.dll",
+            setupapi_available: sapi_ok,
+            device_info_set_opened: handle_valid,
+            serial_numbers_redacted: true,
+            device_count: 0,
+            devices: []
+        };
+    }
+
+    return map{
+        ok: true,
+        platform: os_name,
+        source: "portable_stub",
+        serial_numbers_redacted: true,
+        device_count: 0,
+        devices: []
+    };
+}
+
+fn tpm2_and_pkcs11_probe_live() {
+    let os_name = platform();
+    let tpm_present = false;
+    let tpm_ver_major = "";
+    let has_tpmrm0 = false;
+    let has_tpm0 = false;
+    let acpi_hid = "";
+    let pcr_count = 0;
+
+    let pcsc_lib_ok = false;
+    let pcsc_active = false;
+    let pcsc_rc = -1;
+
+    let p11_loaded = false;
+    let p11_path = "";
+    let p11_ckr_ok = false;
+    let p11_ver = "";
+
+    if os_name == "linux" {
+        has_tpmrm0 = fs_exists("/dev/tpmrm0");
+        has_tpm0 = fs_exists("/dev/tpm0");
+        tpm_ver_major = _read_sysfs_trimmed("/sys/class/tpm/tpm0/tpm_version_major");
+        acpi_hid = _read_sysfs_trimmed("/sys/class/tpm/tpm0/device/firmware_node/hid");
+        if len(acpi_hid) == 0 {
+            acpi_hid = _read_sysfs_trimmed("/sys/class/tpm/tpm0/device/hid");
+        }
+        if fs_exists("/sys/class/tpm/tpm0/pcr-sha256") {
+            let pcrs = try fs_listdir("/sys/class/tpm/tpm0/pcr-sha256") catch [];
+            pcr_count = len(pcrs);
+        }
+        tpm_present = has_tpmrm0 or has_tpm0 or len(tpm_ver_major) > 0;
+
+        // Probe PC/SC SmartCard Daemon via libpcsclite.so.1
+        let pcsc_h = try ffi_load("libpcsclite.so.1") catch 0;
+        if type(pcsc_h) == "number" and pcsc_h != 0 {
+            pcsc_lib_ok = true;
+            let ctx_out = bytes_new(8);
+            // SCARD_SCOPE_SYSTEM = 2
+            let rc = try ffi_call_typed(pcsc_h, "SCardEstablishContext", "u32, ptr, ptr, ptr -> i64", [2, 0, 0, ctx_out]) catch -1;
+            pcsc_rc = rc;
+            if rc == 0 {
+                pcsc_active = true;
+                let hctx = _get_u64_le(ctx_out, 0);
+                try ffi_call_typed(pcsc_h, "SCardReleaseContext", "u64 -> i64", [hctx]) catch 0;
+            }
+            try ffi_close(pcsc_h) catch nil;
+        }
+
+        // Probe OASIS PKCS#11 C_GetFunctionList across standard Linux module locations
+        let libc_h = try ffi_load("libc.so.6") catch 0;
+        let p11_candidates = [
+            "/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so",
+            "/usr/lib/aarch64-linux-gnu/pkcs11/p11-kit-trust.so",
+            "/usr/lib64/pkcs11/p11-kit-trust.so",
+            "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+            "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so"
+        ];
+        let pi = 0;
+        while pi < len(p11_candidates) and not p11_loaded {
+            let cand = p11_candidates[pi];
+            if fs_exists(cand) {
+                let p11_h = try ffi_load(cand) catch 0;
+                if type(p11_h) == "number" and p11_h != 0 {
+                    p11_loaded = true;
+                    p11_path = cand;
+                    let flist_out = bytes_new(8);
+                    let ck_rc = try ffi_call_typed(p11_h, "C_GetFunctionList", "ptr -> u64", [flist_out]) catch 1;
+                    let flist_ptr = _get_u64_le(flist_out, 0);
+                    if ck_rc == 0 and flist_ptr != 0 {
+                        p11_ckr_ok = true;
+                        if type(libc_h) == "number" and libc_h != 0 {
+                            let ver_bytes = bytes_new(2);
+                            try ffi_call_typed(libc_h, "memcpy", "ptr, u64, u64 -> u64", [ver_bytes, flist_ptr, 2]) catch 0;
+                            p11_ver = str(bytes_get(ver_bytes, 0)) + "." + str(bytes_get(ver_bytes, 1));
+                        }
+                    }
+                    try ffi_close(p11_h) catch nil;
+                }
+            }
+            pi = pi + 1;
+        }
+        if type(libc_h) == "number" and libc_h != 0 {
+            try ffi_close(libc_h) catch nil;
+        }
+    } elif os_name == "windows" {
+        // Probe Windows TPM 2.0 PCP via ncrypt.dll ("Microsoft Platform Crypto Provider")
+        let nc_h = try ffi_load("ncrypt.dll") catch 0;
+        if type(nc_h) == "number" and nc_h != 0 {
+            let prov_out = bytes_new(8);
+            let prov_w = _utf16le_zbytes("Microsoft Platform Crypto Provider");
+            let nrc = try ffi_call_typed(nc_h, "NCryptOpenStorageProvider", "ptr, ptr, u32 -> i32", [prov_out, prov_w, 0]) catch -1;
+            if nrc == 0 {
+                tpm_present = true;
+                tpm_ver_major = "2";
+                let hprov = _get_u64_le(prov_out, 0);
+                if hprov != 0 {
+                    try ffi_call_typed(nc_h, "NCryptFreeObject", "u64 -> i32", [hprov]) catch 0;
+                }
+            }
+            try ffi_close(nc_h) catch nil;
+        }
+
+        // Probe Windows SmartCard PC/SC via winscard.dll
+        let ws_h = try ffi_load("winscard.dll") catch 0;
+        if type(ws_h) == "number" and ws_h != 0 {
+            pcsc_lib_ok = true;
+            let ctx_out = bytes_new(8);
+            let wrc = try ffi_call_typed(ws_h, "SCardEstablishContext", "u32, ptr, ptr, ptr -> i32", [2, 0, 0, ctx_out]) catch -1;
+            pcsc_rc = wrc;
+            if wrc == 0 {
+                pcsc_active = true;
+                let hctx = _get_u64_le(ctx_out, 0);
+                try ffi_call_typed(ws_h, "SCardReleaseContext", "u64 -> i32", [hctx]) catch 0;
+            }
+            try ffi_close(ws_h) catch nil;
+        }
+    }
+
+    return map{
+        ok: true,
+        version: HW_HSM_VERSION,
+        platform: os_name,
+        tpm_present: tpm_present,
+        tpm_version_major: tpm_ver_major,
+        tpm_dev_tpmrm0: has_tpmrm0,
+        tpm_dev_tpm0: has_tpm0,
+        tpm_acpi_hid: acpi_hid,
+        tpm_sha256_pcr_count: pcr_count,
+        pcsc_library_available: pcsc_lib_ok,
+        pcsc_service_active: pcsc_active,
+        pcsc_status_code: pcsc_rc,
+        pkcs11_module_loaded: p11_loaded,
+        pkcs11_module_path: p11_path,
+        pkcs11_ckr_ok: p11_ckr_ok,
+        pkcs11_cryptoki_version: p11_ver
+    };
+}
+
 export HW_HSM_VERSION, FORMAT_BUS, FORMAT_WEBAUTHN, FORMAT_PKCS11;
 export CAN_EFF_FLAG, CAN_RTR_FLAG, CAN_ERR_FLAG, CAN_SFF_MASK, CAN_EFF_MASK, CANFD_BRS, CANFD_ESI, CANFD_FDF;
 export WEBAUTHN_FLAG_UP, WEBAUTHN_FLAG_UV, WEBAUTHN_FLAG_AT;
@@ -865,3 +1482,5 @@ export modbus_tcp_build_mbap, modbus_tcp_parse_mbap;
 export socketcan_encode_frame, socketcan_decode_frame;
 export i2c_spi_gpio_transfer_plan, usbhid_build_report_descriptor;
 export build_fido2_webauthn_assertion, verify_fido2_webauthn_assertion, pkcs11_build_mechanism_session;
+export modbus_rtu_live_pty_transceive, modbus_tcp_live_loopback_transceive, socketcan_probe_and_transceive_live;
+export usb_enumerate_live_devices, tpm2_and_pkcs11_probe_live;

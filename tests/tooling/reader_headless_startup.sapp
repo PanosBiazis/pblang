@@ -1,0 +1,224 @@
+// Pure-PBLang verification that headless Reader validates navigation without loading presentation/GUI modules, while --gui-session still loads presentation.
+let Dir = import("stdlib:linux_dirfs.sapp");
+let PackageBuilder = import("../../examples/declarative_browser/package_builder.sapp");
+
+fn _parse_cli() {
+    let raw = os_args();
+    let out: any = map{package: nil, evidence: nil, report: nil, runtime: nil};
+    let after = false;
+    let i = 0;
+    while i < len(raw) {
+        let arg = raw[i];
+        if not after {
+            if arg == "--" { after = true; }
+        } elif (arg == "--package" or arg == "--evidence" or arg == "--report" or arg == "--runtime") and i + 1 < len(raw) {
+            let val = raw[i + 1];
+            if arg == "--package" { out.package = val; }
+            elif arg == "--evidence" { out.evidence = val; }
+            elif arg == "--report" { out.report = val; }
+            elif arg == "--runtime" { out.runtime = val; }
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _resolve_pkg_runtime(explicit, repo) {
+    if explicit != nil and explicit != "" { return explicit; }
+    if fs_exists(repo + "/target/release/pblang") { return repo + "/target/release/pblang"; }
+    if fs_exists(repo + "/pblang") { return repo + "/pblang"; }
+    return "./pblang";
+}
+
+fn _mkdir_private(parent, name) {
+    let fs = Dir.open_absolute(parent, false, false);
+    assert(fs.ok, "open parent");
+    let created = Dir.mkdir_new(fs, name, false);
+    let closed = Dir.close(fs);
+    assert(created.ok and closed, "mkdir private");
+    return parent + "/" + name;
+}
+
+fn _rm_tree(path) {
+    let removed = false;
+    try { fs_remove(path); removed = true; } catch {}
+    if removed { return true; }
+    let kids = try fs_listdir(path) catch nil;
+    if type(kids) == "array" {
+        for kid in kids { let _child = _rm_tree(path + "/" + kid); }
+    }
+    let ok = false;
+    try { fs_remove(path); ok = true; } catch {}
+    return ok;
+}
+
+fn _snapshot_walk(root, rel, acc) {
+    let current = if rel == "" { root } else { root + "/" + rel };
+    let kids = try fs_listdir(current) catch nil;
+    if type(kids) == "array" {
+        for kid in array_sort(kids) {
+            let next_rel = if rel == "" { kid } else { rel + "/" + kid };
+            _snapshot_walk(root, next_rel, acc);
+        }
+    } elif rel != "pblang" {
+        acc[rel] = sha256(base64_encode_bytes(fs_read_bytes(current)));
+    } else {
+        acc[rel] = "runtime_present:" + str(fs_exists(current));
+    }
+}
+
+fn _snapshot(root) {
+    let acc = map{};
+    _snapshot_walk(root, "", acc);
+    return acc;
+}
+
+fn _copy_sources(src, dst) {
+    let kids = try fs_listdir(src) catch nil;
+    if type(kids) == "array" {
+        fs_mkdirs(dst);
+        for kid in kids {
+            if kid != "pblang" {
+                _copy_sources(src + "/" + kid, dst + "/" + kid);
+            }
+        }
+    } else {
+        fs_write_bytes(dst, fs_read_bytes(src));
+    }
+}
+
+fn _add_entry(entries, rel_path, bytes) {
+    entries[rel_path] = map{kind: "f", bytes: bytes};
+    let parent = path_dirname(rel_path);
+    while parent != "." and parent != "" and parent != "/" {
+        entries[parent] = map{kind: "d", bytes: []};
+        let next_parent = path_dirname(parent);
+        if next_parent == parent { break; }
+        parent = next_parent;
+    }
+}
+
+fn _build_source_package(repo, dest) {
+    let entry = "examples/declarative_browser/main.sapp";
+    let pending = [entry, "examples/declarative_browser/install.sapp"];
+    let captured = map{};
+    let entries: any = map{};
+    while len(pending) > 0 {
+        let rel = array_pop(pending);
+        if not map_has(captured, rel) {
+            captured[rel] = true;
+            let text = fs_read(repo + "/" + rel);
+            _add_entry(entries, rel, str_to_bytes(text));
+            for raw in PackageBuilder.imports(text) {
+                array_push(pending, PackageBuilder.resolve(raw, rel));
+            }
+        }
+    }
+    let manifest = "[package]\nname=\"pb-document-reader\"\nversion=\"0.1.0\"\nentry=\"" + entry + "\"\n[dependencies]\nstdlib={path=\"stdlib\"}\n";
+    let lock = "manifest_sha256 = \"" + sha256(manifest) + "\"\ncontent_hash_algorithm = \"pblang-package-tree-v2\"\n[dependencies.stdlib]\npath = \"stdlib\"\nsha256 = \"" + PackageBuilder.tree_digest(entries) + "\"\n";
+    _add_entry(entries, "pblang.toml", str_to_bytes(manifest));
+    _add_entry(entries, "pblang.lock", str_to_bytes(lock));
+    fs_mkdirs(dest);
+    for rel in array_sort(map_keys(entries)) {
+        let item = entries[rel];
+        let out_path = dest + "/" + rel;
+        if item.kind == "d" {
+            fs_mkdirs(out_path);
+        } else {
+            fs_mkdirs(path_dirname(out_path));
+            fs_write_bytes(out_path, item.bytes);
+        }
+    }
+}
+
+fn _run_pkg(runtime, pkg_dir, script_args) {
+    let prev = try env_get("PBLANG_SCRIPT_ARGS") catch nil;
+    env_set("PBLANG_SCRIPT_ARGS", str_join(script_args, "\n"));
+    let cmd_args = [
+        "run", pkg_dir,
+        "--allow-all", "--deny-net", "--deny-http", "--deny-exec", "--deny-spawn"
+    ];
+    if len(script_args) > 0 {
+        array_push(cmd_args, "--");
+        for a in script_args { array_push(cmd_args, a); }
+    }
+    let res = proc_spawn_wait(runtime, cmd_args);
+    if prev == nil { env_set("PBLANG_SCRIPT_ARGS", ""); }
+    else { env_set("PBLANG_SCRIPT_ARGS", prev); }
+    return res;
+}
+
+fn _run(scratch, repo, cli) {
+    let runtime = _resolve_pkg_runtime(cli.runtime, repo);
+    let base_pkg = if cli.package != nil and cli.package != "" { cli.package } else { scratch + "/clean_pkg" };
+    if cli.package == nil or cli.package == "" {
+        _build_source_package(repo, base_pkg);
+    }
+    let before = _snapshot(base_pkg);
+    let marker = "reader_presentation_fixture_loaded";
+
+    let fault_app_pkg = scratch + "/fault_app_pkg";
+    _copy_sources(base_pkg, fault_app_pkg);
+    fs_write(fault_app_pkg + "/examples/declarative_browser/app.sapp", "throw \"" + marker + "\";\n");
+
+    let fault_pages_pkg = scratch + "/fault_pages_pkg";
+    _copy_sources(base_pkg, fault_pages_pkg);
+    let pages_path = fault_pages_pkg + "/examples/declarative_browser/pages.sapp";
+    let pages_src = fs_read(pages_path);
+    let needle = "href=\\\"pb://guide\\\"";
+    let pieces = str_split(pages_src, needle);
+    assert(len(pieces) == 2, "pages.sapp contains exact single guide href");
+    fs_write(pages_path, str_join(pieces, "href=\\\"pb://about\\\""));
+
+    let checks: any = [];
+    let record = fn(name, pkg_dir, args, expect_ok, expected_sub) {
+        let p = _run_pkg(runtime, pkg_dir, args);
+        let combined = p.stdout + p.stderr;
+        if cli.evidence != nil and cli.evidence != "" {
+            fs_mkdirs(cli.evidence);
+            fs_write(cli.evidence + "/" + name + ".log", combined);
+        }
+        let ok = ((p.exit_code == 0) == expect_ok) and str_contains(combined, expected_sub);
+        assert(ok, "check failed: " + name + " -> " + combined);
+        array_push(checks, map{name: name, passed: ok, exit: p.exit_code});
+    };
+
+    record("headless-normal", base_pkg, [], true, "declarative_browser_pass");
+    record("headless-with-unavailable-presentation", fault_app_pkg, [], true, "declarative_browser_pass");
+    record("gui-still-loads-presentation", fault_app_pkg, ["--gui-session"], false, marker);
+    record("navigation-check-still-rejects-wrong-link", fault_pages_pkg, [], false, "local navigation");
+
+    assert(before == _snapshot(base_pkg), "base package remained completely unchanged");
+    array_push(checks, map{name: "package-unchanged", passed: true});
+
+    if cli.evidence != nil and cli.evidence != "" {
+        fs_mkdirs(cli.evidence);
+        fs_write(cli.evidence + "/acceptance.json", json_stringify(checks) + "\n");
+    }
+
+    return map{
+        passed: true,
+        checks: checks,
+        source_hidden: true,
+        faults_private: true
+    };
+}
+
+fn main() {
+    let cli = _parse_cli();
+    let repo = cwd();
+    let scratch_name = "pblang_tooling_s3_headless_" + str(num_floor(now_ms()));
+    let scratch = _mkdir_private("/tmp", scratch_name);
+    let result = try _run(scratch, repo, cli) catch nil;
+    let _cleaned = _rm_tree(scratch);
+    assert(result != nil and result.passed == true, "reader_headless_startup failed");
+    let json_text = json_stringify(result);
+    if cli.report != nil and cli.report != "" {
+        fs_mkdirs(path_dirname(cli.report));
+        fs_write(cli.report, json_text + "\n");
+    }
+    print json_text;
+}
+
+main();

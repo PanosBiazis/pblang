@@ -8,14 +8,12 @@
 
 #include "zr_compiler.h"
 
-#define ZR_PBCK_CACHE_SALT "PBLANG-ZR-5.0.0-r1|"
+#define ZR_PBCK_CACHE_SALT "PBLANG-ZR-5.1.0-r1|"
 
 static bool zr_file_exists_reg(const char *path) {
     if (!path || !path[0]) return false;
 #if defined(_WIN32)
-    wchar_t *wp = zr_win_utf8_to_wide(path, true);
-    DWORD attr = wp ? GetFileAttributesW(wp) : INVALID_FILE_ATTRIBUTES;
-    free(wp);
+    DWORD attr = GetFileAttributesA(path);
     return (attr != INVALID_FILE_ATTRIBUTES) && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 #else
     struct stat st;
@@ -26,9 +24,7 @@ static bool zr_file_exists_reg(const char *path) {
 static bool zr_dir_exists(const char *path) {
     if (!path || !path[0]) return false;
 #if defined(_WIN32)
-    wchar_t *wp = zr_win_utf8_to_wide(path, true);
-    DWORD attr = wp ? GetFileAttributesW(wp) : INVALID_FILE_ATTRIBUTES;
-    free(wp);
+    DWORD attr = GetFileAttributesA(path);
     return (attr != INVALID_FILE_ATTRIBUTES) && (attr & FILE_ATTRIBUTE_DIRECTORY);
 #else
     struct stat st;
@@ -39,11 +35,7 @@ static bool zr_dir_exists(const char *path) {
 static void zr_mkdir_single(const char *path) {
     if (!path || !path[0]) return;
 #if defined(_WIN32)
-    wchar_t *wp = zr_win_utf8_to_wide(path, true);
-    if (wp) {
-        CreateDirectoryW(wp, NULL);
-        free(wp);
-    }
+    _mkdir(path);
 #else
     mkdir(path, 0755);
 #endif
@@ -68,21 +60,7 @@ static void zr_mkdirs_path(const char *path) {
 static void zr_canonicalize_path(const char *in_path, char out[4096]) {
     if (!in_path || !in_path[0]) { out[0] = '\0'; return; }
 #if defined(_WIN32)
-    wchar_t *wp = zr_win_utf8_to_wide(in_path, false);
-    if (wp) {
-        wchar_t wfull[4096];
-        if (_wfullpath(wfull, wp, 4096)) {
-            char *u8 = zr_win_wide_to_utf8(wfull);
-            free(wp);
-            if (u8) {
-                snprintf(out, 4096, "%s", u8);
-                free(u8);
-                return;
-            }
-        } else {
-            free(wp);
-        }
-    }
+    if (_fullpath(out, in_path, 4096)) return;
 #elif !defined(__wasi__)
     char *rp = realpath(in_path, NULL);
     if (rp) {
@@ -112,7 +90,7 @@ static void zr_path_parent_dir(const char *path, char out[4096]) {
 }
 
 static bool zr_read_entire_file(const char *path, uint8_t **out_buf, size_t *out_len) {
-    FILE *fp = zr_fopen(path, "rb");
+    FILE *fp = fopen(path, "rb");
     if (!fp) return false;
     long sz = -1;
     if (fseek(fp, 0, SEEK_END) == 0) {

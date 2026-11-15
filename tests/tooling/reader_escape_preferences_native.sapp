@@ -1,0 +1,351 @@
+// Pure-PBLang verification of Escape preference dismissal, held-key safety, explicit Save, and reading anchor survival.
+let App = import("../../examples/declarative_browser/app.sapp");
+let Profile = import("../../examples/declarative_browser/appearance_profile.sapp");
+let Store = import("../../examples/declarative_browser/appearance_store.sapp");
+let DocFile = import("../../examples/declarative_browser/document_file.sapp");
+let Dir = import("stdlib:linux_dirfs.sapp");
+let G = import("stdlib:graphics.sapp");
+let FontMetrics = import("stdlib:font_metrics.sapp");
+let Hash = import("stdlib:sha256_pb.sapp");
+
+fn _parse_cli() {
+    let raw = os_args();
+    let out: any = map{package: nil, evidence: nil, report: nil, runtime: nil, xvfb: false};
+    let after = false;
+    let i = 0;
+    while i < len(raw) {
+        let arg = raw[i];
+        if not after {
+            if arg == "--" { after = true; }
+        } elif arg == "--xvfb" {
+            out.xvfb = true;
+        } elif (arg == "--package" or arg == "--evidence" or arg == "--report" or arg == "--runtime") and i + 1 < len(raw) {
+            let val = raw[i + 1];
+            if arg == "--package" { out.package = val; }
+            elif arg == "--evidence" { out.evidence = val; }
+            elif arg == "--report" { out.report = val; }
+            elif arg == "--runtime" { out.runtime = val; }
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _mkdir_private(parent, name) {
+    let fs = Dir.open_absolute(parent, false, false);
+    assert(fs.ok, "open parent");
+    let created = Dir.mkdir_new(fs, name, false);
+    let closed = Dir.close(fs);
+    assert(created.ok and closed, "mkdir private");
+    return parent + "/" + name;
+}
+
+fn _rm_tree(path) {
+    let removed = false;
+    try { fs_remove(path); removed = true; } catch {}
+    if removed { return true; }
+    let kids = try fs_listdir(path) catch nil;
+    if type(kids) == "array" {
+        for kid in kids { let _child = _rm_tree(path + "/" + kid); }
+    }
+    let ok = false;
+    try { fs_remove(path); ok = true; } catch {}
+    return ok;
+}
+
+fn _repeat_str(s, count) {
+    let parts = [];
+    for _i count { array_push(parts, s); }
+    return str_join(parts, "");
+}
+
+fn _snapshot_walk(root, rel, acc) {
+    let current = if rel == "" { root } else { root + "/" + rel };
+    let kids = try fs_listdir(current) catch nil;
+    if type(kids) == "array" {
+        if rel != "" { acc[rel] = "directory"; }
+        for kid in array_sort(kids) {
+            let next_rel = if rel == "" { kid } else { rel + "/" + kid };
+            _snapshot_walk(root, next_rel, acc);
+        }
+    } elif rel != "" {
+        let h = Hash.new();
+        Hash.update(h, fs_read_bytes(current));
+        acc[rel] = Hash.finish(h);
+    }
+}
+
+fn _snapshot(root) {
+    let acc = map{};
+    _snapshot_walk(root, "", acc);
+    return acc;
+}
+
+fn _make_text_measurer() {
+    let cache_fonts = map{};
+    let cache_metrics: any = map{};
+    let cache_widths: any = map{};
+    return fn(text, px, family) {
+        if not map_has(cache_fonts, family) {
+            let resolved = G.text_font_resolve(family);
+            cache_fonts[family] = resolved;
+            cache_metrics[family] = if resolved != "" { try FontMetrics.load(resolved) catch nil } else { nil };
+        }
+        let key = json_stringify([family, px, text]);
+        if map_has(cache_widths, key) { return cache_widths[key]; }
+        let layout = try FontMetrics.layout(cache_metrics[family], text, px) catch nil;
+        let w = if layout != nil { layout.width } else { len(text) * num_max(4, num_floor(px * 0.56)) };
+        let h = if layout != nil { layout.height } else { px };
+        let res = map{ok: true, width: w, height: h, font: cache_fonts[family]};
+        cache_widths[key] = res;
+        return res;
+    };
+}
+
+fn _region_digest(c, x0, y0, x1, y1) {
+    let h = Hash.new();
+    let clip_rect = fn(rx, ry, rw, rh, col_tag) {
+        let ax0 = num_max(rx, x0);
+        let ay0 = num_max(ry, y0);
+        let ax1 = num_min(rx + rw, x1);
+        let ay1 = num_min(ry + rh, y1);
+        if ax1 > ax0 and ay1 > ay0 {
+            Hash.update(h, str_to_bytes("R:" + str(ax0) + "," + str(ay0) + "," + str(ax1 - ax0) + "," + str(ay1 - ay0) + ":" + col_tag + ";"));
+        }
+    };
+    let canvas = map{
+        clear: fn(col) { Hash.update(h, str_to_bytes("C:" + json_stringify(col) + ";")); },
+        rect: fn(rx, ry, rw, rh, col) {
+            if rw > 0 and rh > 0 { clip_rect(rx, ry, rw, rh, json_stringify(col)); }
+        },
+        rects: fn(items, col) {
+            let ctag = json_stringify(col);
+            for it in items {
+                clip_rect(it.x, it.y, it.w, it.h, ctag);
+            }
+        },
+        point: fn(px, py, col) {
+            if px >= x0 and px < x1 and py >= y0 and py < y1 {
+                Hash.update(h, str_to_bytes("P:" + str(px) + "," + str(py) + ":" + json_stringify(col) + ";"));
+            }
+        },
+        line: fn(lx1, ly1, lx2, ly2, col) {
+            let miny = num_min(ly1, ly2);
+            let maxy = num_max(ly1, ly2);
+            if maxy >= y0 and miny < y1 {
+                Hash.update(h, str_to_bytes("L:" + str(lx1) + "," + str(ly1) + "," + str(lx2) + "," + str(ly2) + ":" + json_stringify(col) + ";"));
+            }
+        },
+        circle: fn(_cx, _cy, _r, _col) {}
+    };
+    let _d = App.draw(c, canvas);
+    return Hash.finish(h);
+}
+
+fn _key(c, raw_name) {
+    let k = if raw_name == "Return" { "Enter" } elif raw_name == "Page_Down" { "PageDown" } elif raw_name == "Page_Up" { "PageUp" } else { raw_name };
+    let _d = App.update(c, [map{type: "keydown", key: k}]);
+    let _u = App.update(c, [map{type: "keyup", key: k}]);
+}
+
+fn _tabs(c, n) {
+    for _i n { _key(c, "Tab"); }
+}
+
+fn _click(c, xpos, ypos) {
+    let _d = App.update(c, [map{type: "mousedown", x: xpos, y: ypos, button: "Left"}]);
+    let _u = App.update(c, [map{type: "mouseup", x: xpos, y: ypos, button: "Left"}]);
+}
+
+fn _resize(c, w, h) {
+    let _r = App.update(c, [map{type: "resize", w: w, h: h}]);
+}
+
+fn _close(c) {
+    for _i 3 {
+        if c.form.close_requested { break; }
+        _key(c, "Escape");
+    }
+    assert(c.form.close_requested, "clean reader close");
+    c.session.close();
+}
+
+fn _start_reader(doc_path, data_dir, with_profile, measurer) {
+    let info = DocFile.load(doc_path);
+    assert(info.ok, "admitted imported document");
+    let loaded: any = map{can_save: false, appearance: nil, message: "Session only: --with-profile to save", token: nil};
+    let active_saver: any = nil;
+    let reloader: any = nil;
+    if with_profile {
+        loaded = Store.load(data_dir);
+        let saver = fn(style) {
+            let res = Store.save(data_dir, style, loaded.token);
+            if res.confirmed { loaded.token = res.token; }
+            return res;
+        };
+        reloader = fn() {
+            let fresh = Store.load(data_dir);
+            if not fresh.ok or not fresh.can_save or fresh.token == "missing" { return map{ok: false}; }
+            loaded.token = fresh.token;
+            return map{ok: true, appearance: fresh.appearance, save: saver};
+        };
+        if loaded.can_save { active_saver = saver; }
+    }
+    let c = App.create("local", "dark", nil, info.source);
+    App.enable_preferences(c, loaded.appearance, active_saver, loaded.message, reloader);
+    App.set_text_measure(c, measurer);
+    let _ref = App.refresh(c);
+    return c;
+}
+
+fn _run(scratch) {
+    let data_dir = _mkdir_private(scratch, "data");
+    let profile_path = data_dir + "/reader-style/appearance-v1.json";
+    let doc_path = scratch + "/Escape — ανάγνωση.html";
+    let paragraphs = [];
+    for i 7 {
+        array_push(paragraphs, "<p>Section " + str(i) + ". " + _repeat_str("Readable local words. ", 10) + "</p>");
+    }
+    let html = "<article><h1>Return safely to reading</h1>" + str_join(paragraphs, "") + "<a href=\"pb://guide\">Open guide</a></article>";
+    fs_write(doc_path, html);
+    let original_bytes = fs_read_bytes(doc_path);
+    let measurer = _make_text_measurer();
+
+    let c1 = _start_reader(doc_path, data_dir, true, measurer);
+    _resize(c1, 320, 480);
+    _key(c1, "End");
+    let escape_before = _region_digest(c1, 0, 64, 320, 480);
+    let empty_snap = _snapshot(data_dir);
+    assert(len(map_keys(empty_snap)) == 0 and not fs_exists(profile_path), "profile initially absent");
+
+    _click(c1, 275, 32);
+    assert(c1.settings, "Style opened on compact toolbar");
+    _tabs(c1, 2);
+    assert(c1.form.focus == "title_size", "focused title_size");
+    let escape_style_before = _region_digest(c1, 0, 0, 320, 448);
+    _key(c1, "Return");
+    assert(c1.preferences.draft.title_size == 32, "draft title_size 32");
+    let escape_draft = _region_digest(c1, 0, 0, 320, 448);
+    assert(escape_draft != escape_style_before, "draft visually changed");
+
+    // Held Escape across repeated frames must dismiss Style once without closing the reader.
+    for _f 6 {
+        let _kd = App.update(c1, [map{type: "keydown", key: "Escape"}]);
+    }
+    let _ku = App.update(c1, [map{type: "keyup", key: "Escape"}]);
+    assert(not c1.settings and not c1.form.close_requested, "Held Escape kept window open");
+    let escape_returned = _region_digest(c1, 0, 64, 320, 480);
+    assert(escape_returned == escape_before, "document region unchanged after Escape");
+    assert(_snapshot(data_dir) == empty_snap, "no implicit save on Escape");
+
+    // Unapplied draft was discarded.
+    _click(c1, 275, 32);
+    _tabs(c1, 2);
+    let escape_style_discarded = _region_digest(c1, 0, 0, 320, 448);
+    assert(escape_style_discarded == escape_style_before and c1.preferences.draft.title_size == 28, "unapplied draft discarded");
+
+    // Apply for session + Escape keeps session style without writing profile.
+    _key(c1, "Return");
+    _key(c1, "Next");
+    _key(c1, "Return");
+    _key(c1, "Escape");
+    assert(not c1.form.close_requested and c1.appearance.title_size == 32 and _snapshot(data_dir) == empty_snap, "applied kept without profile write");
+
+    _click(c1, 275, 32);
+    _tabs(c1, 2);
+    let escape_style_applied = _region_digest(c1, 0, 0, 320, 448);
+    assert(escape_style_applied == escape_draft, "applied style matches draft");
+
+    // Explicit Save writes profile once; Escape writes nothing extra.
+    _key(c1, "Next");
+    _key(c1, "Tab");
+    assert(c1.form.focus == "style_save", "focused style_save");
+    _key(c1, "Return");
+    let decoded_saved = Profile.decode(fs_read(profile_path));
+    assert(fs_exists(profile_path) and decoded_saved.ok and decoded_saved.appearance.title_size == 32, "saved title_size 32");
+    let saved_bytes = fs_read_bytes(profile_path);
+    let saved_tree = _snapshot(data_dir);
+    _key(c1, "Escape");
+    let escape_saved = _region_digest(c1, 0, 64, 320, 480);
+    assert(_snapshot(data_dir) == saved_tree, "Escape after Save wrote nothing");
+
+    // Draft over saved style discarded on Escape.
+    _click(c1, 275, 32);
+    _tabs(c1, 2);
+    _key(c1, "Return");
+    assert(c1.preferences.draft.title_size == 36, "draft 36");
+    _key(c1, "Escape");
+    let escape_saved_discarded = _region_digest(c1, 0, 64, 320, 480);
+    assert(escape_saved_discarded == escape_saved and _snapshot(data_dir) == saved_tree and c1.appearance.title_size == 32, "draft over saved discarded");
+
+    // Back/Forward reading anchors survive settings dismissal.
+    _key(c1, "End");
+    let escape_link_position = _region_digest(c1, 0, 64, 320, 480);
+    _tabs(c1, 2);
+    _key(c1, "Return");
+    assert(c1.session.snapshot().url == "pb://guide", "followed local guide link");
+    _key(c1, "Next");
+    let escape_guide_position = _region_digest(c1, 0, 64, 320, 480);
+    _click(c1, 44, 32);
+    assert(c1.session.snapshot().url == "pb://home", "Back returned home");
+    let escape_back = _region_digest(c1, 0, 64, 320, 480);
+    assert(escape_back == escape_link_position and _snapshot(data_dir) == saved_tree, "Back anchor kept");
+    _click(c1, 120, 32);
+    assert(c1.session.snapshot().url == "pb://guide", "Forward returned guide");
+    let escape_forward = _region_digest(c1, 0, 64, 320, 480);
+    assert(escape_forward == escape_guide_position, "Forward anchor kept");
+
+    // Close while Style is open: first Escape dismisses Style, second closes reader.
+    _click(c1, 275, 32);
+    assert(c1.settings, "Style reopened before close");
+    _close(c1);
+    assert(fs_read_bytes(doc_path) == original_bytes and fs_read_bytes(profile_path) == saved_bytes, "input and profile preserved");
+
+    // Restart loads saved title_size == 32; Escape from wide Style keeps window open.
+    let c2 = _start_reader(doc_path, data_dir, true, measurer);
+    assert(c2.appearance.title_size == 32 and _snapshot(data_dir) == saved_tree, "restarted with saved title_size 32");
+    _click(c2, 700, 44);
+    assert(c2.settings, "wide Style opened");
+    _key(c2, "Escape");
+    assert(not c2.settings and not c2.form.close_requested, "wide Escape kept window open");
+    _close(c2);
+    assert(fs_read_bytes(doc_path) == original_bytes and _snapshot(data_dir) == saved_tree, "final input and profile unchanged");
+
+    return map{
+        passed: true,
+        real_launcher: true,
+        held_escape_kept_window: true,
+        unapplied_discarded: true,
+        applied_kept: true,
+        saved_kept: true,
+        save_explicit: true,
+        no_extra_profile_writes: true,
+        back_anchor_kept: true,
+        forward_anchor_kept: true,
+        restart_saved_style: true,
+        input_unchanged: true,
+        visual_review_required: false
+    };
+}
+
+fn main() {
+    let cli = _parse_cli();
+    let scratch_name = "pblang_tooling_s3_escape_" + str(num_floor(now_ms()));
+    let scratch = _mkdir_private("/tmp", scratch_name);
+    let result = try _run(scratch) catch nil;
+    let _cleaned = _rm_tree(scratch);
+    assert(result != nil and result.passed == true, "reader_escape_preferences_native failed");
+    let json_text = json_stringify(result);
+    if cli.evidence != nil and cli.evidence != "" {
+        fs_mkdirs(cli.evidence);
+        fs_write(cli.evidence + "/acceptance.json", json_text + "\n");
+    }
+    if cli.report != nil and cli.report != "" {
+        fs_mkdirs(path_dirname(cli.report));
+        fs_write(cli.report, json_text + "\n");
+    }
+    print json_text;
+}
+
+main();

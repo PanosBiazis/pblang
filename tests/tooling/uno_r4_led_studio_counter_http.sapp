@@ -1,0 +1,269 @@
+// Pure PBLang verification for UNO R4 LED Studio counter HTTP workflow:
+// duplicate + invert authored frames, start counter 7..9 (1s) -> Counter 07,
+// project.json generator metadata, elapsed tick -> Counter 08 with stable Stop
+// CSRF token and unchanged frames.json, Stop counter freeze, explicit capture
+// into selected frame only, project JSON roundtrip, invalid counter_seconds=0
+// atomic rejection, finite 9..9 completion, and legacy frames.json import
+// clearing generator to nil.
+
+let Web = import("../../examples/uno_r4_led_studio/web.sapp");
+
+fn _attr_value(attrs_str, attr_name) {
+    let marker = attr_name + "=\"";
+    if not str_contains(attrs_str, marker) {
+        return nil;
+    }
+    let after = str_split(attrs_str, marker)[1];
+    return str_split(after, "\"")[0];
+}
+
+fn _has_flag_attr(attrs_str, flag_name) {
+    let padded = " " + attrs_str + " ";
+    return str_contains(padded, " " + flag_name + " ") or str_ends_with(attrs_str, " " + flag_name);
+}
+
+fn _html_unescape(s) {
+    let out = str_join(str_split(s, "&amp;"), "&");
+    out = str_join(str_split(out, "&lt;"), "<");
+    out = str_join(str_split(out, "&gt;"), ">");
+    out = str_join(str_split(out, "&quot;"), "\"");
+    out = str_join(str_split(out, "&#39;"), "'");
+    return out;
+}
+
+fn _parse_form(page) {
+    let main_html = str_split(page, "<form id=\"led-file-import\"")[0];
+    let inputs = map{};
+    let input_order = [];
+    let in_chunks = str_split(main_html, "<input ");
+    let n_in = len(in_chunks);
+    let idx = 1;
+    while idx < n_in {
+        let tag = str_split(in_chunks[idx], ">")[0];
+        let form_ref = _attr_value(tag, "form");
+        if form_ref == nil or form_ref == "led-editor" {
+            let input_type = _attr_value(tag, "type");
+            let name = _attr_value(tag, "name");
+            if name != nil and input_type != "file" {
+                let take = true;
+                if input_type == "radio" and not _has_flag_attr(tag, "checked") {
+                    take = false;
+                }
+                if take {
+                    let raw_val = _attr_value(tag, "value");
+                    let val = "";
+                    if raw_val != nil {
+                        val = _html_unescape(raw_val);
+                    }
+                    if not map_has(inputs, name) {
+                        push(input_order, name);
+                    }
+                    inputs[name] = val;
+                }
+            }
+        }
+        idx = idx + 1;
+    }
+
+    let buttons = map{};
+    let btn_chunks = str_split(main_html, "<button ");
+    let n_btn = len(btn_chunks);
+    let bidx = 1;
+    while bidx < n_btn {
+        let bpart = str_split(btn_chunks[bidx], "</button>")[0];
+        let gt_parts = str_split(bpart, ">");
+        if len(gt_parts) >= 2 {
+            let battrs = gt_parts[0];
+            let bval = _attr_value(battrs, "value");
+            if bval != nil {
+                let blabel = str_trim(_html_unescape(gt_parts[1]));
+                buttons[blabel] = _html_unescape(bval);
+            }
+        }
+        bidx = bidx + 1;
+    }
+    return map{inputs: inputs, order: input_order, buttons: buttons};
+}
+
+fn _put_field(values, order, k, v) {
+    if not map_has(values, k) {
+        push(order, k);
+    }
+    values[k] = v;
+    return 0;
+}
+
+fn _http_get(app, host, path) {
+    let res = app.handle(map{
+        method: "GET",
+        path: path,
+        headers: map{"Host": host},
+        body: ""
+    });
+    assert(res.status == 200, "GET " + path + " expected 200, got " + str(res.status));
+    return res.body;
+}
+
+fn _http_post(app, host, origin, page, button_label, updates) {
+    let parsed = _parse_form(page);
+    assert(map_has(parsed.buttons, button_label), "missing button label: " + button_label);
+    let values = map{};
+    let order = [];
+    for k in parsed.order {
+        _put_field(values, order, k, parsed.inputs[k]);
+    }
+    _put_field(values, order, "action", parsed.buttons[button_label]);
+    _put_field(values, order, "animation", "");
+    _put_field(values, order, "workspace", "dynamic");
+    for uk in map_keys(updates) {
+        _put_field(values, order, uk, updates[uk]);
+    }
+
+    let pairs = [];
+    for k in order {
+        push(pairs, url_encode(k) + "=" + url_encode(str(values[k])));
+    }
+    let res = app.handle(map{
+        method: "POST",
+        path: "/action",
+        headers: map{
+            "Host": host,
+            "Origin": origin,
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: str_join(pairs, "&")
+    });
+    assert(res.status == 200, "POST " + button_label + " expected 200, got " + str(res.status));
+    return res.body;
+}
+
+fn _advance_model_elapsed_ms(app, delta_ms) {
+    // Deterministically shift model start/last_time backward so now_ms() - started
+    // advances by delta_ms without wall-clock sleep jitter.
+    app.state.started = app.state.started - delta_ms;
+    app.state.last_time = app.state.last_time - delta_ms;
+    return 0;
+}
+
+fn _pixels_equal(a, b) {
+    if len(a) != len(b) {
+        return false;
+    }
+    for i len(a) {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn _run_counter_http_suite() {
+    let port = 18773;
+    let host = "127.0.0.1:" + str(port);
+    let origin = "http://" + host;
+    let app = Web.create(port);
+
+    let page = _http_get(app, host, "/");
+    page = _http_post(app, host, origin, page, "Duplicate frame", map{});
+    page = _http_post(app, host, origin, page, "Invert", map{});
+    let authored = _http_get(app, host, "/frames.json");
+
+    // Start counter 7..9 @ 1s
+    page = _http_post(app, host, origin, page, "Start counter", map{
+        counter_start: "7",
+        counter_end: "9",
+        counter_seconds: "1"
+    });
+    assert(str_contains(page, "Counter 07"), "initial counter sample is Counter 07");
+    assert(str_contains(page, "http-equiv=\"refresh\""), "meta refresh active while counter running");
+    assert(not str_contains(page, "<set "), "no SVG <set animation in counter view");
+
+    let project = _http_get(app, host, "/project.json");
+    let saved = json_parse(project);
+    assert(saved.generator != nil, "project.json includes generator");
+    assert(saved.generator.kind == "counter" and saved.generator.start == 7 and saved.generator.end == 9 and saved.generator.interval_ms == 1000, "generator config 7..9 @ 1000ms");
+
+    let stop_token = _parse_form(page).inputs["csrf"];
+
+    // Advance 1150 ms -> Counter 08; CSRF token for Stop must remain valid!
+    _advance_model_elapsed_ms(app, 1150);
+    page = _http_get(app, host, "/");
+    assert(str_contains(page, "Counter 08"), "ticked counter sample is Counter 08");
+    assert(_parse_form(page).inputs["csrf"] == stop_token, "Stop CSRF token preserved across counter tick");
+    assert(_http_get(app, host, "/frames.json") == authored, "authored frames.json unchanged while counter runs");
+    assert(_http_get(app, host, "/project.json") == project, "project.json unchanged while counter ticks");
+
+    // Stop counter freezes value at 08 and removes refresh
+    page = _http_post(app, host, origin, page, "Stop counter", map{});
+    assert(not str_contains(page, "http-equiv=\"refresh\""), "Stop counter removes meta refresh");
+    assert(_http_get(app, host, "/frames.json") == authored, "Stop counter keeps authored frames unchanged");
+
+    _advance_model_elapsed_ms(app, 1100);
+    page = _http_get(app, host, "/");
+    assert(not str_contains(page, "http-equiv=\"refresh\"") and str_contains(page, "last value 08"), "stopped counter stays frozen at last value 08");
+
+    // Explicit capture copies 08 into selected frame (frame 2, index 1) ONLY
+    page = _http_post(app, host, origin, page, "Capture last value → selected frame", map{});
+    let captured = json_parse(_http_get(app, host, "/frames.json"));
+    let orig_doc = json_parse(authored);
+    assert(len(captured.document.frames) == 2, "captured document retains 2 frames");
+    assert(_pixels_equal(captured.document.frames[0].pixels, orig_doc.document.frames[0].pixels), "frame 0 untouched by capture");
+    assert(captured.document.frames[0].duration_ms == orig_doc.document.frames[0].duration_ms, "frame 0 duration untouched");
+    assert(captured.document.frames[1].duration_ms == orig_doc.document.frames[1].duration_ms, "frame 1 duration preserved");
+    assert(not _pixels_equal(captured.document.frames[1].pixels, orig_doc.document.frames[1].pixels), "frame 1 pixels updated to captured counter glyph");
+
+    // Import project.json restores authored frames + saved counter without auto-starting
+    page = _http_post(app, host, origin, page, "Import JSON", map{animation: project});
+    assert(not str_contains(page, "http-equiv=\"refresh\""), "imported project does not auto-run counter");
+    assert(_http_get(app, host, "/project.json") == project, "project.json roundtrip exact");
+    assert(_http_get(app, host, "/frames.json") == authored, "frames.json restored to authored");
+
+    // Invalid counter_seconds = 0 rejected atomically
+    page = _http_post(app, host, origin, page, "Save counter settings", map{
+        counter_start: "7",
+        counter_end: "9",
+        counter_seconds: "0"
+    });
+    assert(str_contains(page, "Counter: values 0–99"), "invalid counter_seconds=0 shows validation message");
+    assert(_http_get(app, host, "/project.json") == project, "invalid settings left project.json untouched");
+
+    // Finite counter 9..9 @ 1s completes cleanly after 1150 ms
+    page = _http_post(app, host, origin, page, "Start counter", map{
+        counter_start: "9",
+        counter_end: "9",
+        counter_seconds: "1"
+    });
+    assert(str_contains(page, "Counter 09"), "finite counter starts at Counter 09");
+    _advance_model_elapsed_ms(app, 1150);
+    page = _http_get(app, host, "/");
+    assert(str_contains(page, "Counter complete at 09") and not str_contains(page, "http-equiv=\"refresh\""), "finite counter completes at 09 and stops refreshing");
+
+    // Importing legacy frames.json clears generator back to nil
+    page = _http_post(app, host, origin, page, "Import JSON", map{animation: authored});
+    assert(json_parse(_http_get(app, host, "/project.json")).generator == nil, "legacy frames.json import clears generator");
+    assert(_http_get(app, host, "/frames.json") == authored, "legacy frames.json roundtrip exact");
+
+    app.close();
+    return map{
+        result: "pass",
+        passed: true,
+        live_server_samples: ["07", "08"],
+        stable_stop_token: true,
+        stop_freezes_source: true,
+        authored_frames_preserved: true,
+        project_roundtrip: true,
+        legacy_roundtrip: true,
+        explicit_capture_only_current_frame: true,
+        finite_end: true,
+        authored_sha256: sha256(authored)
+    };
+}
+
+fn main() {
+    assert(fs_exists(cwd() + "/tests/fixtures/uno_r4_led_studio_counter_web.sapp"), "counter web fixture exists");
+    let summary = _run_counter_http_suite();
+    print json_stringify(summary);
+    return 0;
+}
+
+main();

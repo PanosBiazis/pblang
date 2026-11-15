@@ -1,0 +1,433 @@
+// Pure PBLang Linux integration & strace fault-injection test for archive publication & extraction
+// (replaces tests/semantics/archive_publication_cli_test.py).
+
+let OS = import("stdlib:os.sapp");
+let ZIP = import("stdlib:zipfile.sapp");
+
+fn _resolve_runtime(cli) {
+    let rt = "./pblang";
+    if len(cli) > 0 and cli[0] != "" { rt = cli[0]; }
+    if str_starts_with(rt, "/") { return rt; }
+    if str_starts_with(rt, "./") { rt = str_slice(rt, 2, len(rt)); }
+    return OS.cwd() + "/" + rt;
+}
+
+fn _zip_bytes_with_payload(size) {
+    let payload = [];
+    let full = num_floor(size / 256);
+    let rem = size % 256;
+    let r = 0;
+    while r < full {
+        let b = 0;
+        while b < 256 {
+            array_push(payload, b);
+            b = b + 1;
+        }
+        r = r + 1;
+    }
+    let k = 0;
+    while k < rem {
+        array_push(payload, 120); // 'x'
+        k = k + 1;
+    }
+    return map{
+        zip: ZIP.create([
+            map{name: "folder/", data: []},
+            map{name: "folder/binary.bin", data: payload}
+        ], "store"),
+        member: payload
+    };
+}
+
+fn _stat_lstat(path) {
+    let r = proc_spawn_wait("/usr/bin/stat", ["-c", "%a %i", path]);
+    assert(r.exit_code == 0, "stat failed for " + path + ": " + r.stderr);
+    let parts = str_split(str_trim(r.stdout), " ");
+    return map{mode: parts[0], ino: parts[1]};
+}
+
+fn _redact_quoted(line) {
+    let out = "";
+    let i = 0;
+    let n = len(line);
+    while i < n {
+        let ch = line[i];
+        if ch == "\"" {
+            out = out + "\"<redacted>\"";
+            i = i + 1;
+            while i < n {
+                if line[i] == "\\" and i + 1 < n {
+                    i = i + 2;
+                } elif line[i] == "\"" {
+                    i = i + 1;
+                    break;
+                } else {
+                    i = i + 1;
+                }
+            }
+        } else {
+            out = out + ch;
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn _last_dot_suffix(name) {
+    let parts = str_split(name, ".");
+    return parts[len(parts) - 1];
+}
+
+fn _has_65536_write(line) {
+    return str_contains(line, "write(") and str_ends_with(line, ", 65536) = 65536");
+}
+
+fn _has_fsync_ok(line) {
+    if not str_contains(line, "fsync(") { return false; }
+    return str_ends_with(str_trim(line), "= 0");
+}
+
+fn _array_contains_str(arr, target) {
+    let i = 0;
+    while i < len(arr) {
+        if arr[i] == target { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _join(arr, sep) {
+    let out = "";
+    let i = 0;
+    while i < len(arr) {
+        if i > 0 { out = out + sep; }
+        out = out + arr[i];
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() {
+    let cli = OS.script_args();
+    let runtime = _resolve_runtime(cli);
+    let repo = OS.cwd();
+
+    let group = "all";
+    if len(cli) > 1 and cli[1] != "" { group = cli[1]; }
+    assert(group == "all" or group == "basic" or group == "faults" or group == "close", "invalid group: " + group);
+
+    let evidence = "";
+    if len(cli) > 2 and cli[2] != "" {
+        evidence = cli[2];
+        fs_mkdirs(evidence);
+    }
+
+    let op_arg = "";
+    if len(cli) > 3 { op_arg = cli[3]; }
+    let is_extract = op_arg == "extract" or op_arg == "empty";
+    let is_empty = op_arg == "empty";
+    let script = if is_extract { "archive_extract.sapp" } else { "archive_publish.sapp" };
+    let flag = if is_extract { "--extract" } else { "--publish" };
+
+    let mk = proc_spawn_wait("/usr/bin/mktemp", ["-d", "/tmp/archive-cli-XXXXXX"]);
+    assert(mk.exit_code == 0, "mktemp failed: " + mk.stderr);
+    let root = str_trim(mk.stdout);
+    let source = root + "/input.zip";
+    let built = _zip_bytes_with_payload(if is_empty { 0 } else { 12 });
+    let original = built.zip;
+    let expected_bytes = if is_extract { built.member } else { original };
+    fs_write_bytes(source, original);
+
+    let sentinel = root + "/unrelated";
+    fs_write(sentinel, "keep");
+
+    let checks = [];
+
+    let run_cmd = fn(label, dest, src_path, inject_list, want_success, want_trace, override_tail) {
+        let base_cmd = [runtime, "run", repo + "/tools/" + script, "--allow-all", "--"];
+        if override_tail != nil {
+            let ti = 0;
+            while ti < len(override_tail) { array_push(base_cmd, override_tail[ti]); ti = ti + 1; }
+        } else {
+            array_push(base_cmd, flag);
+            array_push(base_cmd, src_path);
+            if is_extract { array_push(base_cmd, "folder/binary.bin"); }
+            array_push(base_cmd, dest);
+        }
+
+        let log_base = label + ".trace";
+        let log_path = root + "/" + log_base;
+        let exec_bin = base_cmd[0];
+        let exec_args = slice(base_cmd, 1, len(base_cmd));
+
+        if len(inject_list) > 0 or want_trace {
+            exec_bin = "strace";
+            exec_args = ["-ff", "-qq", "-o", log_path, "-e", "trace=write,fsync,close,openat,memfd_create"];
+            let ii = 0;
+            while ii < len(inject_list) {
+                array_push(exec_args, "-e");
+                array_push(exec_args, "inject=" + inject_list[ii]);
+                ii = ii + 1;
+            }
+            let bi = 0;
+            while bi < len(base_cmd) {
+                array_push(exec_args, base_cmd[bi]);
+                bi = bi + 1;
+            }
+        }
+
+        let p = proc_spawn_wait(exec_bin, exec_args);
+
+        if len(inject_list) > 0 or want_trace {
+            let names = array_sort(fs_listdir(root));
+            let merged = [];
+            let ni = 0;
+            while ni < len(names) {
+                let nm = names[ni];
+                if str_starts_with(nm, log_base + ".") {
+                    let tid = _last_dot_suffix(nm);
+                    let part_lines = str_split(fs_read(root + "/" + nm), "\n");
+                    let li = 0;
+                    while li < len(part_lines) {
+                        if part_lines[li] != "" {
+                            array_push(merged, tid + " " + part_lines[li]);
+                        }
+                        li = li + 1;
+                    }
+                }
+                ni = ni + 1;
+            }
+            fs_write(log_path, _join(merged, "\n") + "\n");
+        }
+
+        let want_ec = if want_success { 0 } else { 1 };
+        if p.exit_code != want_ec {
+            proc_spawn_wait("/bin/rm", ["-rf", "--", root]);
+            error("label " + label + " unexpected exit_code=" + str(p.exit_code) + " stdout=" + p.stdout + " stderr=" + p.stderr);
+        }
+        let result = json_parse(p.stdout);
+        assert(result["ok"] == want_success, "result.ok mismatch on " + label);
+        assert(not str_contains(p.stdout, root) and not str_contains(p.stdout, "folder/binary.bin"), "stdout redaction on " + label);
+        array_push(checks, label);
+
+        if evidence != "" and fs_exists(log_path) {
+            let raw_lines = str_split(fs_read(log_path), "\n");
+            let red_lines = [];
+            let ri = 0;
+            while ri < len(raw_lines) {
+                let ln = raw_lines[ri];
+                if str_contains(ln, "write(") or str_contains(ln, "fsync(") or str_contains(ln, "close(") or str_contains(ln, "INJECTED") {
+                    array_push(red_lines, _redact_quoted(ln));
+                }
+                ri = ri + 1;
+            }
+            fs_write(evidence + "/" + log_base, _join(red_lines, "\n") + "\n");
+        }
+        return map{result: result, log: log_path};
+    };
+
+    if group == "all" or group == "basic" {
+        let dest = root + "/new.zip";
+        let s1 = run_cmd("success", dest, source, [], true, false, nil);
+        let r1 = s1.result;
+        assert(r1["publication_confirmed"] == true and r1["durability_verified"] == true and r1["wrapper_handles_closed"] == true, "success flags");
+        let st1 = _stat_lstat(dest);
+        assert(fs_read_bytes(dest) == expected_bytes and st1.mode == "600", "success bytes and 0600");
+        if not is_extract {
+            let zread = ZIP.read(fs_read_bytes(dest), "folder/binary.bin");
+            assert(len(zread) == 12 and bytes_to_str(zread) == "xxxxxxxxxxxx", "published zip verified");
+        }
+        run_cmd("collision", dest, source, [], false, false, nil);
+        let st1_after = _stat_lstat(dest);
+        assert(st1_after.ino == st1.ino and fs_read_bytes(dest) == expected_bytes, "collision preserved inode");
+
+        run_cmd("same_input", source, source, [], false, false, nil);
+
+        let kinds = ["symlink", "hardlink", "directory"];
+        let ki = 0;
+        while ki < len(kinds) {
+            let kind = kinds[ki];
+            let kpath = root + "/" + kind + ".zip";
+            if kind == "symlink" {
+                assert(proc_spawn_wait("/bin/ln", ["-s", "--", sentinel, kpath]).exit_code == 0, "ln -s");
+            } elif kind == "hardlink" {
+                assert(proc_spawn_wait("/bin/ln", ["--", sentinel, kpath]).exit_code == 0, "ln hard");
+            } else {
+                fs_mkdirs(kpath);
+            }
+            let before_k = _stat_lstat(kpath);
+            run_cmd(kind, kpath, source, [], false, false, nil);
+            let after_k = _stat_lstat(kpath);
+            assert(after_k.ino == before_k.ino and fs_read(sentinel) == "keep", kind + " preserved");
+            ki = ki + 1;
+        }
+
+        // Two concurrent writers racing on race.zip: exactly one wins (0) and one fails (1).
+        let race = root + "/race.zip";
+        let sh_args = [];
+        if is_extract {
+            sh_args = ["-c", "\"$1\" run \"$2\" --allow-all -- \"$3\" \"$4\" \"$5\" \"$6\" >/dev/null 2>&1 & p1=$!; \"$1\" run \"$2\" --allow-all -- \"$3\" \"$4\" \"$5\" \"$6\" >/dev/null 2>&1 & p2=$!; wait $p1; r1=$?; wait $p2; r2=$?; printf '%s %s' \"$r1\" \"$r2\"", "sh", runtime, repo + "/tools/" + script, flag, source, "folder/binary.bin", race];
+        } else {
+            sh_args = ["-c", "\"$1\" run \"$2\" --allow-all -- \"$3\" \"$4\" \"$5\" >/dev/null 2>&1 & p1=$!; \"$1\" run \"$2\" --allow-all -- \"$3\" \"$4\" \"$5\" >/dev/null 2>&1 & p2=$!; wait $p1; r1=$?; wait $p2; r2=$?; printf '%s %s' \"$r1\" \"$r2\"", "sh", runtime, repo + "/tools/" + script, flag, source, race];
+        }
+        let race_res = proc_spawn_wait("/bin/sh", sh_args);
+        let rcodes = str_trim(race_res.stdout);
+        assert(rcodes == "0 1" or rcodes == "1 0", "two_writer_no_replace expected 0/1, got: " + rcodes);
+        assert(fs_read_bytes(race) == expected_bytes, "race winner wrote exact expected bytes");
+        array_push(checks, "two_writer_no_replace");
+
+        let linked = root + "/linked-parent";
+        assert(proc_spawn_wait("/bin/ln", ["-s", "--", root, linked]).exit_code == 0, "ln linked-parent");
+        let ps = run_cmd("parent_symlink", linked + "/escaped.zip", source, [], false, false, nil);
+        assert(ps.result["publication_attempted"] == false and not fs_exists(root + "/escaped.zip"), "parent_symlink rejected");
+
+        run_cmd("missing_parent", root + "/missing/out.zip", source, [], false, false, nil);
+
+        let linkinput = root + "/input-link.zip";
+        assert(proc_spawn_wait("/bin/ln", ["-s", "--", source, linkinput]).exit_code == 0, "ln input-link");
+        run_cmd("input_symlink", root + "/not-made.zip", linkinput, [], false, false, nil);
+
+        run_cmd("explicit_opt_in", root + "/not-made.zip", source, [], false, false, [source, dest]);
+
+        let bad_cases = ["malformed", "truncated", "oversize"];
+        let bci = 0;
+        while bci < len(bad_cases) {
+            let blabel = bad_cases[bci];
+            let bad_in = root + "/" + blabel + ".input";
+            if blabel == "malformed" {
+                fs_write(bad_in, "not zip");
+            } elif blabel == "truncated" {
+                fs_write_bytes(bad_in, slice(original, 0, len(original) - 1));
+            } else {
+                fs_write(bad_in, str_repeat("x", 4194305));
+            }
+            let bout = root + "/" + blabel + ".zip";
+            let bres = run_cmd(blabel, bout, bad_in, [], false, true, nil);
+            assert(bres.result["publication_attempted"] == false and not fs_exists(bout), blabel + " no publication");
+            let btrace = fs_read(bres.log);
+            assert(not str_contains(btrace, "\"archive-publication\"") and not str_contains(btrace, "O_TMPFILE"), blabel + " no staging fd");
+            bci = bci + 1;
+        }
+    }
+
+    if group == "all" or group == "faults" {
+        let fsync_cases = [
+            map{label: "before_fsync", idx: 1, exists: false},
+            map{label: "after_fsync", idx: 2, exists: true}
+        ];
+        let fci = 0;
+        while fci < len(fsync_cases) {
+            let fc = fsync_cases[fci];
+            let fout = root + "/" + fc.label + ".zip";
+            let fres = run_cmd(fc.label, fout, source, ["fsync:error=EIO:when=" + str(fc.idx)], false, false, nil);
+            let ftrace = fs_read(fres.log);
+            assert(str_contains(ftrace, "INJECTED") and fs_exists(fout) == fc.exists, fc.label + " injected/exists");
+            assert(fres.result["output_may_exist"] == true and fres.result["partial_output_possible"] == false, fc.label + " uncertainty");
+            if fc.exists {
+                assert(fs_read_bytes(fout) == expected_bytes and fres.result["written"] == true and fres.result["publication_confirmed"] == true, "after_fsync written");
+                assert(fres.result["durability_verified"] == false, "after_fsync durability false");
+            } else {
+                assert(not map_has(fres.result, "written"), "before_fsync no written key");
+            }
+            fci = fci + 1;
+        }
+
+        let large_in = root + "/large.input";
+        let large_built = _zip_bytes_with_payload(70000);
+        fs_write_bytes(large_in, large_built.zip);
+        let lres = run_cmd("large_trace", root + "/large.zip", large_in, [], true, true, nil);
+        let llines = str_split(fs_read(lres.log), "\n");
+        let last_chunk = "";
+        let li = 0;
+        while li < len(llines) {
+            if _has_65536_write(llines[li]) { last_chunk = llines[li]; }
+            li = li + 1;
+        }
+        assert(last_chunk != "", "expected 65536 write in large_trace");
+        let tid = str_split(last_chunk, " ")[0];
+        let writes = [];
+        let chunk_index = 0;
+        li = 0;
+        while li < len(llines) {
+            let ln = llines[li];
+            if str_starts_with(ln, tid + " ") and str_contains(ln, "write(") {
+                array_push(writes, ln);
+                if ln == last_chunk { chunk_index = len(writes); }
+            }
+            li = li + 1;
+        }
+        let ordinal = chunk_index + 1;
+        let partial = root + "/partial.zip";
+        let pres = run_cmd("partial_write", partial, large_in, ["write:error=ENOSPC:when=" + str(ordinal)], false, false, nil);
+        let ptrace = fs_read(pres.log);
+        assert(str_contains(ptrace, "INJECTED") and str_contains(ptrace, ", 65536) = 65536"), "partial_write injected after 65536");
+        assert(not fs_exists(partial) and pres.result["partial_output_possible"] == false and not map_has(pres.result, "written"), "partial_write atomic");
+    }
+
+    if group == "all" or group == "close" {
+        let cres = run_cmd("close_control", root + "/close-control.zip", source, [], true, true, nil);
+        let clines = str_split(fs_read(cres.log), "\n");
+        let synced_indices = [];
+        let ci = 0;
+        while ci < len(clines) {
+            if _has_fsync_ok(clines[ci]) { array_push(synced_indices, ci); }
+            ci = ci + 1;
+        }
+        assert(len(synced_indices) == 2, "expected 2 fsync=0 calls");
+        let second_idx = synced_indices[1];
+        let tid2 = str_split(clines[second_idx], " ")[0];
+        let next_close = -1;
+        ci = second_idx + 1;
+        while ci < len(clines) {
+            if str_starts_with(clines[ci], tid2 + " ") and str_contains(clines[ci], "close(") {
+                next_close = ci;
+                break;
+            }
+            ci = ci + 1;
+        }
+        assert(next_close >= 0, "expected close after second fsync");
+        let close_ord = 0;
+        ci = 0;
+        while ci <= next_close {
+            if str_starts_with(clines[ci], tid2 + " ") and str_contains(clines[ci], "close(") {
+                close_ord = close_ord + 1;
+            }
+            ci = ci + 1;
+        }
+
+        let close_cases = [
+            map{label: "internal_close", inj: ["close:error=EIO:when=" + str(close_ord)]},
+            map{label: "fsync_internal_close", inj: ["fsync:error=EIO:when=2", "close:error=EIO:when=" + str(close_ord)]}
+        ];
+        let cci = 0;
+        while cci < len(close_cases) {
+            let cc = close_cases[cci];
+            let cout = root + "/" + cc.label + ".zip";
+            let r_cc = run_cmd(cc.label, cout, source, cc.inj, false, false, nil);
+            assert(fs_read_bytes(cout) == expected_bytes and r_cc.result["publication_confirmed"] == false, cc.label + " bytes vs unconfirmed");
+            assert(r_cc.result["output_may_exist"] == true and not map_has(r_cc.result, "written") and r_cc.result["wrapper_handles_closed"] == true, cc.label + " handles closed");
+            assert(str_contains(fs_read(r_cc.log), "INJECTED"), cc.label + " injected");
+            cci = cci + 1;
+        }
+    }
+
+    assert(fs_read_bytes(source) == original and fs_read(sentinel) == "keep", "source and sentinel intact");
+    let root_entries = fs_listdir(root);
+    let rei = 0;
+    while rei < len(root_entries) {
+        assert(not str_starts_with(root_entries[rei], ".pblang-stage-"), "no lingering stage file");
+        rei = rei + 1;
+    }
+
+    proc_spawn_wait("/bin/rm", ["-rf", "--", root]);
+    let op_name = if is_empty { "empty" } else { if is_extract { "extract" } else { "publish" } };
+    let pw_bytes = if _array_contains_str(checks, "partial_write") { 65536 } else { nil };
+    print(json_stringify(map{
+        passed: checks,
+        count: len(checks),
+        operation: op_name,
+        partial_write_after_bytes: pw_bytes
+    }));
+}
+
+main();

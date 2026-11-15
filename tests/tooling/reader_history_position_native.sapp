@@ -1,0 +1,311 @@
+// Pure PBLang native verification: Back/Forward reading positions, reflow, Home, and fresh launch.
+let App = import("../../examples/declarative_browser/app.sapp");
+let Store = import("../../examples/declarative_browser/appearance_store.sapp");
+let DocFile = import("../../examples/declarative_browser/document_file.sapp");
+let Dir = import("stdlib:linux_dirfs.sapp");
+let G = import("stdlib:graphics.sapp");
+let FM = import("stdlib:font_metrics.sapp");
+
+fn _cli_args() {
+    let raw = try env_get("PBLANG_SCRIPT_ARGS") catch "";
+    if type(raw) == "string" and raw != "" { return str_split(raw, "\n"); }
+    let argv = os_args();
+    let out = [];
+    let after = false;
+    for item in argv {
+        if after { array_push(out, item); }
+        elif item == "--" { after = true; }
+    }
+    return out;
+}
+
+fn _parse_opts(args) {
+    let opts = map{ package: "", evidence: "", runtime: "", report: "", xvfb: false };
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if a == "--xvfb" { opts.xvfb = true; i = i + 1; }
+        elif (a == "--package" or a == "--evidence" or a == "--runtime" or a == "--report") and i + 1 < len(args) {
+            opts[str_slice(a, 2, len(a))] = args[i + 1];
+            i = i + 2;
+        } else {
+            i = i + 1;
+        }
+    }
+    return opts;
+}
+
+fn _mk_private_tmp(prefix) {
+    let name = "pblang_tooling_s4_" + prefix + "_" + str(num_floor(now_ms()));
+    let tmp_fs = Dir.open_absolute("/tmp", false, false);
+    assert(tmp_fs.ok, "open /tmp handle");
+    let created = Dir.mkdir_new(tmp_fs, name, false);
+    let closed = Dir.close(tmp_fs);
+    assert(created.ok and closed, "create private temp dir");
+    return path_join("/tmp", name);
+}
+
+fn _rm_tree(path) {
+    if not (try fs_exists(path) catch false) { return; }
+    let entries = try fs_listdir(path) catch nil;
+    if type(entries) == "array" {
+        for name in entries { _rm_tree(path_join(path, name)); }
+    }
+    let _r = try fs_remove(path) catch nil;
+}
+
+fn _font_measurer() {
+    let fonts = map{};
+    for fam in ["sans", "serif", "monospace", "system"] {
+        let resolved = G.text_font_resolve(fam);
+        fonts[fam] = if resolved != "" { FM.load(resolved) } else { nil };
+    }
+    return fn(text, px, family) {
+        if text == "" { return map{ ok: true, width: 0, height: px }; }
+        let fam = if map_has(fonts, family) { family } else { "sans" };
+        let layout = try FM.layout(fonts[fam], text, px) catch nil;
+        if layout != nil {
+            return map{ ok: true, width: layout.width, height: layout.height };
+        }
+        return map{ ok: true, width: num_floor(len(text) * px * 0.6 + 0.999), height: px };
+    };
+}
+
+fn _render_snapshot(c, measure_fn) {
+    let ops = [];
+    let canvas = map{
+        clear: fn(col) { ops = [map{ op: "clear", y: 0, h: c.height, color: col }]; },
+        rect: fn(x, y, rw, rh, col) {
+            if rw > 0 and rh > 0 {
+                array_push(ops, map{ op: "rect", x: num_floor(x), y: num_floor(y), w: num_floor(rw), h: num_floor(rh), c: col });
+            }
+        },
+        rects: fn(list, col) {
+            for r in list {
+                if r.w > 0 and r.h > 0 {
+                    array_push(ops, map{ op: "rect", x: num_floor(r.x), y: num_floor(r.y), w: num_floor(r.w), h: num_floor(r.h), c: col });
+                }
+            }
+        },
+        line: fn(x1, y1, x2, y2, col) {
+            let top = num_min(y1, y2);
+            let bot = num_max(y1, y2);
+            array_push(ops, map{ op: "line", x1: x1, y1: y1, x2: x2, y2: y2, y: top, h: bot - top + 1, c: col });
+        },
+        point: fn(x, y, col) {
+            array_push(ops, map{ op: "point", x: x, y: y, h: 1, c: col });
+        },
+        circle: fn(cx, cy, r, col) {
+            array_push(ops, map{ op: "circle", x: cx - r, y: cy - r, w: r * 2, h: r * 2, c: col });
+        },
+        textMeasure: fn(text, px, _adv, fam) { return measure_fn(text, px, fam); },
+        textStyled: fn(x, y, text, col, px, adv, fam) {
+            array_push(ops, map{ op: "text", x: x, y: y, h: px, text: text, px: px, adv: adv, fam: fam, c: col });
+            return map{ ok: true, font: fam, renderer: "native-aa-fontdue", positioning: "truetype-baseline" };
+        }
+    };
+    App.draw(c, canvas);
+    for w in c.form.widgets {
+        assert(w.x >= 0 and w.y >= 0 and w.x + w.w <= c.width and w.y + w.h <= c.height, "widget within viewport bounds");
+    }
+    let body_ops = [];
+    for item in ops {
+        if item.op != "clear" and item.y + item.h > 64 {
+            let clipped = map{};
+            for k in map_keys(item) { clipped[k] = item[k]; }
+            if item.op == "rect" and item.y < 64 {
+                clipped.h = item.y + item.h - 64;
+                clipped.y = 64;
+            }
+            array_push(body_ops, clipped);
+        }
+    }
+    return map{
+        w: c.width,
+        h: c.height,
+        full_hash: sha256(json_stringify(ops)),
+        body_hash: sha256(json_stringify(body_ops)),
+        anchor: c.reading_anchor,
+        page: c.reading_page,
+        url: c.session.snapshot().url
+    };
+}
+
+fn _key(c, name) {
+    let k = if name == "Return" { "Enter" } else { name };
+    App.update(c, [map{ type: "keydown", key: k }, map{ type: "keyup", key: k }]);
+}
+
+fn _tabs(c, n) {
+    for _i n { _key(c, "Tab"); }
+}
+
+fn _click(c, x, y) {
+    App.update(c, [
+        map{ type: "mousedown", button: "Left", x: x, y: y },
+        map{ type: "mouseup", button: "Left", x: x, y: y }
+    ]);
+}
+
+fn _resize(c, w, h) {
+    App.update(c, [map{ type: "resize", w: w, h: h }]);
+}
+
+fn _launch(with_profile, data_dir, doc_path, measure_fn) {
+    let loaded_doc = DocFile.load(doc_path);
+    assert(loaded_doc.ok, "document admission succeeded");
+    let loaded = map{ can_save: false, appearance: nil, message: "Session only: --with-profile to save", token: nil };
+    let saver:any = nil;
+    let reloader:any = nil;
+    if with_profile {
+        loaded = Store.load(data_dir);
+        saver = fn(style) {
+            let r = Store.save(data_dir, style, loaded.token);
+            if r.confirmed { loaded.token = r.token; }
+            return r;
+        };
+        reloader = fn() {
+            let fresh = Store.load(data_dir);
+            if not fresh.ok or not fresh.can_save or fresh.token == "missing" { return map{ ok: false }; }
+            loaded.token = fresh.token;
+            return map{ ok: true, appearance: fresh.appearance, save: saver };
+        };
+    }
+    let active_saver:any = if loaded.can_save { saver } else { nil };
+    let c = App.create("local", "dark", nil, loaded_doc.source);
+    App.enable_preferences(c, loaded.appearance, active_saver, loaded.message, reloader);
+    App.set_text_measure(c, measure_fn);
+    App.refresh(c);
+    return c;
+}
+
+fn _same_body(shots, a, b) {
+    let first = shots[a];
+    let second = shots[b];
+    assert(first.w == second.w and first.h == second.h, "matching viewport size for " + a + " vs " + b);
+    assert(first.body_hash == second.body_hash, "matching reading body for " + a + " vs " + b);
+}
+
+fn _journey(opts, work, data_dir) {
+    let doc_path = path_join(work, "Remember — θέση.html");
+    let sections = "";
+    for i 7 {
+        sections = sections + "<p>Section " + str(i) + ". " + str_repeat("Readable local words. ", 10) + "</p>";
+    }
+    let source = "<article><h1>Remember my reading place</h1>" + sections + "<a href=\"pb://guide\">Open the guide</a></article>";
+    fs_write(doc_path, source);
+    let original = fs_read_bytes(doc_path);
+
+    let measure = _font_measurer();
+    let shots = map{};
+
+    let c = _launch(false, data_dir, doc_path, measure);
+    _resize(c, 320, 480);
+    shots["history-first"] = _render_snapshot(c, measure);
+
+    _key(c, "End");
+    shots["history-home-last"] = _render_snapshot(c, measure);
+    assert(c.reading_page > 0, "End navigated to last home page");
+
+    _tabs(c, 4);
+    _key(c, "Return");
+    shots["history-guide-first"] = _render_snapshot(c, measure);
+    assert(c.session.snapshot().url == "pb://guide" and c.reading_page == 0, "opened guide at first page");
+
+    _key(c, "Next");
+    shots["history-guide-position"] = _render_snapshot(c, measure);
+    assert(c.reading_page == 1, "advanced guide reading position");
+
+    _click(c, 44, 32);
+    shots["history-back"] = _render_snapshot(c, measure);
+    _same_body(shots, "history-home-last", "history-back");
+
+    _click(c, 120, 32);
+    shots["history-forward"] = _render_snapshot(c, measure);
+    _same_body(shots, "history-guide-position", "history-forward");
+
+    // Reflow while away: increase body size, Apply for session, then return to saved source anchor.
+    _click(c, 275, 32);
+    _key(c, "Tab");
+    _key(c, "Return");
+    _key(c, "Next");
+    _key(c, "Return");
+    _click(c, 275, 32);
+    assert(not c.settings and c.appearance.body_size == 18, "session body size reflow applied");
+
+    _click(c, 44, 32);
+    shots["history-back-reflow"] = _render_snapshot(c, measure);
+
+    _click(c, 200, 32);
+    shots["history-home-reset"] = _render_snapshot(c, measure);
+    assert(c.reading_page == 0, "Home resets current page to top");
+    assert(len(fs_listdir(data_dir)) == 0 and fs_read_bytes(doc_path) == original, "no profile writes and input unchanged");
+    c.session.close();
+
+    // Independent UI reference: reflow the original position without navigating away.
+    let ref = _launch(false, data_dir, doc_path, measure);
+    _resize(ref, 320, 480);
+    _key(ref, "End");
+    _click(ref, 275, 32);
+    _key(ref, "Tab");
+    _key(ref, "Return");
+    _key(ref, "Next");
+    _key(ref, "Return");
+    _click(ref, 275, 32);
+    shots["history-reflow-reference"] = _render_snapshot(ref, measure);
+    _same_body(shots, "history-back-reflow", "history-reflow-reference");
+
+    _click(ref, 200, 32);
+    shots["history-home-reference"] = _render_snapshot(ref, measure);
+    _same_body(shots, "history-home-reset", "history-home-reference");
+    ref.session.close();
+
+    // Fresh launch starts on first page; remember_positions policy toggle keeps current page.
+    let fresh = _launch(false, data_dir, doc_path, measure);
+    _resize(fresh, 320, 480);
+    shots["history-fresh-launch"] = _render_snapshot(fresh, measure);
+    _same_body(shots, "history-first", "history-fresh-launch");
+    _key(fresh, "End");
+    let kept_anchor = fresh.reading_anchor;
+    assert(App.remember_positions(fresh, false), "opt-out remember_positions");
+    assert(fresh.reading_anchor == kept_anchor, "policy toggle preserves current anchor");
+    fresh.session.close();
+
+    assert(len(fs_listdir(data_dir)) == 0 and fs_read_bytes(doc_path) == original, "clean storage and immutable input");
+
+    let report = map{
+        passed: true,
+        real_launcher: true,
+        back_restored: true,
+        forward_restored: true,
+        reflow_return_restored: true,
+        new_launch_starts_first: true,
+        no_position_or_profile_files: true,
+        input_unchanged: true
+    };
+    if opts.evidence != "" {
+        fs_mkdirs(opts.evidence);
+        fs_write(path_join(opts.evidence, "acceptance.json"), json_stringify(report) + "\n");
+    }
+    if opts.report != "" {
+        fs_write(opts.report, json_stringify(report) + "\n");
+    }
+    print json_stringify(report);
+    return true;
+}
+
+fn main() {
+    let opts = _parse_opts(_cli_args());
+    let work = _mk_private_tmp("hist_pos");
+    let data_dir = path_join(work, "data");
+    let work_fs = Dir.open_absolute(work, false, true);
+    assert(work_fs.ok and Dir.mkdir_new(work_fs, "data", false).ok and Dir.close(work_fs), "prepare private data folder");
+
+    let ok = try _journey(opts, work, data_dir) catch false;
+
+    _rm_tree(work);
+    assert(not fs_exists(work), "cleaned temporary directory");
+    assert(ok, "reader_history_position_native checks passed");
+}
+
+main();

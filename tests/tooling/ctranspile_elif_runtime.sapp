@@ -1,0 +1,163 @@
+// Execute functions-only C lowering (stdlib/compiler/ctranspile.sapp) against
+// the PBLang VM reference for elif chains, nested elifs, and loop continue/break.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let OS = import("stdlib:os.sapp");
+let CTRANSPILE = import("stdlib:compiler/ctranspile.sapp");
+
+let SOURCE = "\n"
+    + "fn choose(x) {\n"
+    + "    if x == 0 { return 10; }\n"
+    + "    elif x == 1 { return 21; }\n"
+    + "    elif x == 2 { return 32; }\n"
+    + "    else { return 43; }\n"
+    + "}\n"
+    + "fn nested(x) {\n"
+    + "    if x == 0 { return 5; }\n"
+    + "    elif x > 0 {\n"
+    + "        if x == 1 { return 6; }\n"
+    + "        elif x == 2 { return 7; }\n"
+    + "        else { return 8; }\n"
+    + "    }\n"
+    + "    return 9;\n"
+    + "}\n"
+    + "fn count() {\n"
+    + "    let i = 0; let total = 0;\n"
+    + "    while i < 8 {\n"
+    + "        i = i + 1;\n"
+    + "        if i == 1 { total = total + 10; }\n"
+    + "        elif i == 2 { continue; }\n"
+    + "        elif i == 4 { break; }\n"
+    + "        else { total = total + i; }\n"
+    + "    }\n"
+    + "    return total;\n"
+    + "}\n";
+
+let CALLS = [
+    "choose(0)", "choose(1)", "choose(2)", "choose(3)",
+    "nested(0)", "nested(1)", "nested(2)", "nested(3)", "nested(-1)",
+    "count()"
+];
+
+let EXPECTED = "10\n21\n32\n43\n5\n6\n7\n8\n9\n13\n";
+
+fn _rm_tree(path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            _rm_tree(path + "/" + entries[i]);
+            i = i + 1;
+        }
+    }
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _checked_spawn(bin, args) {
+    let r = proc_spawn_wait(bin, args);
+    if r.exit_code != 0 {
+        throw "ctranspile_elif_runtime subprocess failed (" + str(r.exit_code) + "): " + r.stderr;
+    }
+    return r.stdout;
+}
+
+fn main() {
+    let raw_args = os_args();
+    let pb_arg = "";
+    let cc_arg = "cc";
+    let report_arg = "";
+    let i = 0;
+    while i < len(raw_args) {
+        let a = raw_args[i];
+        if a == "--pblang" and i + 1 < len(raw_args) {
+            pb_arg = raw_args[i + 1];
+            i = i + 1;
+        } elif a == "--cc" and i + 1 < len(raw_args) {
+            cc_arg = raw_args[i + 1];
+            i = i + 1;
+        } elif a == "--report" and i + 1 < len(raw_args) {
+            report_arg = raw_args[i + 1];
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+
+    let repo_root = cwd();
+    let pb_bin = if pb_arg != "" { pb_arg } else { repo_root + "/pblang" };
+    assert(fs_exists(pb_bin), "ctranspile_elif_runtime: pblang binary missing");
+    let cc_bin = if str_contains(cc_arg, "/") { cc_arg } else { OS.which(cc_arg) };
+    assert(cc_bin != nil and cc_bin != "" and fs_exists(cc_bin), "C compiler required; native checks cannot be skipped");
+
+    let scratch = "/tmp/pblang_tooling_s1_ctranspile_elif_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(scratch).ok, "create private scratch");
+
+    let deny_flags = ["--deny-net", "--deny-http", "--deny-exec", "--deny-spawn", "--deny-gfx", "--deny-sqlite"];
+    let run_check = fn() {
+        let print_lines = "";
+        let ci = 0;
+        while ci < len(CALLS) {
+            print_lines = print_lines + "print " + CALLS[ci] + ";\n";
+            ci = ci + 1;
+        }
+        let vm_path = scratch + "/fixture.sapp";
+        fs_write(vm_path, SOURCE + print_lines);
+
+        let vm_args = ["run"];
+        let di = 0;
+        while di < len(deny_flags) { array_push(vm_args, deny_flags[di]); di = di + 1; }
+        array_push(vm_args, vm_path);
+        let reference = _checked_spawn(pb_bin, vm_args);
+        assert(reference == EXPECTED, "PBLang reference differs from the fixture contract");
+
+        // Verify both in-process transpile and isolated child-process lowering.
+        let inproc_c = CTRANSPILE.transpile(SOURCE);
+        let c_path = scratch + "/fixture.c";
+        let lower_path = scratch + "/lower.sapp";
+        let ct_mod = repo_root + "/stdlib/compiler/ctranspile.sapp";
+        let lower_src = "let C = import(" + json_stringify(ct_mod) + ");\n"
+            + "fs_write(" + json_stringify(c_path) + ", C.transpile(" + json_stringify(SOURCE) + "));\n";
+        fs_write(lower_path, lower_src);
+
+        let lw_args = ["run"];
+        let dj = 0;
+        while dj < len(deny_flags) { array_push(lw_args, deny_flags[dj]); dj = dj + 1; }
+        array_push(lw_args, lower_path);
+        let _lw_out = _checked_spawn(pb_bin, lw_args);
+        assert(fs_read(c_path) == inproc_c, "child lowering matches direct CTRANSPILE.transpile");
+
+        let main_c = "\n#include <stdio.h>\nint main(void) {\n";
+        let ck = 0;
+        while ck < len(CALLS) {
+            main_c = main_c + "printf(\"%.17g\\n\", " + CALLS[ck] + ");\n";
+            ck = ck + 1;
+        }
+        main_c = main_c + "return 0;\n}\n";
+        fs_write(c_path, inproc_c + main_c);
+
+        let opts = ["-O0", "-O2"];
+        let oi = 0;
+        while oi < len(opts) {
+            let opt = opts[oi];
+            let native_bin = scratch + "/native" + opt;
+            let _cc_out = _checked_spawn(cc_bin, ["-std=c99", opt, "-Werror=return-type", c_path, "-o", native_bin]);
+            let native_out = _checked_spawn(native_bin, []);
+            assert(native_out == reference, "functions-only C output differs from PBLang: " + opt);
+            oi = oi + 1;
+        }
+        return true;
+    };
+
+    let ok = try run_check() catch false;
+    _rm_tree(scratch);
+    assert(not fs_exists(scratch), "ctranspile_elif_runtime temporary directory removed");
+    assert(ok, "ctranspile_elif_runtime failed");
+
+    if report_arg != "" {
+        let pdir = path_dirname(report_arg);
+        if pdir != "" and pdir != "." { fs_mkdirs(pdir); }
+        fs_write(report_arg, json_stringify(map{ passed: true, values: 10, opt_levels: ["-O0", "-O2"] }) + "\n");
+    }
+    print "ctranspile_elif_runtime_pass: 10 values x 2 C optimization levels; temporary outputs removed";
+}
+
+main();

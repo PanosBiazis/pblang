@@ -216,14 +216,6 @@ static bool zr_pbck_read_value(ZrPbckReader *r, PbVM *vm, PbValue *out, uint32_t
             *out = val_obj(fn);
             return true;
         }
-        case 8: {
-            if (!zr_pr_need(r, 8)) return false;
-            uint64_t bits = 0;
-            for (int i = 0; i < 8; i++) bits |= ((uint64_t)r->buf[r->pos + i]) << (i * 8);
-            r->pos += 8;
-            *out = val_i64((int64_t)bits);
-            return true;
-        }
         default:
             snprintf(r->err, sizeof(r->err), "pbck: unsupported constant value tag %u", (unsigned)tag);
             return false;
@@ -666,10 +658,6 @@ static void zr_pbck_write_value_ex(ZrBuf *w, PbValue v, const ZrPbckWriteOpts *o
         case VAL_NUM:
             zr_pw_u8(w, 0);
             zr_pw_f64(w, v.as.num);
-            return;
-        case VAL_I64:
-            zr_pw_u8(w, 8);
-            zr_pw_u64(w, (uint64_t)v.as.i64);
             return;
         case VAL_BOOL:
             zr_pw_u8(w, 1);

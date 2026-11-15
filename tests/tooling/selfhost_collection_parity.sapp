@@ -1,0 +1,243 @@
+// Pure PBLang parity verifier comparing host runtime collection/map/exact-number
+// behavior and diagnostics against all six self-hosted VM execution routes
+// (plain, optimized, pbcs x unbounded, bounded).
+
+let F = import("stdlib:compiler/selfhost_frontend.sapp");
+let V = import("stdlib:compiler/vm.sapp");
+let O = import("stdlib:compiler/optimizer.sapp");
+let P = import("stdlib:selfhost_pbck.sapp");
+
+fn _rm_rf(target) {
+    if not fs_exists(target) { return; }
+    let entries = try fs_listdir(target) catch nil;
+    if entries != nil {
+        for name in entries {
+            _rm_rf(target + "/" + name);
+        }
+    }
+    let _ok = try fs_remove(target) catch false;
+}
+
+fn _parse_cli() {
+    let args = os_args();
+    let runtime = cwd() + "/pblang";
+    let repo = cwd();
+    let report = "";
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if a == "--runtime" and i + 1 < len(args) {
+            runtime = args[i + 1];
+            i = i + 1;
+        } elif a == "--repo" and i + 1 < len(args) {
+            repo = args[i + 1];
+            i = i + 1;
+        } elif a == "--report" and i + 1 < len(args) {
+            report = args[i + 1];
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return map{ runtime: runtime, repo: repo, report: report };
+}
+
+fn _extract_host_error(stderr) {
+    let s = str_trim(stderr);
+    if str_starts_with(s, "Runtime error: ") {
+        s = str_slice(s, 15, len(s));
+        let idx = str_index_of(s, " (at ");
+        if idx >= 0 {
+            s = str_slice(s, 0, idx);
+        }
+        return s;
+    }
+    let lines = str_split(s, "\n");
+    for line in lines {
+        let idx = str_index_of(line, "]: ");
+        if str_starts_with(line, "error[") and idx >= 0 {
+            return str_slice(line, idx + 3, len(line));
+        }
+    }
+    return s;
+}
+
+fn _run_host(runtime, script_path) {
+    let res = proc_spawn_wait(runtime, ["run", script_path, "--allow-all"]);
+    return map{
+        exit: res.exit_code,
+        stdout: res.stdout,
+        error: if res.exit_code == 0 { nil } else { _extract_host_error(res.stderr) }
+    };
+}
+
+fn _format_vm_output(items) {
+    if len(items) == 0 { return ""; }
+    let lines = [];
+    for item in items {
+        push(lines, str(item));
+    }
+    return str_join(lines, "\n") + "\n";
+}
+
+fn _run_vm_core(code, ctx, bounded) {
+    let res = if bounded {
+        V.run_seeded_bounded(code, map{}, nil, ctx)
+    } else {
+        V.run_seeded(code, map{}, ctx)
+    };
+    V.close_execution(ctx);
+    return _format_vm_output(res.output);
+}
+
+fn _run_vm_route(source, mode, bounded) {
+    let compiled = F.frontend_compile(source);
+    assert(compiled.ok, "fixture compile failed: " + source);
+    let code = compiled.chunk;
+    if mode == "optimized" {
+        code = O.optimize_safe(code).chunk;
+    } elif mode == "pbcs" {
+        code = P.deserialize_chunk(P.serialize_chunk(code));
+    }
+    let ctx = V.execution_context(true);
+    let alloc_chunk = F.frontend_compile("memory_alloc(7);").chunk;
+    let _seed = V.run_seeded(alloc_chunk, map{}, ctx);
+
+    let ok = true;
+    let out_str = "";
+    let err_str = "";
+    try {
+        out_str = _run_vm_core(code, ctx, bounded);
+    } catch e {
+        ok = false;
+        err_str = str(e);
+    }
+    return map{
+        exit: if ok { 0 } else { 1 },
+        stdout: out_str,
+        error: if ok { nil } else { err_str }
+    };
+}
+
+fn _build_cases() {
+    let cases = [
+        ["len", "fn invoke(f){return f(nil);}invoke(len);", false],
+        ["array_pop", "fn invoke(f){return f(7);}invoke(array_pop);", false],
+        ["pop", "fn invoke(f){return f(false);}invoke(pop);", false],
+        ["array_sort", "fn invoke(f){return f(\"abc\");}invoke(array_sort);", false],
+        ["map_keys", "fn invoke(f){return f([]);}invoke(map_keys);", false],
+        ["array_push", "fn invoke(f){return f(nil,9);}invoke(array_push);", false],
+        ["push", "fn invoke(f){return f(map{k:7},9);}invoke(push);", false],
+        ["has_member", "fn invoke(f){return f(nil,9);}invoke(has_member);", false],
+        ["map_has non-map", "fn invoke(f){print f([],\"k\");}invoke(map_has);", true],
+        ["map_remove non-string key", "fn invoke(f){print f(map{k:7},9);}invoke(map_remove);", true],
+        ["boxed map key bigint", "fn invoke(f,k){print f(map{k:7},k);}invoke(map_remove,bigint(\"42\"));", true],
+        ["boxed map key rational", "fn invoke(f,k){print f(map{k:7},k);}invoke(map_remove,rational(3,2));", true],
+        ["boxed map key decimal", "fn invoke(f,k){print f(map{k:7},k);}invoke(map_remove,decimal(\"1.25\"));", true],
+        ["generic operator push", "let receiver=map{__add__:push,k:7};receiver+9;", false],
+        ["invalid iterator", "fn values(){return nil;}for x in values(){print x;}", false],
+        ["non-map index write", "let m=7;m[\"k\"]=9;", false],
+        ["boxed map index write", "let m=map{k:7};m[bigint(\"42\")]=9;print m[\"42\"];", true],
+        [
+            "valid collections",
+            "let a=[];print array_pop(a);let b=[];print push(b,false);let c=[false];print pop(c);let m=map{k:nil};print map_has(m,\"k\");print map_remove(m,\"k\");print map_remove(m,\"missing\");print has_member(7,\"k\");print map_keys(m);print len(\"αβ\");print array_sort([3,1,2]);",
+            true
+        ],
+        [
+            "valid exact numbers",
+            "fn id(x){return x;}let a=bigint(\"42\");let b=rational(3,2);let c=decimal(\"1.25\");print id(a+bigint(\"1\"));print id(b);print id(c);let arr=[a,b,c];print arr;",
+            true
+        ],
+        [
+            "caught errors",
+            "fn invoke(f){return f(nil);}print (try invoke(array_pop) catch 17);print (try invoke(map_keys) catch false);",
+            true
+        ],
+        [
+            "shadowed builtins",
+            "fn len(a){return 77;}fn array_pop(a){return false;}print len(nil);print array_pop(nil);",
+            true
+        ]
+    ];
+    return cases;
+}
+
+fn _execute_suite(cli, scratch, rows) {
+    let cases = _build_cases();
+    let native_file = scratch + "/native.sapp";
+    let modes = ["plain", "optimized", "pbcs"];
+    let bounds = [false, true];
+
+    for entry in cases {
+        let name = entry[0];
+        let source = entry[1];
+        let valid = entry[2];
+
+        fs_write(native_file, source);
+        let expected = _run_host(cli.runtime, native_file);
+        let host_ok = (expected.exit == 0) == valid and (valid or expected.error != nil);
+        assert(host_ok, "host contract mismatch on " + name + ": " + json_stringify(expected));
+        push(rows, map{ name: "host " + name, passed: true, exit: expected.exit, error: expected.error });
+
+        for mode in modes {
+            for bounded in bounds {
+                let actual = _run_vm_route(source, mode, bounded);
+                let route_label = name + " " + mode + (if bounded { " bounded" } else { " unbounded" });
+                let same = actual.exit == expected.exit and actual.stdout == expected.stdout and actual.error == expected.error;
+                assert(same, "route parity mismatch on " + route_label + ": expected=" + json_stringify(expected) + " actual=" + json_stringify(actual));
+                push(rows, map{ name: route_label, passed: true, exit: actual.exit });
+            }
+        }
+    }
+
+    let aliased_src = "let a=[];print array_pop(a);print push(a,false);print pop(a);";
+    let base_vm = _run_vm_route(aliased_src, "plain", false);
+    assert(base_vm.exit == 0, "aliased VM plain succeeded");
+    for mode in modes {
+        for bounded in bounds {
+            let r = _run_vm_route(aliased_src, mode, bounded);
+            assert(r.exit == 0 and r.stdout == base_vm.stdout, "aliased VM 6-route consistency");
+        }
+    }
+    push(rows, map{ name: "aliased 6-route consistency", passed: true });
+
+    let nested_src = "for _i 1 {let p=map{run:fn(self){return 7;}};print (try {p:run()} catch 9);}";
+    fs_write(native_file, nested_src);
+    let nested_host = _run_host(cli.runtime, native_file);
+    let nested_vm = F.frontend_run(nested_src);
+    assert(nested_host.exit == 0 and str_trim(nested_host.stdout) == "7", "sovereign nested p:run returns 7");
+    assert(nested_vm.ok and nested_vm.output == [7], "selfhost nested p:run returns [7]");
+    push(rows, map{ name: "nested p:run parity", passed: true });
+
+    if cli.report != "" {
+        fs_write(cli.report, json_stringify(rows));
+    }
+}
+
+fn main() {
+    let cli = _parse_cli();
+    assert(fs_exists(cli.repo + "/stdlib/compiler/vm.sapp"), "repo stdlib/compiler/vm.sapp must exist");
+    let scratch = "/tmp/pblang_tooling_s2_col_parity_" + str(now_ms());
+    fs_mkdirs(scratch);
+    let rows = [];
+    let err_msg = "";
+
+    try {
+        _execute_suite(cli, scratch, rows);
+    } catch e {
+        err_msg = str(e);
+    }
+
+    _rm_rf(scratch);
+    if err_msg != "" {
+        throw err_msg;
+    }
+
+    print json_stringify(map{
+        runner: "tests/tooling/selfhost_collection_parity.sapp",
+        language: "PBLang",
+        passed: true,
+        checks: len(rows)
+    });
+}
+
+main();

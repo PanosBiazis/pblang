@@ -1,0 +1,253 @@
+// Pure PBLang qualification runner for secure_file read_text_prefix parent
+// ownership, single-close verification, UTF-8 scalar boundary trimming,
+// polyglot_web browser_plan integration (no browser launch), and Linux FD checks.
+let SECURE = import("stdlib:secure_file.sapp");
+let POLYGLOT_WEB = import("stdlib:polyglot_web.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _replace_once(source, needle, replacement) {
+    let parts = str_split(source, needle);
+    assert(len(parts) == 2, "expected exactly one occurrence of needle");
+    return parts[0] + replacement + parts[1];
+}
+
+fn _rm_rf(target) {
+    if not fs_exists(target) { return; }
+    let entries = try fs_listdir(target) catch nil;
+    if type(entries) == "array" {
+        for entry in entries {
+            _rm_rf(target + "/" + entry);
+        }
+    }
+    let _removed = try fs_remove(target) catch nil;
+}
+
+let raw_args = os_args();
+let baseline_path = "";
+let report_path = "";
+let idx = 0;
+while idx < len(raw_args) {
+    if raw_args[idx] == "--baseline-source" and idx + 1 < len(raw_args) {
+        baseline_path = raw_args[idx + 1];
+    } elif raw_args[idx] == "--report" and idx + 1 < len(raw_args) {
+        report_path = raw_args[idx + 1];
+    }
+    idx = idx + 1;
+}
+
+let repo_root = cwd();
+let stdlib_root = repo_root + "/stdlib/";
+let candidate_raw = fs_read(stdlib_root + "secure_file.sapp");
+let semantic_raw = fs_read(repo_root + "/tests/semantics/secure_file_prefix_cleanup_test.sapp");
+let web_raw = fs_read(stdlib_root + "polyglot_web.sapp");
+let baseline_raw = "";
+if baseline_path != "" {
+    baseline_raw = fs_read(baseline_path);
+} else {
+    baseline_raw = _replace_once(
+        candidate_raw,
+        "let result = try _read_prefix_backend(parent.fs, parent.name, max_bytes)\n        catch _error(\"secure prefix backend failed\");\n    let closed = try _close(parent.fs) catch false;\n    if type(closed) != \"bool\" or not closed {\n        return map{ ok: false, error: \"secure prefix parent cleanup could not be verified\",\n            cleanup_uncertain: true, parent_close_confirmed: false };\n    }",
+        "let result = _read_prefix_backend(parent.fs, parent.name, max_bytes);\n    let _ignored_closed = _close(parent.fs);"
+    );
+}
+
+let scratch = "/tmp/pblang_tooling_s2_prefix_cleanup_" + str(num_floor(now_ms()));
+assert(SECURE.create_private_temporary_directory_new(scratch).ok, "private temporary qualification directory created");
+assert(SECURE.create_private_directory_new(scratch + "/work").ok, "private work subdirectory created");
+
+let backend_src = "let state = map{};\n"
+    + "fn configure(read_mode, close_mode) {\n"
+    + "    state.read_mode = read_mode; state.close_mode = close_mode;\n"
+    + "    state.opens = 0; state.reads = 0; state.closes = 0; state.admit = true;\n"
+    + "}\n"
+    + "fn open(path, create = false, protect = false) {\n"
+    + "    let _p = path; let _c = create; let _pr = protect;\n"
+    + "    state.opens = state.opens + 1; return map{ ok: state.admit };\n"
+    + "}\n"
+    + "fn open_absolute(path, create = false, protect = false) { return open(path, create, protect); }\n"
+    + "fn close(fs) {\n"
+    + "    let _f = fs;\n"
+    + "    state.closes = state.closes + 1;\n"
+    + "    if state.close_mode == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.close_mode == \"nil\" { return nil; }\n"
+    + "    if state.close_mode == \"number\" { return 1; }\n"
+    + "    if state.close_mode == \"map\" { return map{ ok: true }; }\n"
+    + "    return state.close_mode == \"success\";\n"
+    + "}\n"
+    + "fn read_prefix_bytes(fs, name, limit) {\n"
+    + "    let _f = fs; let _n = name; let _l = limit;\n"
+    + "    state.reads = state.reads + 1;\n"
+    + "    if state.read_mode == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.read_mode == \"failure\" { return map{ ok: false, error: \"synthetic failure\", marker: 7 }; }\n"
+    + "    return map{ ok: true, bytes: [206, 177], source_size: 2, truncated: false };\n"
+    + "}\n"
+    + "export state, configure, open, open_absolute, close, read_prefix_bytes;\n";
+
+fs_write(scratch + "/backend.sapp", backend_src);
+fs_write(scratch + "/semantic.sapp", semantic_raw);
+
+let cand_bound = str_replace_all(candidate_raw, "\"stdlib:", "\"" + stdlib_root);
+let base_bound = str_replace_all(baseline_raw, "\"stdlib:", "\"" + stdlib_root);
+let web_bound = str_replace_all(web_raw, "\"stdlib:", "\"" + stdlib_root);
+
+let cand_model = _replace_once(
+    cand_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/cand_model.sapp", cand_model);
+
+let base_model = _replace_once(
+    base_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/base_model.sapp", base_model);
+
+let cand_throw = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.read_prefix_bytes(fs, name, max_bytes); }",
+    "if platform() == \"linux\" { throw \"synthetic-private-value\"; }"
+);
+fs_write(scratch + "/cand_throw.sapp", cand_throw);
+
+let web_throw = _replace_once(
+    web_bound,
+    "let SECURE_FILE = import(\"" + stdlib_root + "secure_file.sapp\");",
+    "let SECURE_FILE = import(\"" + scratch + "/cand_throw.sapp\");"
+);
+fs_write(scratch + "/web_throw.sapp", web_throw);
+
+let cand_close_false = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); return false; }"
+);
+fs_write(scratch + "/cand_close_false.sapp", cand_close_false);
+
+let cand_close_throw = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); throw \"synthetic-private-value\"; }"
+);
+fs_write(scratch + "/cand_close_throw.sapp", cand_close_throw);
+
+let B = import(scratch + "/backend.sapp");
+let SEM = import(scratch + "/semantic.sapp");
+let S_CAND_MODEL = import(scratch + "/cand_model.sapp");
+let S_BASE_MODEL = import(scratch + "/base_model.sapp");
+let S_CAND_THROW = import(scratch + "/cand_throw.sapp");
+let WEB_THROW = import(scratch + "/web_throw.sapp");
+let S_CLOSE_FALSE = import(scratch + "/cand_close_false.sapp");
+let S_CLOSE_THROW = import(scratch + "/cand_close_throw.sapp");
+
+let rows = [];
+
+// Group 1: Modeled ownership matrix (18 matrix cases + 6 admission cases)
+let m_res = SEM.run(S_CAND_MODEL, B);
+assert(m_res.ok and m_res.matrix_cases == 18 and m_res.admission_cases == 6, "modeled ownership matrix passed");
+array_push(rows, map{ label: "modeled_ownership_matrix", passed: true, result: m_res });
+
+// Group 2: Old modeled source rejected by new contract
+let base_rejected = true;
+try { SEM.run(S_BASE_MODEL, B); base_rejected = false; } catch {}
+assert(base_rejected, "baseline source rejected by prefix ownership contract");
+array_push(rows, map{ label: "old_modeled_source_rejected", passed: true, rejected: base_rejected });
+
+// Group 3: Canonical runtime prefix limits, directory/missing refusals, browser_plan, and FD delta 0
+let input_html = scratch + "/work/input.html";
+let empty_path = scratch + "/work/empty";
+let dir_target = scratch + "/work/subdir";
+let missing_path = scratch + "/work/missing";
+
+fs_write(input_html, "A€Z");
+fs_write(empty_path, "");
+fs_mkdirs(dir_target);
+
+let fd_before_real = len(fs_listdir("/proc/self/fd"));
+let checks = 0;
+for _i 12 {
+    let whole = SECURE.read_text_prefix(input_html, 5, false);
+    assert(whole.ok and whole.text == "A€Z" and whole.source_size == 5 and whole.size == 5
+        and whole.returned_bytes == 5 and not whole.truncated and whole.utf8_boundary_trimmed_bytes == 0,
+        "exact prefix");
+    let large = SECURE.read_text_prefix(input_html, 8, false);
+    assert(large.ok and large.text == "A€Z" and not large.truncated, "larger cap");
+    let zero = SECURE.read_text_prefix(input_html, 0, false);
+    assert(zero.ok and zero.text == "" and zero.source_size == 5
+        and zero.returned_bytes == 0 and zero.truncated, "zero cap");
+    for cap in [1, 2, 3] {
+        let bounded = SECURE.read_text_prefix(input_html, cap, false);
+        assert(bounded.ok and bounded.source_size == 5 and bounded.truncated
+            and bounded.returned_bytes >= 1 and bounded.returned_bytes <= cap,
+            "bounded prefix cap");
+    }
+    let scalar = SECURE.read_text_prefix(input_html, 4, false);
+    assert(scalar.ok and scalar.text == "A€" and scalar.returned_bytes == 4
+        and scalar.truncated and scalar.utf8_boundary_trimmed_bytes == 0, "exact scalar boundary");
+    assert(not SECURE.read_text_prefix(dir_target, 2, false).ok, "directory target rejected");
+    assert(not SECURE.read_text_prefix("", 2, false).ok, "empty path rejected");
+    assert(not SECURE.read_text_prefix(input_html, 0 - 1, false).ok, "negative cap rejected");
+    let empty_res = SECURE.read_text_prefix(empty_path, 0, false);
+    assert(empty_res.ok and empty_res.text == "" and not empty_res.truncated, "empty file prefix");
+    assert(not SECURE.read_text_prefix(missing_path, 1, false).ok, "missing backend file rejected");
+    assert(POLYGLOT_WEB.browser_plan(input_html).ok, "real browser_plan without browser launch");
+    checks = checks + 12;
+}
+let fd_delta_real = len(fs_listdir("/proc/self/fd")) - fd_before_real;
+assert(checks == 144 and fd_delta_real == 0, "144 UTF-8 and browser_plan checks with zero fd delta");
+array_push(rows, map{ label: "real_utf8_limits_consumer_and_descriptors", passed: true, checks: checks, fd_delta: fd_delta_real });
+
+// Group 4: Candidate prefix and browser_plan backend exception redaction with FD delta 0
+let fd_before_exc = len(fs_listdir("/proc/self/fd"));
+let exc_count = 0;
+let denied_count = 0;
+for _i 4 {
+    let rp = nil;
+    try { rp = S_CAND_THROW.read_text_prefix(input_html, 1, false); } catch { exc_count = exc_count + 1; }
+    if rp != nil and not rp.ok {
+        assert(not map_has(rp, "text") and not map_has(rp, "bytes"), "no prefix data on exception");
+        denied_count = denied_count + 1;
+    }
+    let rb = nil;
+    try { rb = WEB_THROW.browser_plan(input_html); } catch { exc_count = exc_count + 1; }
+    if rb != nil and not rb.ok {
+        assert(not map_has(rb, "text") and not map_has(rb, "bytes"), "no browser_plan data on exception");
+        denied_count = denied_count + 1;
+    }
+}
+let fd_delta_exc = len(fs_listdir("/proc/self/fd")) - fd_before_exc;
+assert(exc_count == 0 and denied_count == 8 and fd_delta_exc == 0, "zero fd leak on prefix/browser_plan exceptions");
+array_push(rows, map{ label: "candidate_prefix_and_browser_plan_exception", passed: true, denied: denied_count, fd_delta: fd_delta_exc });
+
+// Group 5: Real close followed by false / throw suppresses prefix result with FD delta 0
+let fd_before_close = len(fs_listdir("/proc/self/fd"));
+for _i 12 {
+    let cf = S_CLOSE_FALSE.read_text_prefix(input_html, 1, false);
+    assert(not cf.ok and cf.cleanup_uncertain and not cf.parent_close_confirmed
+        and not map_has(cf, "text") and not map_has(cf, "bytes"), "close false suppresses prefix");
+    let ct = S_CLOSE_THROW.read_text_prefix(input_html, 1, false);
+    assert(not ct.ok and ct.cleanup_uncertain and not ct.parent_close_confirmed
+        and not map_has(ct, "text") and not map_has(ct, "bytes"), "close throw suppresses prefix");
+}
+let fd_delta_close = len(fs_listdir("/proc/self/fd")) - fd_before_close;
+assert(fd_delta_close == 0, "zero fd delta on close uncertainty projection");
+array_push(rows, map{ label: "real_close_uncertainty_projection", passed: true, iterations: 12, fd_delta: fd_delta_close });
+
+let report = map{
+    passed: true,
+    runner: "tests/tooling/secure_file_prefix_cleanup_check.sapp",
+    language: "PBLang",
+    source_sha256: SHA256.sha256_hex(candidate_raw),
+    baseline_sha256: SHA256.sha256_hex(baseline_raw),
+    semantic_sha256: SHA256.sha256_hex(semantic_raw),
+    caller_sha256: SHA256.sha256_hex(web_raw),
+    groups_passed: len(rows),
+    rows: rows
+};
+if report_path != "" {
+    fs_write(report_path, json_stringify(report) + "\n");
+}
+_rm_rf(scratch);
+assert(not fs_exists(scratch), "scratch cleaned up");
+print json_stringify(report);

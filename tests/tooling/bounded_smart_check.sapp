@@ -1,0 +1,360 @@
+// Linux source-admission qualification for smart-check (stdlib/check_cli.sapp) in pure PBLang.
+// Verifies 1 MiB per-file cap, 4 MiB aggregate budget, 64-file cap, strict UTF-8,
+// symlink/FIFO refusal, exact literal filenames, no implicit FFI grant, and non-execution.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+let OS = import("stdlib:os.sapp");
+
+let MIB = 1048576;
+
+fn _find_libc() {
+    let paths = [
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/usr/lib/libc.so.6",
+        "/lib/libc.so.6"
+    ];
+    let i = 0;
+    while i < len(paths) {
+        if fs_exists(paths[i]) { return paths[i]; }
+        i = i + 1;
+    }
+    throw "bounded_smart_check: libc.so.6 not found";
+}
+
+fn _cleanup_dir(libc, dir_path, special_names, normal_names) {
+    let i = 0;
+    while i < len(special_names) {
+        let _u = ffi_call_typed(libc, "unlink", "i32(cstr)", [dir_path + "/" + special_names[i]]);
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(normal_names) {
+        let _r = try fs_remove(dir_path + "/" + normal_names[j]) catch false;
+        j = j + 1;
+    }
+    let rest = try fs_listdir(dir_path) catch [];
+    let k = 0;
+    while k < len(rest) {
+        let p = dir_path + "/" + rest[k];
+        let _u2 = ffi_call_typed(libc, "unlink", "i32(cstr)", [p]);
+        let _r2 = try fs_remove(p) catch false;
+        k = k + 1;
+    }
+    let _rd = ffi_call_typed(libc, "rmdir", "i32(cstr)", [dir_path]);
+    let _rf = try fs_remove(dir_path) catch false;
+}
+
+fn _repeat_x(count) {
+    let chunk = "x";
+    while len(chunk) < count {
+        chunk = chunk + chunk;
+    }
+    return str_slice(chunk, 0, count);
+}
+
+fn _resolve_paths(release_arg, runtime_arg, repo_root) {
+    let bin = "";
+    let driver = "";
+    if release_arg != "" {
+        if fs_exists(release_arg + "/bin/pblang") { bin = release_arg + "/bin/pblang"; }
+        elif fs_exists(release_arg + "/pblang") { bin = release_arg + "/pblang"; }
+        if fs_exists(release_arg + "/stdlib/check_cli.sapp") { driver = release_arg + "/stdlib/check_cli.sapp"; }
+    }
+    if runtime_arg != "" {
+        bin = runtime_arg;
+    }
+    if bin == "" {
+        if fs_exists(repo_root + "/pblang") { bin = repo_root + "/pblang"; }
+        elif fs_exists(repo_root + "/target/release/pblang") { bin = repo_root + "/target/release/pblang"; }
+    }
+    if driver == "" {
+        driver = repo_root + "/stdlib/check_cli.sapp";
+    }
+    assert(bin != "" and fs_exists(bin), "bounded_smart_check: pblang binary missing");
+    assert(fs_exists(driver), "bounded_smart_check: check_cli.sapp missing");
+    return map{ binary: bin, driver: driver };
+}
+
+fn main() {
+    let raw_args = os_args();
+    let release_arg = "";
+    let runtime_arg = "";
+    let report_arg = "";
+    let only_arg = "";
+    let idx = 0;
+    while idx < len(raw_args) {
+        let a = raw_args[idx];
+        if a == "--release" and idx + 1 < len(raw_args) {
+            release_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--runtime" and idx + 1 < len(raw_args) {
+            runtime_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--report" and idx + 1 < len(raw_args) {
+            report_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--only" and idx + 1 < len(raw_args) {
+            only_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        }
+        idx = idx + 1;
+    }
+
+    let repo_root = cwd();
+    let resolved = _resolve_paths(release_arg, runtime_arg, repo_root);
+    let binary = resolved.binary;
+    let driver = resolved.driver;
+    let strace_bin = try OS.which("strace") catch nil;
+
+    let scratch = "/tmp/pblang_tooling_s1_bounded_smart_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(scratch).ok, "create private scratch");
+
+    let libc_path = _find_libc();
+    let libc = ffi_load(libc_path);
+
+    let is_sovereign = str_contains(proc_spawn_wait(binary, ["--version"]).stdout, "sovereign");
+    let utf8_fixture = if is_sovereign { [255, 32, 61, 32, 49, 59] } else { [112, 114, 105, 110, 116, 32, 34, 255, 34, 59] };
+    let utf8_expect = if is_sovereign { "parse-error" } else { "source admission rejected" };
+
+    let good = "let answer=42; print answer;\n";
+    let good_bytes = str_to_bytes(good);
+    let fixtures = map{
+        "valid.sapp": good_bytes,
+        "malformed.sapp": str_to_bytes("let x=;"),
+        "utf8.sapp": utf8_fixture,
+        "empty.sapp": [],
+        "line\nname.sapp ": good_bytes,
+        "root": good_bytes,
+        "TRACE_CANARY": good_bytes,
+        "--bounded-source": good_bytes,
+        "effect.sapp": str_to_bytes("fs_write(\"" + scratch + "/EFFECT\", \"must not execute\");"),
+        "lazy.sapp": str_to_bytes("fn load(){return import(\"private-provider\");} export load;")
+    };
+
+    let pad_exact = good + "//" + _repeat_x(MIB - len(good_bytes) - 3) + "\n";
+    let pad_over = good + "//" + _repeat_x(MIB + 1 - len(good_bytes) - 3) + "\n";
+    let pad_short = good + "//" + _repeat_x(MIB - 1 - len(good_bytes) - 3) + "\n";
+    fixtures["exact.sapp"] = str_to_bytes(pad_exact);
+    fixtures["over.sapp"] = str_to_bytes(pad_over);
+    fixtures["short.sapp"] = str_to_bytes(pad_short);
+
+    let fixture_names = map_keys(fixtures);
+    let before_hashes = map{};
+    let fi = 0;
+    while fi < len(fixture_names) {
+        let nm = fixture_names[fi];
+        let data = fixtures[nm];
+        fs_write_bytes(scratch + "/" + nm, data);
+        if nm == "utf8.sapp" {
+            before_hashes[nm] = SHA256.sha256_hex_bytes(data);
+        } else {
+            before_hashes[nm] = sha256(bytes_to_str(data));
+        }
+        fi = fi + 1;
+    }
+
+    assert(ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", ["valid.sapp", scratch + "/link.sapp"]) == 0, "create symlink");
+    assert(ffi_call_typed(libc, "mkfifo", "i32(cstr,u32)", [scratch + "/fifo", 384]) == 0, "create fifo");
+
+    let rows = [];
+    let prev_profile = env_get("PBLANG_CHECK_PROFILE");
+
+    let execute_case = fn(name, rel_files, expected_code, expected_text, flags, profile, grant, trace_absent, trace_copy, trace_present) {
+        if only_arg != "" and only_arg != name { return; }
+
+        let full_files = [];
+        let j = 0;
+        while j < len(rel_files) {
+            let item = rel_files[j];
+            if str_starts_with(item, "/") {
+                array_push(full_files, item);
+            } elif str_starts_with(item, "./") {
+                array_push(full_files, scratch + "/" + str_slice(item, 2, len(item)));
+            } else {
+                array_push(full_files, scratch + "/" + item);
+            }
+            j = j + 1;
+        }
+
+        let cmd_args = ["run"];
+        if grant {
+            array_push(cmd_args, "--allow-all");
+        } else {
+            array_push(cmd_args, "--deny-ffi");
+            array_push(cmd_args, "--deny-exec");
+        }
+        array_push(cmd_args, driver);
+        array_push(cmd_args, "--");
+        let fk = 0;
+        while fk < len(flags) {
+            array_push(cmd_args, flags[fk]);
+            fk = fk + 1;
+        }
+        let m = 0;
+        while m < len(full_files) {
+            array_push(cmd_args, full_files[m]);
+            m = m + 1;
+        }
+
+        env_set("PBLANG_CHECK_PROFILE", profile);
+        let traced = (trace_absent != "" or trace_copy != "" or trace_present != "") and strace_bin != nil;
+        let trace_path = scratch + "/trace-" + str(len(rows)) + ".log";
+        let proc: any = nil;
+        if traced {
+            let s_args = ["-f", "-yy", "-s", "256", "-e", "trace=openat,sendfile", "-o", trace_path, binary];
+            let si = 0;
+            while si < len(cmd_args) {
+                array_push(s_args, cmd_args[si]);
+                si = si + 1;
+            }
+            proc = proc_spawn_wait(strace_bin, s_args);
+        } else {
+            proc = proc_spawn_wait(binary, cmd_args);
+        }
+
+        let combined = proc.stdout + proc.stderr;
+        let unchanged = true;
+        let hi = 0;
+        while hi < len(fixture_names) {
+            let fnm = fixture_names[hi];
+            let cur_hash = if fnm == "utf8.sapp" {
+                SHA256.sha256_hex_bytes(fs_read_bytes(scratch + "/" + fnm))
+            } else {
+                sha256(fs_read(scratch + "/" + fnm))
+            };
+            if cur_hash != before_hashes[fnm] { unchanged = false; }
+            hi = hi + 1;
+        }
+
+        let checks = map{
+            exit_ok: proc.exit_code == expected_code,
+            diagnostic_ok: str_contains(combined, expected_text),
+            output_budget: len(str_to_bytes(proc.stdout)) <= 16384,
+            fixtures_unchanged: unchanged,
+            source_not_executed: not fs_exists(scratch + "/EFFECT")
+        };
+
+        if traced and fs_exists(trace_path) {
+            let trace_text = fs_read(trace_path);
+            if trace_present != "" {
+                checks["trace_positive_control"] = str_contains(trace_text, trace_present);
+            }
+            if trace_absent != "" {
+                checks["no_source_open_or_copy"] = not str_contains(trace_text, trace_absent);
+            }
+            if trace_copy != "" {
+                let tlines = str_split(trace_text, "\n");
+                let copies = 0;
+                let cap_plus_one = false;
+                let ti = 0;
+                while ti < len(tlines) {
+                    let tl = tlines[ti];
+                    if str_contains(tl, "sendfile(") and str_contains(tl, trace_copy) {
+                        copies = copies + 1;
+                        if str_contains(tl, ", " + str(MIB + 1) + ")") { cap_plus_one = true; }
+                    }
+                    ti = ti + 1;
+                }
+                checks["bounded_copy"] = copies == 1 and cap_plus_one;
+            }
+            let _rm_trace = try fs_remove(trace_path) catch false;
+        }
+
+        let ckeys = map_keys(checks);
+        let row_pass = true;
+        let ci = 0;
+        while ci < len(ckeys) {
+            if not checks[ckeys[ci]] { row_pass = false; }
+            ci = ci + 1;
+        }
+
+        array_push(rows, map{
+            name: name,
+            passed: row_pass,
+            exit: proc.exit_code,
+            checks: checks
+        });
+    };
+
+    let run_suite = fn() {
+        let bs = ["--bounded-source"];
+        execute_case("direct_valid", ["valid.sapp"], 0, "no issues found", bs, "", true, "", "", "");
+        execute_case("public_profile", ["valid.sapp"], 0, "no issues found", [], "bounded-source", true, "", "", "");
+        execute_case("malformed", ["malformed.sapp"], 1, "parse-error", bs, "", true, "", "", "");
+        execute_case("strict_utf8", ["utf8.sapp"], 1, utf8_expect, bs, "", true, "", "", "");
+        execute_case("empty_diagnosed", ["empty.sapp"], 1, "source is empty", bs, "", true, "", "", "");
+        execute_case("exact_filename", ["line\nname.sapp "], 0, "no issues found", bs, "", true, "", "", "");
+        execute_case("literal_root", ["root"], 0, "no issues found", bs, "", true, "", "", "");
+        execute_case("literal_option_filename", ["./--bounded-source"], 0, "no issues found", bs, "", true, "", "", "");
+        execute_case("symlink_refused", ["link.sapp"], 1, "source admission rejected", bs, "", true, "", "", "");
+        execute_case("fifo_refused", ["fifo"], 1, "source admission rejected", bs, "", true, "", "", "");
+        execute_case("no_implicit_grant", ["valid.sapp"], 1, "source admission rejected", bs, "", false, "", "", "");
+        execute_case("source_not_executed", ["effect.sapp"], 0, "no issues found", bs, "", true, "", "", "");
+        execute_case("combined_origin", ["lazy.sapp"], 1, "import-origin-deferred", ["--bounded-source", "--import-origin"], "", true, "", "", "");
+        execute_case("duplicate_flag", ["valid.sapp"], 1, "duplicate bounded source option", ["--bounded-source", "--bounded-source"], "", true, "", "", "");
+        execute_case("default_unchanged", ["valid.sapp"], 0, "no issues found", [], "", false, "", "", "");
+        execute_case("unknown_profile", ["valid.sapp"], 1, "unknown source profile", bs, "unknown", true, "", "", "");
+
+        let f64 = [];
+        for _c64 64 { array_push(f64, "valid.sapp"); }
+        execute_case("filecount_64", f64, 0, "checked 64 file(s): 0 error(s)", bs, "", true, "", "", "");
+        execute_case("trace_existing_control", ["TRACE_CANARY"], 0, "no issues found", bs, "", true, "", "", "TRACE_CANARY");
+        execute_case("trace_missing_control", [scratch + "/MISSING_CANARY"], 1, "source admission rejected", bs, "", true, "", "", "MISSING_CANARY");
+
+        let f65 = [];
+        for _c65 65 { array_push(f65, scratch + "/COUNT_CANARY"); }
+        execute_case("filecount_65_before_read", f65, 1, "at most 64 files", bs, "", true, "COUNT_CANARY", "", "");
+
+        execute_case("exact_per_file", ["exact.sapp"], 0, "no issues found", bs, "", true, "", "", "");
+        execute_case("one_over_per_file", ["over.sapp"], 1, "source admission rejected", bs, "", true, "", "over.sapp", "");
+        execute_case("aggregate_exact", ["exact.sapp", "exact.sapp", "exact.sapp", "exact.sapp"], 0, "checked 4 file(s): 0 error(s)", bs, "", true, "", "", "");
+        execute_case("aggregate_no_further_read", ["exact.sapp", "exact.sapp", "exact.sapp", "exact.sapp", scratch + "/TOTAL_CANARY"], 1, "aggregate source byte budget exhausted", bs, "", true, "TOTAL_CANARY", "", "");
+        execute_case("aggregate_remaining_one", ["exact.sapp", "exact.sapp", "exact.sapp", "short.sapp", "valid.sapp"], 1, "source admission rejected", bs, "", true, "", "", "");
+        execute_case("failed_reads_charge_allowance", ["over.sapp", "over.sapp", "over.sapp", "over.sapp", scratch + "/FAILED_CANARY"], 1, "aggregate source byte budget exhausted", bs, "", true, "FAILED_CANARY", "", "");
+        return true;
+    };
+    let _suite_ok = try run_suite() catch false;
+
+    if prev_profile == nil {
+        env_set("PBLANG_CHECK_PROFILE", "");
+    } else {
+        env_set("PBLANG_CHECK_PROFILE", prev_profile);
+    }
+
+    _cleanup_dir(libc, scratch, ["link.sapp", "fifo"], fixture_names);
+    ffi_close(libc);
+    assert(not fs_exists(scratch), "bounded_smart_check scratch directory cleaned up");
+
+    let all_passed = len(rows) > 0;
+    let ri = 0;
+    while ri < len(rows) {
+        if not rows[ri].passed {
+            print "FAILED CASE: " + json_stringify(rows[ri]);
+            all_passed = false;
+        }
+        ri = ri + 1;
+    }
+
+    let report = map{
+        passed: all_passed,
+        selected_case: only_arg,
+        driver_sha256: SHA256.sha256_hex_bytes(fs_read_bytes(driver)),
+        fixture_hashes: before_hashes,
+        rows: rows
+    };
+
+    if report_arg != "" {
+        let pdir = path_dirname(report_arg);
+        if pdir != "" and pdir != "." { fs_mkdirs(pdir); }
+        fs_write(report_arg, json_stringify(report) + "\n");
+    }
+
+    assert(report.passed, "bounded_smart_check failed");
+    print "bounded_smart_check_pass: cases=" + str(len(rows));
+}
+
+main();

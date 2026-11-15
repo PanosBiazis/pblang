@@ -1,0 +1,415 @@
+// Qualify opt-in bounded source admission (stdlib/compiler/bounded_source.sapp
+// and launcher check adapter tools/native_bundle_guard.sapp) in pure PBLang.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let BOUNDED = import("stdlib:compiler/bounded_source.sapp");
+let OS = import("stdlib:os.sapp");
+
+fn _find_libc() {
+    let paths = [
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/usr/lib/libc.so.6",
+        "/lib/libc.so.6"
+    ];
+    let i = 0;
+    while i < len(paths) {
+        if fs_exists(paths[i]) { return paths[i]; }
+        i = i + 1;
+    }
+    throw "bounded_source_check: libc.so.6 not found";
+}
+
+fn _rm_tree_libc(libc, path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            let child = path + "/" + entries[i];
+            if ffi_call_typed(libc, "unlink", "i32(cstr)", [child]) != 0 {
+                _rm_tree_libc(libc, child);
+            }
+            i = i + 1;
+        }
+    }
+    let _u = ffi_call_typed(libc, "unlink", "i32(cstr)", [path]);
+    let _d = ffi_call_typed(libc, "rmdir", "i32(cstr)", [path]);
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _prepare_guard_shim(guard_src, stdlib_dir) {
+    // Allow tools/native_bundle_guard.sapp to execute identically under both
+    // sovereign `./pblang` (where os_args() starts with script path) and
+    // retained `pblang-native` (where os_args() starts with "run").
+    let adapted = str_replace_all(guard_src, "import(\"stdlib:", "import(\"" + stdlib_dir + "/");
+    let old_head = "let raw = os_args();";
+    let new_head = "let _raw0 = os_args();\n"
+        + "let raw = if len(_raw0) >= 3 and _raw0[0] != \"run\" and _raw0[1] == \"--\" and _raw0[2] == \"pblang-launch-argv-v2\" {\n"
+        + "    let _r = [\"run\", _raw0[0], \"--sandbox\", \"--\", \"pblang-launch-argv-v2\"];\n"
+        + "    let _k = 3;\n"
+        + "    while _k < len(_raw0) { array_push(_r, _raw0[_k]); _k = _k + 1; }\n"
+        + "    _r\n"
+        + "} elif len(_raw0) >= 2 and _raw0[0] != \"run\" and _raw0[1] == \"--\" {\n"
+        + "    let _r = [\"run\", _raw0[0]];\n"
+        + "    let _k = 2;\n"
+        + "    while _k < len(_raw0) { array_push(_r, _raw0[_k]); _k = _k + 1; }\n"
+        + "    _r\n"
+        + "} elif len(_raw0) > 0 and _raw0[0] == \"run\" {\n"
+        + "    _raw0\n"
+        + "} else {\n"
+        + "    let _r = [\"run\"];\n"
+        + "    let _k = 0;\n"
+        + "    while _k < len(_raw0) { array_push(_r, _raw0[_k]); _k = _k + 1; }\n"
+        + "    _r\n"
+        + "};";
+    return str_replace_all(adapted, old_head, new_head);
+}
+
+fn _run_launcher(candidate_bin, runtime_bin, guard_shim, user_args) {
+    if candidate_bin != "" {
+        return proc_spawn_wait(candidate_bin, user_args);
+    }
+    // Two-phase launcher simulation matching tools/pblang-launch.sh + native_bundle_guard.sapp:
+    // Phase 1: sandboxed argv admission (never imports or reads source).
+    let admit_args = ["run", "--sandbox", guard_shim, "--", "pblang-launch-argv-v2"];
+    let i = 0;
+    while i < len(user_args) {
+        array_push(admit_args, user_args[i]);
+        i = i + 1;
+    }
+    let admit = proc_spawn_wait(runtime_bin, admit_args);
+    if admit.exit_code != 0 {
+        return admit;
+    }
+    let decision = str_trim(admit.stdout);
+    if decision == "pblang-launch-check-usage-v1" {
+        return map{
+            exit_code: 2,
+            stdout: "",
+            stderr: "pblang --check: expected --check --via-pblang, supported capability options, optional --retained-source, optional --bounded-source=BYTES, and one filename\n"
+        };
+    }
+    if decision == "pblang-launch-check-v1" {
+        // Extract capability flags for runtime VM before script path, while passing full user_args to guard.
+        let exec_args = ["run"];
+        let j = 0;
+        let opts = true;
+        let saw_sandbox = false;
+        let saw_deny_ffi = false;
+        let saw_ffi_lib = false;
+        let required_syms = ["free", "close", "dup", "strdup", "openat", "memfd_create", "sendfile", "lseek"];
+        let granted_syms = map{};
+        let has_bounded_flag = false;
+        while j < len(user_args) {
+            let ua = user_args[j];
+            if opts and ua == "--" {
+                opts = false;
+            } elif opts and (ua == "--sandbox" or ua == "--allow-all" or str_starts_with(ua, "--allow-") or str_starts_with(ua, "--deny-")) {
+                if ua == "--sandbox" { saw_sandbox = true; }
+                if ua == "--deny-ffi" { saw_deny_ffi = true; }
+                array_push(exec_args, ua);
+            } elif opts and str_starts_with(ua, "--bounded-source=") {
+                has_bounded_flag = true;
+            } elif opts and str_starts_with(ua, "--ffi-lib=") {
+                let lib_val = str_slice(ua, 10, len(ua));
+                if lib_val == "" or not fs_exists(lib_val) {
+                    return map{ exit_code: 2, stdout: "", stderr: "invalid --ffi-lib grant\n" };
+                }
+                saw_ffi_lib = true;
+            } elif opts and str_starts_with(ua, "--ffi-symbol=") {
+                let sym_val = str_slice(ua, 13, len(ua));
+                if not regex_match(sym_val, "^[A-Za-z_][A-Za-z0-9_]*$") {
+                    return map{ exit_code: 2, stdout: "", stderr: "malformed --ffi-symbol grant\n" };
+                }
+                granted_syms[sym_val] = true;
+            }
+            j = j + 1;
+        }
+        if saw_sandbox {
+            exec_args = ["run", "--sandbox"];
+        } elif has_bounded_flag {
+            let all_syms = saw_ffi_lib;
+            let si = 0;
+            while si < len(required_syms) {
+                if not map_has(granted_syms, required_syms[si]) { all_syms = false; }
+                si = si + 1;
+            }
+            if all_syms and not saw_deny_ffi {
+                array_push(exec_args, "--allow-ffi");
+            } elif not all_syms and not saw_deny_ffi {
+                array_push(exec_args, "--deny-ffi");
+            }
+        }
+        array_push(exec_args, guard_shim);
+        array_push(exec_args, "--");
+        let k = 0;
+        while k < len(user_args) {
+            array_push(exec_args, user_args[k]);
+            k = k + 1;
+        }
+        return proc_spawn_wait(runtime_bin, exec_args);
+    }
+    return proc_spawn_wait(runtime_bin, user_args);
+}
+
+fn main() {
+    let raw_args = os_args();
+    let candidate_arg = "";
+    let runtime_arg = "";
+    let report_arg = "";
+    let group_arg = "";
+    let idx = 0;
+    while idx < len(raw_args) {
+        let a = raw_args[idx];
+        if a == "--candidate" and idx + 1 < len(raw_args) {
+            candidate_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--runtime" and idx + 1 < len(raw_args) {
+            runtime_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--report" and idx + 1 < len(raw_args) {
+            report_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--group" and idx + 1 < len(raw_args) {
+            group_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        }
+        idx = idx + 1;
+    }
+
+    let repo_root = cwd();
+    let candidate_bin = "";
+    if candidate_arg != "" and fs_exists(candidate_arg + "/bin/pblang") {
+        candidate_bin = candidate_arg + "/bin/pblang";
+    }
+    let runtime_bin = if runtime_arg != "" { runtime_arg } else { repo_root + "/pblang" };
+    assert(fs_exists(runtime_bin), "bounded_source_check: runtime binary not found");
+
+    let libc_path = _find_libc();
+    let libc = ffi_load(libc_path);
+    let grants = [
+        "--ffi-lib=" + libc_path,
+        "--ffi-symbol=free", "--ffi-symbol=close", "--ffi-symbol=dup", "--ffi-symbol=strdup",
+        "--ffi-symbol=openat", "--ffi-symbol=memfd_create", "--ffi-symbol=sendfile", "--ffi-symbol=lseek"
+    ];
+
+    let scratch = "/tmp/pblang_tooling_s1_bounded_source_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(scratch).ok, "create scratch dir");
+
+    let guard_shim = scratch + "/guard_shim.sapp";
+    fs_write(guard_shim, _prepare_guard_shim(fs_read(repo_root + "/tools/native_bundle_guard.sapp"), repo_root + "/stdlib"));
+
+    let active_bin = if candidate_bin != "" { candidate_bin } else { runtime_bin };
+    let is_sovereign = str_contains(proc_spawn_wait(active_bin, ["--version"]).stdout, "sovereign");
+    let invalid_bytes = if is_sovereign { [255, 32, 61, 32, 49, 59] } else { [112, 114, 105, 110, 116, 32, 34, 255, 34, 59] };
+    let invalid_expect = if is_sovereign { "self-hosted check failed" } else { "not valid UTF-8" };
+
+    let root = scratch + "/work";
+    fs_mkdirs(root);
+    let valid_src = "print \"γειά\";";
+    let valid_bytes = str_to_bytes(valid_src);
+    fs_write_bytes(root + "/valid.sapp", valid_bytes);
+    fs_write_bytes(root + "/empty.sapp", []);
+    fs_write_bytes(root + "/invalid.sapp", invalid_bytes);
+    fs_write(root + "/type.sapp", "let n:number=\"wrong\";");
+    fs_write_bytes(root + "/root", valid_bytes);
+    fs_mkdirs(root + "/folder");
+    fs_write_bytes(root + "/folder/valid.sapp", valid_bytes);
+    assert(ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", ["valid.sapp", root + "/link.sapp"]) == 0, "symlink file");
+    assert(ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", ["folder", root + "/parent-link"]) == 0, "symlink dir");
+    assert(ffi_call_typed(libc, "mkfifo", "i32(cstr,u32)", [root + "/fifo", 384]) == 0, "mkfifo");
+
+    let rows = [];
+    let groups = if group_arg != "" { [group_arg] } else { ["library", "source", "argv", "permissions", "allocation"] };
+    let strace_bin = try OS.which("strace") catch nil;
+
+    let check_case = fn(label, args, expected_code, expected_text) {
+        let p = _run_launcher(candidate_bin, runtime_bin, guard_shim, args);
+        let code_ok = if expected_code == nil { p.exit_code != 0 } else { p.exit_code == expected_code };
+        let text_ok = expected_text == "" or str_contains(p.stdout + p.stderr, expected_text);
+        let ok = code_ok and text_ok;
+        let row = map{ name: label, passed: ok, exit: p.exit_code, stdout: p.stdout, stderr: p.stderr };
+        array_push(rows, row);
+        if not ok { print "FAIL_ROW: " + json_stringify(row); }
+        assert(ok, "bounded_source_check failed case: " + label);
+        return row;
+    };
+
+    let bounded_case = fn(label, rel_path, limit, expected_code, extra_flags, expected_text) {
+        let target = if str_starts_with(rel_path, "/") { rel_path } else { root + "/" + rel_path };
+        let args = ["--check", "--via-pblang", "--bounded-source=" + str(limit)];
+        let gi = 0;
+        while gi < len(grants) { array_push(args, grants[gi]); gi = gi + 1; }
+        let ei = 0;
+        while ei < len(extra_flags) { array_push(args, extra_flags[ei]); ei = ei + 1; }
+        array_push(args, "--");
+        array_push(args, target);
+        return check_case(label, args, expected_code, expected_text);
+    };
+
+    let run_groups = fn() {
+        let gi = 0;
+        while gi < len(groups) {
+            let grp = groups[gi];
+            if grp == "library" {
+                let bad_limits: any = [0, -1, 1048577, 1.5, "32", nil, true];
+                let li = 0;
+                while li < len(bad_limits) {
+                    assert(not BOUNDED.read_source(root + "/valid.sapp", bad_limits[li]).ok, "invalid limit rejected");
+                    li = li + 1;
+                }
+                let bad_paths: any = [nil, 0, true, "", root + "/folder/", "../valid.sapp"];
+                let pi = 0;
+                while pi < len(bad_paths) {
+                    assert(not BOUNDED.read_source(bad_paths[pi], 64).ok, "invalid path rejected");
+                    pi = pi + 1;
+                }
+                let copy_target = root + "/lib_copy.sapp";
+                fs_write_bytes(copy_target, valid_bytes);
+                let loaded = BOUNDED.read_source(copy_target);
+                assert(loaded.ok and loaded.size == 17 and loaded.source == valid_src, "default read_source 17 UTF-8 bytes");
+                fs_write(copy_target, "let n:number=\"changed\";");
+                assert(loaded.source == valid_src, "captured source immutable");
+                let changed = BOUNDED.read_source(copy_target, 64);
+                assert(changed.ok and changed.source != loaded.source, "replacement observed on reread");
+                array_push(rows, map{ name: "library_contract", passed: true, exit: 0 });
+            } elif grp == "source" {
+                let _r1 = bounded_case("exact UTF-8 byte boundary", "valid.sapp", len(valid_bytes), 0, [], "self-hosted check ok");
+                let _r2 = bounded_case("one byte too small", "valid.sapp", len(valid_bytes) - 1, 1, [], "exceeds byte limit");
+                let _r3 = bounded_case("empty", "empty.sapp", 64, 1, [], "self-hosted check failed");
+                let _r4 = bounded_case("invalid UTF-8", "invalid.sapp", 64, 1, [], invalid_expect);
+                let _r5 = bounded_case("type diagnostic", "type.sapp", 64, 1, [], "self-hosted check failed");
+                let _r6 = bounded_case("literal root", "root", 64, 0, [], "self-hosted check ok");
+
+                let rejected_paths = ["absent", "folder", "link.sapp", "parent-link/valid.sapp", "fifo"];
+                let rpi = 0;
+                while rpi < len(rejected_paths) {
+                    let _rr = bounded_case("reject " + rejected_paths[rpi], rejected_paths[rpi], 64, 1, [], "bounded source rejected");
+                    rpi = rpi + 1;
+                }
+
+                let literal_names = ["χώρος πηγής.sapp", "line\nnext.sapp", "--bounded-source=1", "--ffi-symbol=close", "--ffi-lib=not-a-library"];
+                let lni = 0;
+                while lni < len(literal_names) {
+                    let lname = literal_names[lni];
+                    fs_write_bytes(root + "/" + lname, valid_bytes);
+                    let _rl = bounded_case("literal " + lname, lname, 64, 0, [], "self-hosted check ok");
+                    lni = lni + 1;
+                }
+
+                let _r7 = bounded_case("absolute path", root + "/valid.sapp", 64, 0, [], "self-hosted check ok");
+                fs_write(root + "/effect.sapp", "fs_write(\"" + root + "/effect\", \"must-not-run\");");
+                let _r8 = bounded_case("source never executed", "effect.sapp", 256, 0, [], "self-hosted check ok");
+                assert(not fs_exists(root + "/effect"), "effect file must not exist");
+            } elif grp == "argv" {
+                let bad_vals = ["", "0", "-1", "+1", "1.5", "1e3", "1048577", "999999999999999999", " 20"];
+                let bvi = 0;
+                while bvi < len(bad_vals) {
+                    let bv = bad_vals[bvi];
+                    let _rb = check_case("invalid limit " + bv, ["--check", "--via-pblang", "--bounded-source=" + bv, root + "/absent"], 2, "");
+                    bvi = bvi + 1;
+                }
+                let _s1 = check_case("bounded requires both selectors 0", ["--bounded-source=64", root + "/valid.sapp"], 2, "");
+                let _s2 = check_case("bounded requires both selectors 1", ["--check", "--bounded-source=64", root + "/valid.sapp"], 2, "");
+                let _s3 = check_case("bounded requires both selectors 2", ["--via-pblang", "--bounded-source=64", root + "/valid.sapp"], 2, "");
+                let _s4 = check_case("bounded option before selectors", ["--bounded-source=64", "--check", "--via-pblang", root + "/valid.sapp"], 2, "");
+                let _s5 = check_case("duplicate option", ["--check", "--via-pblang", "--bounded-source=32", "--bounded-source=64", root + "/absent"], 2, "");
+                let _s6 = check_case("missing value form", ["--check", "--via-pblang", "--bounded-source", "32", root + "/absent"], 2, "");
+
+                let after_args = ["--check", "--via-pblang", root + "/valid.sapp"];
+                let ag1 = 0;
+                while ag1 < len(grants) { array_push(after_args, grants[ag1]); ag1 = ag1 + 1; }
+                array_push(after_args, "--bounded-source=64");
+                let _s7 = check_case("option after filename", after_args, 0, "self-hosted check ok");
+
+                let alias_args = ["--allow-ffi", "--self-host", "--bounded-source=64", "--check"];
+                let ag2 = 0;
+                while ag2 < len(grants) { array_push(alias_args, grants[ag2]); ag2 = ag2 + 1; }
+                array_push(alias_args, root + "/valid.sapp");
+                let _s8 = check_case("alias and leading capabilities", alias_args, 0, "self-hosted check ok");
+
+                let no_optin = ["--check", "--via-pblang"];
+                let ag3 = 0;
+                while ag3 < len(grants) { array_push(no_optin, grants[ag3]); ag3 = ag3 + 1; }
+                array_push(no_optin, root + "/valid.sapp");
+                let _s9 = check_case("grants require opt-in", no_optin, 2, "");
+                let _s10 = check_case("malformed symbol", ["--check", "--via-pblang", "--bounded-source=64", "--ffi-symbol=bad-symbol", root + "/valid.sapp"], 2, "");
+                let _s11 = check_case("empty library grant", ["--check", "--via-pblang", "--bounded-source=64", "--ffi-lib=", root + "/valid.sapp"], nil, "");
+                let _s12 = bounded_case("upper bound 1048576", "valid.sapp", 1048576, 0, [], "self-hosted check ok");
+            } elif grp == "permissions" {
+                let hard_denies = ["ffi", "fs", "import"];
+                let hdi = 0;
+                while hdi < len(hard_denies) {
+                    let _hd = bounded_case("deny " + hard_denies[hdi], "valid.sapp", 64, nil, ["--deny-" + hard_denies[hdi]], "");
+                    hdi = hdi + 1;
+                }
+                let indep_denies = ["exec", "net", "http", "env", "spawn", "gfx", "sqlite"];
+                let idi = 0;
+                while idi < len(indep_denies) {
+                    let _id = bounded_case("independent deny " + indep_denies[idi], "valid.sapp", 64, 0, ["--deny-" + indep_denies[idi]], "self-hosted check ok");
+                    idi = idi + 1;
+                }
+                let _p1 = bounded_case("locked sandbox", "valid.sapp", 64, nil, ["--sandbox", "--allow-all"], "");
+                let _p2 = check_case("default has no FFI grant", ["--check", "--via-pblang", "--bounded-source=64", root + "/valid.sapp"], 1, "bounded source rejected");
+                let _p3 = check_case("ordinary route permits denied FFI and exec", ["--check", "--via-pblang", "--deny-ffi", "--deny-exec", root + "/valid.sapp"], 0, "self-hosted check ok");
+            } elif grp == "allocation" {
+                let huge_path = root + "/huge.sapp";
+                fs_write_bytes(huge_path, []);
+                assert(ffi_call_typed(libc, "truncate", "i32(cstr,i64)", [huge_path, 4294967296]) == 0, "sparse 4 GiB truncate");
+                if strace_bin != nil and candidate_bin == "" {
+                    let trace_log = root + "/trace.log";
+                    let s_args = ["-f", "-yy", "-e", "trace=openat,read,sendfile,memfd_create,lseek", "-o", trace_log, runtime_bin, "run", "--allow-ffi", guard_shim, "--", "--check", "--via-pblang", "--bounded-source=4096"];
+                    let g_idx = 0;
+                    while g_idx < len(grants) { array_push(s_args, grants[g_idx]); g_idx = g_idx + 1; }
+                    array_push(s_args, huge_path);
+                    let tr_proc = proc_spawn_wait(strace_bin, s_args);
+                    assert(tr_proc.exit_code == 1 and str_contains(tr_proc.stdout + tr_proc.stderr, "exceeds byte limit"), "4 GiB sparse source rejected");
+                    let trace_txt = fs_read(trace_log);
+                    let tlines = str_split(trace_txt, "\n");
+                    let copy_hits = 0;
+                    let ti = 0;
+                    while ti < len(tlines) {
+                        let ln = tlines[ti];
+                        if str_contains(ln, "sendfile(") and str_contains(ln, "huge.sapp") and str_contains(ln, ", 4097) = 4097") {
+                            copy_hits = copy_hits + 1;
+                        }
+                        assert(not (str_contains(ln, "read(") and str_contains(ln, "huge.sapp")), "no direct read() on huge.sapp");
+                        ti = ti + 1;
+                    }
+                    assert(copy_hits == 1, "exact cap+1 (4097 byte) sendfile verified");
+                    array_push(rows, map{ name: "4 GiB sparse source bounded before VM allocation", passed: true, exit: 1, source_copy_bytes: 4097 });
+                } else {
+                    let _ra = bounded_case("4 GiB sparse source bounded", "huge.sapp", 4096, 1, [], "exceeds byte limit");
+                }
+                let _rb1 = bounded_case("before replacement", "valid.sapp", 64, 0, [], "self-hosted check ok");
+                fs_write(root + "/replacement", "let n:number=\"bad\";");
+                fs_rename(root + "/replacement", root + "/valid.sapp");
+                let _rb2 = bounded_case("after replacement", "valid.sapp", 64, 1, [], "self-hosted check failed");
+                fs_write_bytes(root + "/valid.sapp", valid_bytes);
+            }
+            gi = gi + 1;
+        }
+        return true;
+    };
+    if not (try run_groups() catch false) {
+        _rm_tree_libc(libc, scratch);
+        ffi_close(libc);
+        throw "bounded_source_check failed during execution";
+    }
+
+    _rm_tree_libc(libc, scratch);
+    ffi_close(libc);
+    assert(not fs_exists(scratch), "bounded_source_check scratch cleaned up");
+
+    if report_arg != "" {
+        let pdir = path_dirname(report_arg);
+        if pdir != "" and pdir != "." { fs_mkdirs(pdir); }
+        fs_write(report_arg, json_stringify(rows) + "\n");
+    }
+
+    print "bounded_source_check_pass: cases=" + str(len(rows));
+}
+
+main();

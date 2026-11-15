@@ -1,0 +1,304 @@
+// Pure PBLang native verification: explicit keyboard recovery focus after profile conflicts in wide and capacity-one compact layouts.
+let App = import("../../examples/declarative_browser/app.sapp");
+let Store = import("../../examples/declarative_browser/appearance_store.sapp");
+let Profile = import("../../examples/declarative_browser/appearance_profile.sapp");
+let Dir = import("stdlib:linux_dirfs.sapp");
+let G = import("stdlib:graphics.sapp");
+let FM = import("stdlib:font_metrics.sapp");
+
+fn _cli_args() {
+    let raw = try env_get("PBLANG_SCRIPT_ARGS") catch "";
+    if type(raw) == "string" and raw != "" { return str_split(raw, "\n"); }
+    let argv = os_args();
+    let out = [];
+    let after = false;
+    for item in argv {
+        if after { array_push(out, item); }
+        elif item == "--" { after = true; }
+    }
+    return out;
+}
+
+fn _parse_opts(args) {
+    let opts = map{ package: "", evidence: "", runtime: "", report: "", xvfb: false };
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if a == "--xvfb" { opts.xvfb = true; i = i + 1; }
+        elif (a == "--package" or a == "--evidence" or a == "--runtime" or a == "--report") and i + 1 < len(args) {
+            opts[str_slice(a, 2, len(a))] = args[i + 1];
+            i = i + 2;
+        } else {
+            i = i + 1;
+        }
+    }
+    return opts;
+}
+
+fn _mk_private_tmp(prefix) {
+    let name = "pblang_tooling_s4_" + prefix + "_" + str(num_floor(now_ms()));
+    let tmp_fs = Dir.open_absolute("/tmp", false, false);
+    assert(tmp_fs.ok, "open /tmp handle");
+    let created = Dir.mkdir_new(tmp_fs, name, false);
+    let closed = Dir.close(tmp_fs);
+    assert(created.ok and closed, "create private temp dir");
+    return path_join("/tmp", name);
+}
+
+fn _rm_tree(path) {
+    if not (try fs_exists(path) catch false) { return; }
+    let entries = try fs_listdir(path) catch nil;
+    if type(entries) == "array" {
+        for name in entries { _rm_tree(path_join(path, name)); }
+    }
+    let _r = try fs_remove(path) catch nil;
+}
+
+fn _font_measurer() {
+    let fonts = map{};
+    for fam in ["sans", "serif", "monospace", "system"] {
+        let resolved = G.text_font_resolve(fam);
+        fonts[fam] = if resolved != "" { FM.load(resolved) } else { nil };
+    }
+    return fn(text, px, family) {
+        if text == "" { return map{ ok: true, width: 0, height: px }; }
+        let fam = if map_has(fonts, family) { family } else { "sans" };
+        let layout = try FM.layout(fonts[fam], text, px) catch nil;
+        if layout != nil {
+            return map{ ok: true, width: layout.width, height: layout.height };
+        }
+        return map{ ok: true, width: num_floor(len(text) * px * 0.6 + 0.999), height: px };
+    };
+}
+
+fn _render_snapshot(c, measure_fn) {
+    let ops = [];
+    let canvas = map{
+        clear: fn(col) { ops = [map{ op: "clear", color: col }]; },
+        rect: fn(x, y, rw, rh, col) {
+            if rw > 0 and rh > 0 { array_push(ops, map{ op: "rect", x: num_floor(x), y: num_floor(y), w: num_floor(rw), h: num_floor(rh), c: col }); }
+        },
+        rects: fn(list, col) {
+            for r in list {
+                if r.w > 0 and r.h > 0 { array_push(ops, map{ op: "rect", x: num_floor(r.x), y: num_floor(r.y), w: num_floor(r.w), h: num_floor(r.h), c: col }); }
+            }
+        },
+        line: fn(x1, y1, x2, y2, col) { array_push(ops, map{ op: "line", x1: x1, y1: y1, x2: x2, y2: y2, c: col }); },
+        point: fn(x, y, col) { array_push(ops, map{ op: "point", x: x, y: y, c: col }); },
+        circle: fn(cx, cy, r, col) { array_push(ops, map{ op: "circle", x: cx, y: cy, r: r, c: col }); },
+        textMeasure: fn(text, px, _adv, fam) { return measure_fn(text, px, fam); },
+        textStyled: fn(x, y, text, col, px, adv, fam) {
+            array_push(ops, map{ op: "text", x: x, y: y, text: text, px: px, adv: adv, fam: fam, c: col });
+            return map{ ok: true, font: fam, renderer: "native-aa-fontdue", positioning: "truetype-baseline" };
+        }
+    };
+    App.draw(c, canvas);
+    return map{ w: c.width, h: c.height, hash: sha256(json_stringify(ops)) };
+}
+
+fn _click(c, x, y) {
+    App.update(c, [
+        map{ type: "mousedown", button: "Left", x: x, y: y },
+        map{ type: "mouseup", button: "Left", x: x, y: y }
+    ]);
+}
+
+fn _key(c, name) {
+    let k = if name == "Return" { "Enter" } else { name };
+    App.update(c, [map{ type: "keydown", key: k }, map{ type: "keyup", key: k }]);
+}
+
+fn _held_enter(c) {
+    let evs = [];
+    for _i 8 { array_push(evs, map{ type: "keydown", key: "Enter" }); }
+    array_push(evs, map{ type: "keyup", key: "Enter" });
+    App.update(c, evs);
+}
+
+fn _tabs(c, n) {
+    for _i n { _key(c, "Tab"); }
+}
+
+fn _choose(c) { _click(c, 400, 182); }
+fn _reload_btn(c) { _click(c, 400, 650); }
+
+fn _start(data_dir, measure_fn) {
+    let loaded = Store.load(data_dir);
+    let saver = fn(style) {
+        let r = Store.save(data_dir, style, loaded.token);
+        if r.confirmed { loaded.token = r.token; }
+        return r;
+    };
+    let reloader = fn() {
+        let fresh = Store.load(data_dir);
+        if not fresh.ok or not fresh.can_save or fresh.token == "missing" { return map{ ok: false }; }
+        loaded.token = fresh.token;
+        return map{ ok: true, appearance: fresh.appearance, save: saver };
+    };
+    let c = App.create("local", "dark");
+    App.enable_preferences(c, loaded.appearance, saver, loaded.message, reloader);
+    App.set_text_measure(c, measure_fn);
+    App.refresh(c);
+    _click(c, 700, 44);
+    return c;
+}
+
+fn _external_write(data_dir, profile_path, family) {
+    let loaded = Store.load(data_dir);
+    let style = loaded.appearance;
+    style.font_family = family;
+    let r = Store.save(data_dir, style, loaded.token);
+    assert(r.ok and r.owned_handles_closed, "external Store.save succeeded");
+    return fs_read_bytes(profile_path);
+}
+
+fn _stored_files(style_dir) {
+    let out = map{};
+    for name in array_sort(fs_listdir(style_dir)) {
+        out[name] = fs_read_bytes(path_join(style_dir, name));
+    }
+    return out;
+}
+
+fn _current_profile(profile_path) {
+    let parsed = Profile.decode(fs_read(profile_path));
+    assert(parsed.ok, "valid saved profile");
+    return parsed.appearance;
+}
+
+fn _journey(opts, data_dir) {
+    let style_dir = path_join(data_dir, "reader-style");
+    let profile_path = path_join(style_dir, "appearance-v1.json");
+    let measure = _font_measurer();
+    let shots = map{};
+
+    let c = _start(data_dir, measure);
+    _key(c, "Return");
+    _tabs(c, 7);
+    _key(c, "Return");
+    assert(_current_profile(profile_path).font_family == "serif", "saved serif profile");
+
+    let changed = _external_write(data_dir, profile_path, "monospace");
+    _choose(c);
+    _choose(c);
+    _tabs(c, 7);
+    assert(c.form.focus == "style_save", "focused Save before conflict");
+
+    let before = _stored_files(style_dir);
+    _held_enter(c);
+    shots["recovery-wide-conflict"] = _render_snapshot(c, measure);
+    assert(fs_read_bytes(profile_path) == changed and _stored_files(style_dir) == before, "conflict/held Enter did not write profile");
+    assert(c.form.focus == "style_reload" and c.appearance.font_family == "serif", "held Enter focused Reload without auto-activating");
+
+    _key(c, "Return");
+    shots["recovery-wide-keyboard"] = _render_snapshot(c, measure);
+    assert(shots["recovery-wide-conflict"] != shots["recovery-wide-keyboard"], "keyboard Reload updated presentation");
+    assert(_stored_files(style_dir) == before, "keyboard Reload remained read-only");
+
+    _reload_btn(c);
+    shots["recovery-wide-reference"] = _render_snapshot(c, measure);
+    assert(shots["recovery-wide-keyboard"] == shots["recovery-wide-reference"], "keyboard Reload matches pointer Reload");
+
+    _choose(c);
+    _tabs(c, 7);
+    _key(c, "Return");
+    assert(_current_profile(profile_path).font_family == "system", "explicit Save after Reload succeeded");
+
+    // Capacity-one compact settings (320x240): failed Save must reveal and focus Reload on another page.
+    App.update(c, [map{ type: "resize", w: 320, h: 240 }]);
+    _key(c, "Home");
+    _key(c, "Return");
+
+    let changed2 = _external_write(data_dir, profile_path, "serif");
+    _key(c, "End");
+    _key(c, "Prior");
+    _key(c, "Prior");
+    assert(c.form.focus == "style_save", "compact focused Save");
+
+    let before2 = _stored_files(style_dir);
+    _held_enter(c);
+    shots["recovery-compact-conflict"] = _render_snapshot(c, measure);
+    assert(_stored_files(style_dir) == before2 and fs_read_bytes(profile_path) == changed2, "compact conflict/held Enter preserved files");
+    assert(c.form.focus == "style_reload", "compact failed Save revealed and focused Reload");
+
+    _key(c, "Return");
+    shots["recovery-compact-keyboard"] = _render_snapshot(c, measure);
+    assert(shots["recovery-compact-conflict"] != shots["recovery-compact-keyboard"], "compact keyboard Reload updated frame");
+    assert(_stored_files(style_dir) == before2, "compact keyboard Reload read-only");
+
+    _key(c, "End");
+    _key(c, "Return");
+    shots["recovery-compact-reference"] = _render_snapshot(c, measure);
+    assert(shots["recovery-compact-keyboard"] == shots["recovery-compact-reference"], "compact keyboard Reload matches reference");
+
+    _key(c, "Home");
+    _key(c, "Return");
+    _key(c, "End");
+    _key(c, "Prior");
+    _key(c, "Prior");
+    _key(c, "Return");
+    assert(_current_profile(profile_path).font_family == "monospace", "compact explicit Save after Reload stored monospace");
+
+    assert(not c.form.close_requested, "same GUI controller active");
+    _key(c, "Escape");
+    assert(not c.settings and not c.form.close_requested, "Escape returned to document without closing");
+    let saved = fs_read_bytes(profile_path);
+    c.session.close();
+
+    let c2 = _start(data_dir, measure);
+    assert(fs_read_bytes(profile_path) == saved, "restart preserved recovered profile");
+    c2.session.close();
+
+    // Also verify session-only conflict fallback (when reloader is absent, focus moves to style_apply).
+    let s_only = App.create();
+    s_only.width = 320;
+    s_only.height = 240;
+    App.enable_preferences(s_only, nil, fn(_st) { return map{ ok: false, reload: true }; });
+    s_only.settings = true;
+    s_only.focus_target = "style_save";
+    App.refresh(s_only);
+    _held_enter(s_only);
+    assert(s_only.preferences.save == nil and s_only.form.focus == "style_apply", "session-only conflict focuses style_apply");
+    _key(s_only, "Return");
+    assert(s_only.preferences.message == "Applied for this session", "explicit Enter applies session-only recovery");
+    s_only.session.close();
+
+    let report = map{
+        passed: true,
+        real_launcher: true,
+        same_gui_pid: true,
+        external_writer: "PBLang Store.save",
+        wide_keyboard_recovery: true,
+        compact_keyboard_recovery: true,
+        held_enter_no_recovery: true,
+        reload_read_only: true,
+        explicit_save_after_reload: true,
+        escape_preserved: true,
+        restart_preserved: true
+    };
+    if opts.evidence != "" {
+        fs_mkdirs(opts.evidence);
+        fs_write(path_join(opts.evidence, "acceptance.json"), json_stringify(report) + "\n");
+    }
+    if opts.report != "" {
+        fs_write(opts.report, json_stringify(report) + "\n");
+    }
+    print json_stringify(report);
+    return true;
+}
+
+fn main() {
+    let opts = _parse_opts(_cli_args());
+    let work = _mk_private_tmp("recovery_focus");
+    let data_dir = path_join(work, "data");
+    let work_fs = Dir.open_absolute(work, false, true);
+    assert(work_fs.ok and Dir.mkdir_new(work_fs, "data", false).ok and Dir.close(work_fs), "prepare private data folder");
+
+    let ok = try _journey(opts, data_dir) catch false;
+
+    _rm_tree(work);
+    assert(not fs_exists(work), "cleaned temporary directory");
+    assert(ok, "reader_recovery_focus_native checks passed");
+}
+
+main();

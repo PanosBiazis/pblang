@@ -1,0 +1,187 @@
+// Pure-PBLang verification that document admission never loads the reader GUI presentation or profile store.
+let Dir = import("stdlib:linux_dirfs.sapp");
+let PackageBuilder = import("../../examples/declarative_browser/package_builder.sapp");
+
+fn _parse_cli() {
+    let raw = os_args();
+    let out = map{evidence: nil, report: nil, runtime: nil, package: nil};
+    let after = false;
+    let i = 0;
+    while i < len(raw) {
+        let arg = raw[i];
+        if not after {
+            if arg == "--" { after = true; }
+        } elif (arg == "--evidence" or arg == "--report" or arg == "--runtime" or arg == "--package") and i + 1 < len(raw) {
+            let val = raw[i + 1];
+            if arg == "--evidence" { out.evidence = val; }
+            elif arg == "--report" { out.report = val; }
+            elif arg == "--runtime" { out.runtime = val; }
+            elif arg == "--package" { out.package = val; }
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _resolve_runtime(explicit, repo) {
+    if explicit != nil and explicit != "" { return explicit; }
+    if fs_exists(repo + "/pblang") { return repo + "/pblang"; }
+    if fs_exists(repo + "/target/release/pblang") { return repo + "/target/release/pblang"; }
+    return "./pblang";
+}
+
+fn _rm_tree(path) {
+    let removed = false;
+    try { fs_remove(path); removed = true; } catch {}
+    if removed { return true; }
+    let kids = try fs_listdir(path) catch nil;
+    if type(kids) == "array" {
+        for kid in kids { let _child = _rm_tree(path + "/" + kid); }
+    }
+    let ok = false;
+    try { fs_remove(path); ok = true; } catch {}
+    return ok;
+}
+
+fn _mkdir_private(parent, name) {
+    let fs = Dir.open_absolute(parent, false, false);
+    assert(fs.ok, "open parent for private dir");
+    let created = Dir.mkdir_new(fs, name, false);
+    let closed = Dir.close(fs);
+    assert(created.ok and closed, "create private 0700 directory");
+    return parent + "/" + name;
+}
+
+fn _run_main(runtime, entry_path, data_dir, script_args, allow_exec) {
+    let prev_data = try env_get("PBLANG_READER_DATA_DIR") catch nil;
+    let prev_args = try env_get("PBLANG_SCRIPT_ARGS") catch nil;
+    env_set("PBLANG_READER_DATA_DIR", data_dir);
+    env_set("PBLANG_SCRIPT_ARGS", str_join(script_args, "\n"));
+    let argv = ["run", entry_path, "--allow-all", "--deny-net", "--deny-http", "--deny-spawn"];
+    if not allow_exec { array_push(argv, "--deny-exec"); }
+    let res = proc_spawn_wait(runtime, argv);
+    if prev_data == nil { env_set("PBLANG_READER_DATA_DIR", ""); }
+    else { env_set("PBLANG_READER_DATA_DIR", prev_data); }
+    if prev_args == nil { env_set("PBLANG_SCRIPT_ARGS", ""); }
+    else { env_set("PBLANG_SCRIPT_ARGS", prev_args); }
+    return res;
+}
+
+fn _run(scratch, repo, runtime, pkg_override) {
+    let base_root = if pkg_override != nil and pkg_override != "" { pkg_override } else { repo };
+    let main_src = fs_read(base_root + "/examples/declarative_browser/main.sapp");
+    let doc_src = fs_read(base_root + "/examples/declarative_browser/document_file.sapp");
+
+    // Static import separation check: document_file.sapp never imports presentation or store modules.
+    let doc_imports = PackageBuilder.imports(doc_src);
+    for raw in doc_imports {
+        assert(not str_contains(raw, "app.sapp") and not str_contains(raw, "settings_layout.sapp")
+            and not str_contains(raw, "appearance_store.sapp") and not str_contains(raw, "gui.sapp")
+            and not str_contains(raw, "graphics.sapp"), "document_file must stay presentation-free");
+    }
+    let main_imports = PackageBuilder.imports(main_src);
+    assert(len(main_imports) >= 5, "main.sapp imports tracked by package builder");
+
+    let data_dir = _mkdir_private(scratch, "data");
+    let profile_path = data_dir + "/reader-style/appearance-v1.json";
+    let good = scratch + "/valid.html";
+    let valid_html = "<article><h1>PRIVATE_TITLE</h1><p>Ελληνικό κείμενο.</p></article>";
+    fs_write(good, valid_html);
+    let original_bytes = fs_read_bytes(good);
+    let bad = scratch + "/invalid.html";
+    fs_write_bytes(bad, [255]);
+
+    // Create an isolated copy of examples/declarative_browser with poisoned GUI/store modules
+    // to prove runtime non-evaluation during admission checks and rejected GUI launches.
+    let isolated_dir = scratch + "/isolated_browser";
+    fs_mkdirs(isolated_dir);
+    for fname in fs_listdir(base_root + "/examples/declarative_browser") {
+        if str_ends_with(fname, ".sapp") {
+            fs_write(isolated_dir + "/" + fname, fs_read(base_root + "/examples/declarative_browser/" + fname));
+        }
+    }
+    fs_write(isolated_dir + "/app.sapp", "throw \"PRESENTATION_LOADED_DURING_ADMISSION\";\n");
+    fs_write(isolated_dir + "/settings_layout.sapp", "throw \"SETTINGS_LOADED_DURING_ADMISSION\";\n");
+    fs_write(isolated_dir + "/appearance_store.sapp", "throw \"STORE_LOADED_DURING_ADMISSION\";\n");
+
+    let real_entry = base_root + "/examples/declarative_browser/main.sapp";
+    let poisoned_entry = isolated_dir + "/main.sapp";
+    let observations = [];
+
+    // Case 1: valid --check-document --open
+    for entry in [real_entry, poisoned_entry] {
+        let p = _run_main(runtime, entry, data_dir, ["--check-document", "--open", good], false);
+        assert(p.exit_code == 0 and p.stderr == "", "valid admission exit");
+        let parsed = json_parse(str_trim(p.stdout));
+        assert(parsed.ok == true and parsed.format == "pblang.reader.document.v1"
+            and parsed.bytes == len(original_bytes) and parsed.blocks == 1, "valid admission payload");
+        assert(not str_contains(p.stdout + p.stderr, "PRIVATE_TITLE") and not str_contains(p.stdout + p.stderr, good), "no source or path disclosure");
+    }
+    array_push(observations, map{case: "valid", exit: 0, controller_modules: [], store_loaded: false});
+
+    // Case 2: invalid --check-document --open
+    for entry in [real_entry, poisoned_entry] {
+        let p = _run_main(runtime, entry, data_dir, ["--check-document", "--open", bad], false);
+        assert(p.exit_code == 1 and p.stderr == "", "invalid admission exit");
+        let parsed = json_parse(str_trim(p.stdout));
+        assert(parsed.ok == false and (parsed.code == "invalid_utf8" or parsed.code == "unsupported_document"), "invalid byte stream rejected");
+        assert(not str_contains(p.stdout + p.stderr, bad), "invalid path hidden");
+    }
+    array_push(observations, map{case: "invalid", exit: 1, controller_modules: [], store_loaded: false});
+
+    // Case 3: invalid-gui --gui-profile --open (must fail BEFORE loading app.sapp or appearance_store.sapp!)
+    for entry in [real_entry, poisoned_entry] {
+        let p = _run_main(runtime, entry, data_dir, ["--gui-profile", "--open", bad], true);
+        assert(p.exit_code == 1 and p.stderr == "", "invalid-gui exit");
+        assert(str_starts_with(str_trim(p.stdout), "Document unavailable or unsupported; no document or preferences changed."), "actionable invalid-gui diagnostic");
+    }
+    array_push(observations, map{case: "invalid-gui", exit: 1, controller_modules: [], store_loaded: false});
+
+    // Case 4: headless demo check (loads pages.sapp + session, still never opens GUI or profile store)
+    for entry in [real_entry, poisoned_entry] {
+        let p = _run_main(runtime, entry, data_dir, [], false);
+        assert(p.exit_code == 0 and p.stderr == "" and str_trim(p.stdout) == "declarative_browser_pass", "headless demo check");
+    }
+    array_push(observations, map{case: "demo", exit: 0, controller_modules: [], store_loaded: false});
+
+    // Prove poisoned app.sapp actually triggers when a valid GUI launch reaches presentation import.
+    let neg = _run_main(runtime, poisoned_entry, data_dir, ["--gui-session", "--open", good], false);
+    assert(neg.exit_code != 0 and str_contains(neg.stdout + neg.stderr, "PRESENTATION_LOADED_DURING_ADMISSION"), "GUI mode genuinely imports app.sapp after valid admission");
+
+    assert(not fs_exists(profile_path) and not fs_exists(data_dir + "/reader-style"), "no profile folder created");
+    assert(fs_read_bytes(good) == original_bytes and fs_read_bytes(bad) == [255], "input files untouched");
+
+    return map{
+        passed: true,
+        baseline: false,
+        headless: true,
+        no_profile_or_input_writes: true,
+        observations: observations
+    };
+}
+
+fn main() {
+    let cli = _parse_cli();
+    let repo = cwd();
+    let runtime = _resolve_runtime(cli.runtime, repo);
+    let scratch_name = "pblang_tooling_s3_adm_imports_" + str(num_floor(now_ms()));
+    let scratch = _mkdir_private("/tmp", scratch_name);
+    let result = try _run(scratch, repo, runtime, cli.package) catch nil;
+    let ok = result != nil;
+
+    if ok and cli.evidence != nil {
+        fs_mkdirs(cli.evidence);
+        fs_write(cli.evidence + "/acceptance.json", json_stringify(result) + "\n");
+    }
+    if ok and cli.report != nil {
+        fs_mkdirs(path_dirname(cli.report));
+        fs_write(cli.report, json_stringify(result) + "\n");
+    }
+    let _cleaned = _rm_tree(scratch);
+    assert(not fs_exists(scratch), "disposable scratch cleaned");
+    assert(ok, "reader_admission_imports verification failed");
+    print json_stringify(result);
+}
+
+main();

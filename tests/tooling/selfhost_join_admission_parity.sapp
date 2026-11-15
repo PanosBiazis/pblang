@@ -1,0 +1,233 @@
+// Pure PBLang parity verifier comparing str_join admission, Unicode/non-string
+// formatting, error preservation under secondary close faults, and all six
+// self-host execution routes (plain, optimized, pbcs x unbounded, bounded).
+
+let F = import("stdlib:compiler/selfhost_frontend.sapp");
+let V = import("stdlib:compiler/vm.sapp");
+let O = import("stdlib:compiler/optimizer.sapp");
+let P = import("stdlib:selfhost_pbck.sapp");
+
+fn _rm_rf(target) {
+    if not fs_exists(target) { return; }
+    let entries = try fs_listdir(target) catch nil;
+    if entries != nil {
+        for name in entries {
+            _rm_rf(target + "/" + name);
+        }
+    }
+    let _ok = try fs_remove(target) catch false;
+}
+
+fn _parse_cli() {
+    let args = os_args();
+    let runtime = cwd() + "/pblang";
+    let repo = cwd();
+    let report = "";
+    let start_idx = 0;
+    let count = 10;
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if a == "--runtime" and i + 1 < len(args) {
+            runtime = args[i + 1];
+            i = i + 1;
+        } elif a == "--repo" and i + 1 < len(args) {
+            repo = args[i + 1];
+            i = i + 1;
+        } elif a == "--report" and i + 1 < len(args) {
+            report = args[i + 1];
+            i = i + 1;
+        } elif a == "--start" and i + 1 < len(args) {
+            start_idx = num_floor(parse_number(args[i + 1]));
+            i = i + 1;
+        } elif a == "--count" and i + 1 < len(args) {
+            count = num_floor(parse_number(args[i + 1]));
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return map{ runtime: runtime, repo: repo, report: report, start: start_idx, count: count };
+}
+
+fn _extract_host_error(stderr) {
+    let s = str_trim(stderr);
+    if str_starts_with(s, "Runtime error: ") {
+        s = str_slice(s, 15, len(s));
+        let idx = str_index_of(s, " (at ");
+        if idx >= 0 {
+            s = str_slice(s, 0, idx);
+        }
+        return s;
+    }
+    let lines = str_split(s, "\n");
+    for line in lines {
+        let idx = str_index_of(line, "]: ");
+        if str_starts_with(line, "error[") and idx >= 0 {
+            return str_slice(line, idx + 3, len(line));
+        }
+    }
+    return s;
+}
+
+fn _run_host(runtime, script_path) {
+    let res = proc_spawn_wait(runtime, [
+        "run", script_path,
+        "--deny-net", "--deny-http", "--deny-exec",
+        "--deny-ffi", "--deny-spawn", "--deny-gfx", "--deny-sqlite"
+    ]);
+    return map{
+        exit: res.exit_code,
+        stdout: res.stdout,
+        error: if res.exit_code == 0 { nil } else { _extract_host_error(res.stderr) }
+    };
+}
+
+fn _format_vm_output(items) {
+    if len(items) == 0 { return ""; }
+    let lines = [];
+    for item in items {
+        push(lines, str(item));
+    }
+    return str_join(lines, "\n") + "\n";
+}
+
+fn _run_vm_core(code, ctx, bounded) {
+    let res = if bounded {
+        V.run_seeded_bounded(code, map{}, nil, ctx)
+    } else {
+        V.run_seeded(code, map{}, ctx)
+    };
+    V.close_execution(ctx);
+    return _format_vm_output(res.output);
+}
+
+fn _run_vm_route(source, mode, bounded) {
+    let compiled = F.frontend_compile(source);
+    assert(compiled.ok, "fixture compile: " + source);
+    let code = compiled.chunk;
+    if mode == "optimized" {
+        code = O.optimize_safe(code).chunk;
+    } elif mode == "pbcs" {
+        code = P.deserialize_chunk(P.serialize_chunk(code));
+    }
+    let ctx = V.execution_context(true);
+    let _seed = V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk, map{}, ctx);
+    let ok = true;
+    let out_str = "";
+    let err_str = "";
+    try {
+        out_str = _run_vm_core(code, ctx, bounded);
+    } catch e {
+        ok = false;
+        err_str = str(e);
+    }
+    return map{
+        exit: if ok { 0 } else { 1 },
+        stdout: out_str,
+        error: if ok { nil } else { err_str }
+    };
+}
+
+fn _run_secondary_close_fault(source) {
+    let ctx = V.execution_context(true);
+    let _seed = V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk, map{}, ctx);
+    ctx.memory.reclaimed = map{};
+    let ok = true;
+    let err_str = "";
+    try {
+        let _r = V.run_seeded(F.frontend_compile(source).chunk, map{}, ctx);
+    } catch e {
+        ok = false;
+        err_str = str(e);
+    }
+    return map{
+        exit: if ok { 0 } else { 1 },
+        stdout: "",
+        error: if ok { nil } else { err_str }
+    };
+}
+
+fn _execute_suite(cli, cases, scratch, rows) {
+    let native_file = scratch + "/native.sapp";
+    let modes = ["plain", "optimized", "pbcs"];
+    let bounds = [false, true];
+    let end_idx = cli.start + cli.count;
+    if end_idx > len(cases) { end_idx = len(cases); }
+
+    let idx = cli.start;
+    while idx < end_idx {
+        let entry = cases[idx];
+        let name = entry[0];
+        let source = entry[1];
+        let valid = entry[2];
+
+        fs_write(native_file, source);
+        let expected = _run_host(cli.runtime, native_file);
+        assert((expected.exit == 0) == valid, "host validity mismatch on " + name);
+
+        for mode in modes {
+            for bounded in bounds {
+                let actual = _run_vm_route(source, mode, bounded);
+                let passed = actual.exit == expected.exit and actual.stdout == expected.stdout and actual.error == expected.error;
+                assert(passed, "join parity mismatch on " + name + "/" + mode + "/" + str(bounded) + ": expected=" + json_stringify(expected) + " actual=" + json_stringify(actual));
+                push(rows, map{ case: name, mode: mode, bounded: bounded, passed: true });
+            }
+        }
+        idx = idx + 1;
+    }
+
+    if end_idx >= len(cases) {
+        let fault_src = "str_join(nil,\"x\");";
+        fs_write(native_file, fault_src);
+        let expected_fault = _run_host(cli.runtime, native_file);
+        let actual_fault = _run_secondary_close_fault(fault_src);
+        assert(actual_fault.exit != 0 and actual_fault.error == expected_fault.error, "first error must survive secondary close fault");
+        push(rows, map{ case: "first error survives cleanup fault", passed: true, error: actual_fault.error });
+    }
+
+    if cli.report != "" {
+        fs_write(cli.report, json_stringify(rows));
+    }
+}
+
+fn main() {
+    let cli = _parse_cli();
+    assert(fs_exists(cli.repo + "/stdlib/compiler/vm.sapp"), "repo stdlib/compiler/vm.sapp must exist");
+    let cases = [
+        ["join non-array", "str_join(nil,\"x\");", false],
+        ["join first bad argument", "str_join(map{},nil);", false],
+        ["join boxed array", "str_join(bigint(\"2\"),\"x\");", false],
+        ["join separator", "str_join([],nil);", false],
+        ["join boxed separator", "str_join([\"a\"],decimal(\"1\"));", false],
+        ["join generic operator", "let receiver=map{__add__:str_join};receiver+\"x\";", false],
+        ["join Unicode and empty", "print str_join([],\"x\");print str_join([\"\"],\"\");print str_join([\"α🙂\",\"á\"],\"λβ\");", true],
+        ["join non-string privacy", "print str_join([\"α\",nil,7,bigint(\"3\"),decimal(\"2\"),rational(1,2),[\"synthetic\"],map{data:\"hidden\"},false,\"🙂\"],\"|\");", true],
+        ["join caught error", "print (try str_join(nil,\"x\") catch false);", true],
+        ["join shadowed builtin", "fn str_join(a,b){return nil;}print str_join(nil,nil);", true]
+    ];
+
+    let scratch = "/tmp/pblang_tooling_s2_join_parity_" + str(now_ms());
+    fs_mkdirs(scratch);
+    let rows = [];
+    let err_msg = "";
+
+    try {
+        _execute_suite(cli, cases, scratch, rows);
+    } catch e {
+        err_msg = str(e);
+    }
+
+    _rm_rf(scratch);
+    if err_msg != "" {
+        throw err_msg;
+    }
+
+    print json_stringify(map{
+        runner: "tests/tooling/selfhost_join_admission_parity.sapp",
+        language: "PBLang",
+        passed: true,
+        checks: len(rows)
+    });
+}
+
+main();

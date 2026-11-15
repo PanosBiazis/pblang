@@ -1,0 +1,183 @@
+// Pure PBLang test for examples/uno_r4_led_studio/device_adapter.ino.
+// Validates the thin Arduino UNO R4 WiFi SDK boundary against generated firmware
+// under both USB CDC (pb_writable()==4) and UART1 bridge NO_USB (pb_writable()==1).
+
+fn _script_args() {
+    let raw = os_args();
+    let out = [];
+    let i = 0;
+    let skip_self = true;
+    while i < len(raw) {
+        let a = raw[i];
+        if a == "run" or a == "--allow-all" or str_starts_with(a, "--allow-") or str_starts_with(a, "--deny-") {
+            i = i + 1;
+        } elif a == "--" {
+            i = i + 1;
+            while i < len(raw) {
+                array_push(out, raw[i]);
+                i = i + 1;
+            }
+        } elif skip_self and str_ends_with(a, ".sapp") {
+            skip_self = false;
+            i = i + 1;
+        } else {
+            array_push(out, a);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn _join(arr, sep) {
+    let out = "";
+    let i = 0;
+    while i < len(arr) {
+        if i > 0 { out = out + sep; }
+        out = out + arr[i];
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _mktemp_dir(prefix) {
+    let r = proc_spawn_wait("/usr/bin/mktemp", ["-d", "/tmp/" + prefix + "-XXXXXX"]);
+    assert(r.exit_code == 0, "mktemp failed: " + r.stderr);
+    return str_trim(r.stdout);
+}
+
+fn _mock_arduino_h() {
+    let lines = [
+        "#pragma once",
+        "#include <cstdint>",
+        "#include <deque>",
+        "#include <string>",
+        "#define ARDUINO_UNOR4_WIFI 1",
+        "static uint32_t mock_millis_val = 0;",
+        "inline uint32_t millis() { return mock_millis_val; }",
+        "struct MockSerial {",
+        "    std::deque<unsigned char> input;",
+        "    std::string output;",
+        "    void begin(unsigned long) {}",
+        "    int available() { return (int)input.size(); }",
+        "    int read() { if (input.empty()) return -1; auto c = input.front(); input.pop_front(); return (int)c; }",
+        "#ifdef NO_USB",
+        "    int availableForWrite() { return 0; }",
+        "#else",
+        "    int availableForWrite() { return 4; }",
+        "#endif",
+        "    size_t write(uint8_t v) { output.push_back((char)v); return 1; }",
+        "};",
+        "static MockSerial Serial;"
+    ];
+    return _join(lines, "\n") + "\n";
+}
+
+fn _mock_matrix_h() {
+    let lines = [
+        "#pragma once",
+        "#include <cstdint>",
+        "struct ArduinoLEDMatrix {",
+        "    uint32_t last_words[3] = {0, 0, 0};",
+        "    bool begin() { return true; }",
+        "    void clear() { last_words[0] = last_words[1] = last_words[2] = 0; }",
+        "    void loadFrame(const uint32_t w[3]) { last_words[0] = w[0]; last_words[1] = w[1]; last_words[2] = w[2]; }",
+        "};"
+    ];
+    return _join(lines, "\n") + "\n";
+}
+
+fn _harness_cpp(adapter_abs) {
+    let lines = [
+        "#include <cassert>",
+        "#include <iostream>",
+        "#include <string>",
+        "#include \"" + adapter_abs + "\"",
+        "int main() {",
+        "    setup();",
+        "#ifdef NO_USB",
+        "    assert(Serial.availableForWrite() == 0 && pb_writable() == 1);",
+        "#else",
+        "    assert(Serial.availableForWrite() == 4 && pb_writable() == 4);",
+        "#endif",
+        "    for (unsigned char c : std::string(\"HELLO 1234567890abcdef\\n\")) { Serial.input.push_back(c); }",
+        "    for (int i = 0; i < 100; i++) { loop(); }",
+        "    assert(Serial.output.find(\"\\\"command\\\":\\\"HELLO\\\"\") != std::string::npos);",
+        "    assert(Serial.output.find(\"\\\"ok\\\":true\") != std::string::npos);",
+        "    assert(!Serial.output.empty() && Serial.output.back() == '\\n');",
+        "    return 0;",
+        "}"
+    ];
+    return _join(lines, "\n") + "\n";
+}
+
+fn _rm_tree(dir) {
+    if not fs_exists(dir) { return nil; }
+    let items = try fs_listdir(dir) catch [];
+    let i = 0;
+    while i < len(items) {
+        let p = dir + "/" + items[i];
+        try fs_remove(p) catch nil;
+        i = i + 1;
+    }
+    try fs_remove(dir) catch nil;
+    return nil;
+}
+
+fn main() {
+    let cli = _script_args();
+    let adapter_src = fs_read("examples/uno_r4_led_studio/device_adapter.ino");
+    assert(str_contains(adapter_src, "#if defined(NO_USB)"), "NO_USB guard present in adapter");
+    assert(str_contains(adapter_src, "#include \"pblang_firmware.h\""), "firmware include present");
+
+    let M = import("../../examples/uno_r4_led_studio/model.sapp");
+    let D = import("../../examples/uno_r4_led_studio/device_export.sapp");
+    let state = M.create();
+    M.apply(state, "add");
+    M.apply(state, "preset", "border");
+    M.apply(state, "timing_all", 1000);
+    let plan = D.plan(state.document, 2);
+    let lowered = D.lower(plan, fs_read("examples/uno_r4_led_studio/device_firmware.sapp"));
+
+    let tmp_dir = _mktemp_dir("pbled-adapter-check");
+    fs_write(tmp_dir + "/Arduino.h", _mock_arduino_h());
+    fs_write(tmp_dir + "/Arduino_LED_Matrix.h", _mock_matrix_h());
+    fs_write(tmp_dir + "/pblang_firmware.h", lowered.c_source);
+    fs_write(tmp_dir + "/device_adapter.ino", adapter_src);
+    fs_write(tmp_dir + "/harness.cpp", _harness_cpp(tmp_dir + "/device_adapter.ino"));
+
+    let cxx = "/usr/bin/c++";
+    if fs_exists(cxx) {
+        let extra_usb = [];
+        if len(cli) > 0 and cli[0] == "--no-usb" {
+            extra_usb = ["-DNO_USB"];
+        }
+        // Verify default USB CDC mode
+        let c1 = proc_spawn_wait(cxx, ["-std=c++17", "-Wall", "-Wextra", "-Werror", "-I", tmp_dir, tmp_dir + "/harness.cpp", "-o", tmp_dir + "/test_usb"]);
+        if c1.exit_code != 0 {
+            _rm_tree(tmp_dir);
+            error("c++ USB compile failed: " + c1.stderr);
+        }
+        let r1 = proc_spawn_wait(tmp_dir + "/test_usb", []);
+        if r1.exit_code != 0 {
+            _rm_tree(tmp_dir);
+            error("USB adapter test failed: " + r1.stderr);
+        }
+        // Verify UNO R4 WiFi NO_USB UART1 bridge mode
+        let c2_args = ["-std=c++17", "-Wall", "-Wextra", "-Werror", "-DNO_USB", "-I", tmp_dir, tmp_dir + "/harness.cpp", "-o", tmp_dir + "/test_nousb"];
+        if len(extra_usb) > 0 { c2_args = c2_args; }
+        let c2 = proc_spawn_wait(cxx, c2_args);
+        if c2.exit_code != 0 {
+            _rm_tree(tmp_dir);
+            error("c++ NO_USB compile failed: " + c2.stderr);
+        }
+        let r2 = proc_spawn_wait(tmp_dir + "/test_nousb", []);
+        if r2.exit_code != 0 {
+            _rm_tree(tmp_dir);
+            error("NO_USB adapter test failed: " + r2.stderr);
+        }
+    }
+    _rm_tree(tmp_dir);
+    print("uno_r4_actual_adapter_hello_pass");
+}
+
+main();

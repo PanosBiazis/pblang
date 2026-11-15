@@ -1,0 +1,401 @@
+// JSON number/grammar binary64 byte oracle, roundtrip, strict parse_exact
+// error-ordering, malformed diagnostic parity, and bounded scale checks
+// for stdlib/json_decode.sapp and stdlib/json.sapp in pure PBLang.
+
+let SECURE = import("stdlib:secure_file.sapp");
+
+fn _rm_tree(path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            _rm_tree(path + "/" + entries[i]);
+            i = i + 1;
+        }
+    }
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _resolve_candidate_bin(candidate_arg, repo_root) {
+    if candidate_arg != "" {
+        if fs_exists(candidate_arg + "/bin/pblang") { return candidate_arg + "/bin/pblang"; }
+        if fs_exists(candidate_arg + "/target/release/pblang") { return candidate_arg + "/target/release/pblang"; }
+        if fs_exists(candidate_arg + "/pblang") { return candidate_arg + "/pblang"; }
+        if fs_exists(candidate_arg) { return candidate_arg; }
+    }
+    if fs_exists(repo_root + "/target/release/pblang") {
+        return repo_root + "/target/release/pblang";
+    }
+    return repo_root + "/pblang";
+}
+
+fn _extract_error(stderr_text) {
+    let lines = str_split(stderr_text, "\n");
+    let i = 0;
+    while i < len(lines) {
+        let ln = str_trim(lines[i]);
+        if str_starts_with(ln, "error[") {
+            let idx = str_index_of(ln, "]: ");
+            if idx >= 0 {
+                return str_slice(ln, idx + 3, len(ln));
+            }
+        }
+        if str_starts_with(ln, "Runtime error: ") {
+            let rest = str_slice(ln, 15, len(ln));
+            let at_idx = str_index_of(rest, " (at ");
+            if at_idx >= 0 {
+                return str_slice(rest, 0, at_idx);
+            }
+            return rest;
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _repeat_str(s, count) {
+    if count <= 0 { return ""; }
+    let parts = [];
+    let i = 0;
+    while i < count {
+        array_push(parts, s);
+        i = i + 1;
+    }
+    return str_join(parts, "");
+}
+
+fn _build_oracle_cases() {
+    // Explicit IEEE-754 binary64 little-endian byte oracles + deterministic LCG vectors.
+    let explicit = [
+        map{ text: "0", bytes: [0, 0, 0, 0, 0, 0, 0, 0] },
+        map{ text: "-0", bytes: [0, 0, 0, 0, 0, 0, 0, 128] },
+        map{ text: "0.0", bytes: [0, 0, 0, 0, 0, 0, 0, 0] },
+        map{ text: "-0.0", bytes: [0, 0, 0, 0, 0, 0, 0, 128] },
+        map{ text: "0e999", bytes: [0, 0, 0, 0, 0, 0, 0, 0] },
+        map{ text: "-0e-999", bytes: [0, 0, 0, 0, 0, 0, 0, 128] },
+        map{ text: "0.1", bytes: num_to_le_bytes(parse_number("0.1")) },
+        map{ text: "0.10000000000000001", bytes: num_to_le_bytes(parse_number("0.10000000000000001")) },
+        map{ text: "0.10000000000000002", bytes: num_to_le_bytes(parse_number("0.10000000000000002")) },
+        map{ text: "0.1000000000000000055511151231257827021181583404541015625", bytes: num_to_le_bytes(parse_number("0.1000000000000000055511151231257827021181583404541015625")) },
+        map{ text: "1.2345678901234567", bytes: num_to_le_bytes(parse_number("1.2345678901234567")) },
+        map{ text: "1.7976931348623157e308", bytes: [255, 255, 255, 255, 255, 255, 239, 127] },
+        map{ text: "2.2250738585072014e-308", bytes: [0, 0, 0, 0, 0, 0, 16, 0] },
+        map{ text: "2.2250738585072011e-308", bytes: [255, 255, 255, 255, 255, 255, 15, 0] },
+        map{ text: "5e-324", bytes: [1, 0, 0, 0, 0, 0, 0, 0] },
+        map{ text: "2e-324", bytes: [0, 0, 0, 0, 0, 0, 0, 0] },
+        map{ text: "3e-324", bytes: [1, 0, 0, 0, 0, 0, 0, 0] },
+        map{ text: "1e-400", bytes: [0, 0, 0, 0, 0, 0, 0, 0] },
+        map{ text: "-1e-400", bytes: [0, 0, 0, 0, 0, 0, 0, 128] }
+    ];
+
+    let boundaries = [
+        "4503599627370495", "4503599627370496",
+        "9007199254740990", "9007199254740991",
+        "9007199254740992", "9007199254740993", "9007199254740994"
+    ];
+    let bi = 0;
+    while bi < len(boundaries) {
+        let bstr = boundaries[bi];
+        let signs = ["", "-"];
+        let si = 0;
+        while si < len(signs) {
+            let sg = signs[si];
+            let forms = [sg + bstr, sg + bstr + ".0", sg + bstr + ".00", sg + bstr + "e0", sg + bstr + "0e-1"];
+            let fi = 0;
+            while fi < len(forms) {
+                let fm = forms[fi];
+                array_push(explicit, map{ text: fm, bytes: num_to_le_bytes(parse_number(fm)) });
+                fi = fi + 1;
+            }
+            si = si + 1;
+        }
+        bi = bi + 1;
+    }
+
+    let extras = ["1", "-1", "999999999999999", "-999999999999999", "1000000000000000"];
+    let ei = 0;
+    while ei < len(extras) {
+        let ex = extras[ei];
+        array_push(explicit, map{ text: ex, bytes: num_to_le_bytes(parse_number(ex)) });
+        ei = ei + 1;
+    }
+
+    // Add deterministic pseudo-random integers and rational decimals up to 160 vectors.
+    let seed = 110021;
+    while len(explicit) < 160 {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        let v = seed - 1073741824;
+        let t = if len(explicit) % 2 == 0 {
+            str(v)
+        } else {
+            str(v) + "." + str(seed % 10000)
+        };
+        array_push(explicit, map{ text: t, bytes: num_to_le_bytes(parse_number(t)) });
+    }
+    return explicit;
+}
+
+fn main() {
+    let raw_args = os_args();
+    let candidate_arg = "";
+    let report_arg = "";
+    let group_arg = "";
+    let start_idx = 0;
+    let count_val = -1;
+    let i = 0;
+    while i < len(raw_args) {
+        let a = raw_args[i];
+        if a == "--candidate" and i + 1 < len(raw_args) {
+            candidate_arg = raw_args[i + 1];
+            i = i + 1;
+        } elif a == "--report" and i + 1 < len(raw_args) {
+            report_arg = raw_args[i + 1];
+            i = i + 1;
+        } elif a == "--group" and i + 1 < len(raw_args) {
+            group_arg = raw_args[i + 1];
+            i = i + 1;
+        } elif a == "--start" and i + 1 < len(raw_args) {
+            start_idx = num_floor(parse_number(raw_args[i + 1]));
+            i = i + 1;
+        } elif a == "--count" and i + 1 < len(raw_args) {
+            count_val = num_floor(parse_number(raw_args[i + 1]));
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+
+    let repo_root = cwd();
+    let stdlib_root = if candidate_arg != "" and fs_exists(candidate_arg + "/stdlib") {
+        candidate_arg + "/stdlib"
+    } else {
+        repo_root + "/stdlib"
+    };
+    let bin_path = _resolve_candidate_bin(candidate_arg, repo_root);
+    assert(fs_exists(bin_path), "json_number_roundtrip: candidate binary missing");
+
+    let scratch = "/tmp/pblang_tooling_s1_json_rt_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(scratch).ok, "create private scratch");
+
+    let dec_stage = scratch + "/json_decode.sapp";
+    let json_stage = scratch + "/json.sapp";
+    fs_write(dec_stage, fs_read(stdlib_root + "/json_decode.sapp"));
+    let json_mod_src = str_replace_all(
+        fs_read(stdlib_root + "/json.sapp"),
+        "import(\"stdlib:json_decode.sapp\")",
+        "import(" + json_stringify(dec_stage) + ")"
+    );
+    fs_write(json_stage, json_mod_src);
+
+    let prev_prof = env_get("PBLANG_CHECK_PROFILE");
+    let prev_sargs = env_get("PBLANG_SCRIPT_ARGS");
+    env_set("PBLANG_CHECK_PROFILE", "");
+    env_set("PBLANG_SCRIPT_ARGS", "");
+
+    let rows = [];
+    let prefix = "let D=import(" + json_stringify(dec_stage) + ");let J=import(" + json_stringify(json_stage) + ");\n";
+
+    let run_child = fn(source, document_opt) {
+        let main_path = scratch + "/main.sapp";
+        let in_path = scratch + "/input.json";
+        fs_write(main_path, source);
+        if document_opt != nil {
+            fs_write(in_path, document_opt);
+        }
+        let t0 = now_ms();
+        let p = proc_spawn_wait(bin_path, [
+            "run", main_path,
+            "--deny-net", "--deny-http", "--deny-exec", "--deny-ffi", "--deny-spawn", "--deny-gfx", "--deny-sqlite"
+        ]);
+        return map{
+            exit: p.exit_code,
+            stdout: p.stdout,
+            stderr: p.stderr,
+            error: _extract_error(p.stderr),
+            seconds: (now_ms() - t0) / 1000.0
+        };
+    };
+
+    let record_row = fn(label, passed, detail) {
+        array_push(rows, map{ label: label, passed: passed, exit: detail.exit, error: detail.error, seconds: detail.seconds });
+        if not passed {
+            print "FAIL_JSON_RT: " + label + " exit=" + str(detail.exit) + " err=" + str(detail.error) + " stderr=" + str_slice(detail.stderr, 0, 240);
+        }
+        assert(passed, "json_number_roundtrip failed: " + label);
+    };
+
+    let groups = if group_arg != "" {
+        [group_arg]
+    } else {
+        ["numbers", "arrays", "exact-diagnostics", "diagnostics", "scale"]
+    };
+
+    let run_groups = fn() {
+        let oracle_cases = _build_oracle_cases();
+        let oracle_file = scratch + "/oracles.json";
+        fs_write(oracle_file, json_stringify(oracle_cases));
+        let gi = 0;
+        while gi < len(groups) {
+            let g = groups[gi];
+            if g == "numbers" {
+                let src_n = prefix
+                    + "let cases = json_parse(fs_read(" + json_stringify(oracle_file) + "));\n"
+                    + "for c in cases {\n"
+                    + "    let v = D.parse(c.text);\n"
+                    + "    assert(num_to_le_bytes(v) == c.bytes, \"oracle \" + c.text);\n"
+                    + "    if c.bytes != [0,0,0,0,0,0,0,128] {\n"
+                    + "        assert(num_to_le_bytes(J.parse(J.stringify(v))) == c.bytes, \"roundtrip \" + c.text);\n"
+                    + "    }\n"
+                    + "}\n"
+                    + "print \"json_oracle_pass\";\n";
+                let rn = run_child(src_n, nil);
+                record_row("decimal/exponent/binary64 byte oracles and roundtrips", rn.exit == 0 and str_contains(rn.stdout, "json_oracle_pass"), rn);
+            } elif g == "arrays" {
+                let src_a = prefix
+                    + "let cases = json_parse(fs_read(" + json_stringify(oracle_file) + "));\n"
+                    + "for c in cases {\n"
+                    + "    let v = D.parse(\"[\" + c.text + \",\" + c.text + \",null,[\" + c.text + \",\" + c.text + \"],\" + c.text + \",\" + c.text + \"]\");\n"
+                    + "    for n in [v[0], v[1], v[3][0], v[3][1], v[4], v[5]] {\n"
+                    + "        assert(num_to_le_bytes(n) == c.bytes, \"array oracle \" + c.text);\n"
+                    + "    }\n"
+                    + "}\n"
+                    + "print \"json_oracle_pass\";\n";
+                let ra = run_child(src_a, nil);
+                record_row("array vectors with six binary64 comparisons each", ra.exit == 0 and str_contains(ra.stdout, "json_oracle_pass"), ra);
+            } elif g == "exact-diagnostics" {
+                let prec = "number is not exactly representable as binary64";
+                let exp_msg = "exponent outside -4096..4096";
+                let tok_msg = "numeric token exceeds 1024 characters";
+                let long_tok = "0." + _repeat_str("0", 1023);
+                let ex_cases = [
+                    map{ doc: "[0.1,0.1]", msg: prec },
+                    map{ doc: "[0e-4097,0e-4097]", msg: exp_msg },
+                    map{ doc: "[" + long_tok + "," + long_tok + "]", msg: tok_msg },
+                    map{ doc: "[0.1,[0e-4097],0.1]", msg: prec },
+                    map{ doc: "[0e-4097,[0.1],0e-4097]", msg: exp_msg },
+                    map{ doc: "[0.1,{\"x\":0e-4097},0.1]", msg: prec },
+                    map{ doc: "[0.1,0.5,0.5]", msg: prec },
+                    map{ doc: "[0.1,true,0.1]", msg: prec },
+                    map{ doc: "[0.1,null,0.1]", msg: prec },
+                    map{ doc: "[0.1,\"0.1\",0.1]", msg: prec }
+                ];
+                let exi = 0;
+                while exi < len(ex_cases) {
+                    let ec = ex_cases[exi];
+                    let rex = run_child(prefix + "D.parse_exact(" + json_stringify(ec.doc) + ");\n", nil);
+                    let expected_err = "json.parse_exact: " + ec.msg;
+                    let ok_ex = rex.exit == 1 and rex.error != nil and str_ends_with(rex.error, expected_err);
+                    record_row("strict error ordering " + str(exi), ok_ex, rex);
+                    exi = exi + 1;
+                }
+            } elif g == "diagnostics" {
+                // Batch malformed JSON inputs inside a single child process for fast verification
+                // (or slice by --start/--count when explicitly requested).
+                let raw_bad = [
+                    "", " ", "[", "{", "[1,]", "{\"a\":1,}", "01", "-01", "+1", ".1", "1.",
+                    "1e", "1e+", "--1", "NaN", "Infinity", "1e309", "-1e309", "{\"n\":1e999}",
+                    "[0,\n1e999]", "{1:2}", "{-1.2e2:0}", "{\"a\":0,2:1}", "{\"1\":2,1:3}",
+                    "{\"a\" 1}", "true false", "[1 2]", "\"\\x20\"", "\"a\nb\"", "\"unterminated",
+                    "\"bad\\\"", "{\"n\":1e999,}", "{\"x\":01}", "1e9999x", "{\"a\":0} trailing",
+                    "[null, false,, 2]", "[\"x\",+2]", "{\"x\":1e9999,\"x\":1}", "{\"x\":1,\"x\":1e9999}",
+                    "{\"x\":-1e9999,\"x\":1}"
+                ];
+                let d_start = start_idx;
+                let d_cnt = if count_val > 0 { count_val } else { len(raw_bad) };
+                let sub_bad = [];
+                let di = d_start;
+                while di < len(raw_bad) and di < d_start + d_cnt {
+                    array_push(sub_bad, raw_bad[di]);
+                    di = di + 1;
+                }
+                let diag_src = prefix
+                    + "let bads = " + json_stringify(sub_bad) + ";\n"
+                    + "for b in bads {\n"
+                    + "    let f1 = fn() { let _x = json_parse(b); return false; };\n"
+                    + "    let f2 = fn() { let _y = D.parse(b); return false; };\n"
+                    + "    assert((try f1() catch true) and (try f2() catch true), \"both reject \" + b);\n"
+                    + "}\n"
+                    + "let non_strs: any = [nil, true, 7, [], map{}];\n"
+                    + "for ns in non_strs {\n"
+                    + "    let g1 = fn() { let _x = json_parse(ns); return false; };\n"
+                    + "    let g2 = fn() { let _y = D.parse(ns); return false; };\n"
+                    + "    assert((try g1() catch true) and (try g2() catch true), \"non-string rejected\");\n"
+                    + "}\n"
+                    + "print \"json_diag_pass\";\n";
+                let rd = run_child(diag_src, nil);
+                record_row("malformed and non-string diagnostic parity", rd.exit == 0 and str_contains(rd.stdout, "json_diag_pass"), rd);
+            } elif g == "scale" {
+                let full_scale = group_arg == "scale";
+                let str_len = if full_scale { 2097150 } else { 65536 };
+                let arr_cnt = if full_scale { 1048575 } else { 4096 };
+                let bnd_cnt = if full_scale { 110376 } else { 2048 };
+                let mix_reps = if full_scale { 16384 } else { 512 };
+                let in_file = scratch + "/input.json";
+
+                let scale_cases = [
+                    map{
+                        label: "large string",
+                        doc: "\"" + _repeat_str("x", str_len) + "\"",
+                        chk: "assert(len(v)==" + str(str_len) + ",\"string size\");"
+                    },
+                    map{
+                        label: "dense numeric array",
+                        doc: "[" + _repeat_str("0,", arr_cnt - 1) + "0]",
+                        chk: "assert(len(v)==" + str(arr_cnt) + " and v[0]==0 and v[" + str(arr_cnt - 1) + "]==0,\"dense array\");"
+                    },
+                    map{
+                        label: "leading whitespace",
+                        doc: _repeat_str(" ", str_len) + "0",
+                        chk: "assert(v==0,\"whitespace\");"
+                    },
+                    map{
+                        label: "decimal boundary array",
+                        doc: "[" + _repeat_str("9007199254740991.0,", bnd_cnt - 1) + "9007199254740991.0]",
+                        chk: "assert(len(v)==" + str(bnd_cnt) + " and v[0]==parse_number(\"9007199254740991\"),\"boundaries\");"
+                    },
+                    map{
+                        label: "mixed numeric cells",
+                        doc: "[" + _repeat_str("0.1,9007199254740991.0,-1e-400,0,", mix_reps - 1) + "0.1,9007199254740991.0,-1e-400,0]",
+                        chk: "assert(len(v)==" + str(mix_reps * 4) + " and v[1]==parse_number(\"9007199254740991\") and num_to_le_bytes(v[2])==[0,0,0,0,0,0,0,128],\"mixed cells\");"
+                    },
+                    map{
+                        label: "126 array levels",
+                        doc: _repeat_str("[", 126) + "9007199254740991.0" + _repeat_str("]", 126),
+                        chk: "let depth=0;while is_array(v) {v=v[0];depth=depth+1;}assert(depth==126 and v==parse_number(\"9007199254740991\"),\"near depth limit\");"
+                    }
+                ];
+
+                let s_start = if full_scale { start_idx } else { 0 };
+                let s_cnt = if full_scale and count_val > 0 { count_val } else { len(scale_cases) };
+                let sci = s_start;
+                while sci < len(scale_cases) and sci < s_start + s_cnt {
+                    let sc = scale_cases[sci];
+                    let rsc = run_child(
+                        prefix + "let v=D.parse(fs_read(" + json_stringify(in_file) + "));" + sc.chk + "print \"json_scale_pass\";\n",
+                        sc.doc
+                    );
+                    record_row(sc.label, rsc.exit == 0 and str_contains(rsc.stdout, "json_scale_pass") and rsc.seconds < 30.0, rsc);
+                    sci = sci + 1;
+                }
+            }
+            gi = gi + 1;
+        }
+        return true;
+    };
+
+    let ok = try run_groups() catch false;
+    if prev_prof != nil { env_set("PBLANG_CHECK_PROFILE", prev_prof); }
+    if prev_sargs != nil { env_set("PBLANG_SCRIPT_ARGS", prev_sargs); }
+    _rm_tree(scratch);
+    assert(not fs_exists(scratch), "json_number_roundtrip scratch cleaned up");
+
+    if report_arg != "" {
+        let pdir = path_dirname(report_arg);
+        if pdir != "" and pdir != "." { fs_mkdirs(pdir); }
+        fs_write(report_arg, json_stringify(rows) + "\n");
+    }
+
+    assert(ok and len(rows) > 0, "json_number_roundtrip failed");
+    print "json_number_roundtrip_pass: rows=" + str(len(rows));
+}
+
+main();

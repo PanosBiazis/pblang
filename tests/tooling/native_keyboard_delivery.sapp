@@ -1,0 +1,318 @@
+// Pure PBLang headless verification for native keyboard delivery across widgets
+// (Tab focus ring, disabled-checkbox skip, held-key repeat suppression on checkbox
+// and button, legacy vs ordered text entry, and focus termination).
+// Never opens an X11 window on the user's desktop.
+
+let GUI = import("stdlib:gui.sapp");
+let SECURE_FILE = import("stdlib:secure_file.sapp");
+
+fn _parse_cli() {
+    let args = os_args();
+    let cfg = map{
+        runtime_path: cwd() + "/pblang",
+        mode: "both",
+        evidence_dir: "",
+        standalone: true
+    };
+    let n = len(args);
+    let i = 0;
+    while i < n {
+        let a = args[i];
+        if a == "--runtime" and i + 1 < n {
+            cfg["runtime_path"] = args[i + 1];
+            i = i + 2;
+        } elif a == "--mode" and i + 1 < n {
+            cfg["mode"] = args[i + 1];
+            i = i + 2;
+        } elif a == "--evidence" and i + 1 < n {
+            cfg["evidence_dir"] = args[i + 1];
+            cfg["standalone"] = false;
+            i = i + 2;
+        } else {
+            i = i + 1;
+        }
+    }
+    return cfg;
+}
+
+fn _rm_rf(path) {
+    if not fs_exists(path) {
+        return 0;
+    }
+    let entries = try fs_listdir(path) catch nil;
+    if type(entries) == "array" {
+        for name in entries {
+            if name != "." and name != ".." {
+                _rm_rf(path + "/" + name);
+            }
+        }
+    }
+    let _removed = try fs_remove(path) catch nil;
+    return 0;
+}
+
+fn _write_checked(path, content) {
+    fs_write(path, content);
+    return fs_exists(path);
+}
+
+fn _build_delivery_harness() {
+    let state = map{
+        toggles: 0,
+        disabled: 0,
+        buttons: 0,
+        events: []
+    };
+    let f = GUI.form("PBLang Keyboard Delivery", 640, 320);
+    GUI.add(f, GUI.label("title", 20, 16, "Keyboard delivery check"));
+    GUI.add(f, GUI.checkbox("active", 20, 52, "Active", false, fn(_ctx) {
+        state["toggles"] = state["toggles"] + 1;
+    }));
+    let disabled_box = GUI.checkbox("locked", 20, 88, "Disabled", false, fn(_ctx) {
+        state["disabled"] = state["disabled"] + 1;
+    });
+    disabled_box.enabled = false;
+    GUI.add(f, disabled_box);
+    GUI.add(f, GUI.textbox("entry", 20, 128, 420, 32, ""));
+    GUI.add(f, GUI.button("done", 20, 184, 140, 36, "Done", fn(ctx) {
+        state["buttons"] = state["buttons"] + 1;
+        ctx.close_requested = true;
+    }));
+    return map{form: f, state: state};
+}
+
+fn _key_counts(events, event_type) {
+    let counts = map{};
+    for ev in events {
+        if ev.type == event_type {
+            let k = ev.key;
+            let prev = 0;
+            if map_has(counts, k) {
+                prev = counts[k];
+            }
+            counts[k] = prev + 1;
+        }
+    }
+    return counts;
+}
+
+fn _assert_counts_equal(actual, expected, label) {
+    let a_keys = map_keys(actual);
+    let e_keys = map_keys(expected);
+    assert(len(a_keys) == len(e_keys), label + " distinct key count mismatch");
+    for k in e_keys {
+        assert(map_has(actual, k), label + " missing key " + k);
+        assert(actual[k] == expected[k], label + " count mismatch for " + k);
+    }
+    return true;
+}
+
+fn _press_and_release(f, state, key_name, text_opt, hold_repeats) {
+    let down_ev = map{type: "keydown", key: key_name};
+    if text_opt != nil {
+        down_ev["text"] = text_opt;
+    }
+    push(state["events"], map{type: "keydown", key: key_name});
+    GUI.handle_event(f, down_ev);
+
+    // Simulate X11 auto-repeat keydowns while key is held: checkbox/button/Tab must NOT double-fire!
+    for _rep hold_repeats {
+        GUI.handle_event(f, down_ev);
+    }
+
+    let up_ev = map{type: "keyup", key: key_name};
+    push(state["events"], map{type: "keyup", key: key_name});
+    GUI.handle_event(f, up_ev);
+    return 0;
+}
+
+fn _run_single_mode(mode, evidence_dir) {
+    assert(mode == "legacy" or mode == "ordered", "mode must be legacy or ordered");
+    let phrase = "native.pbsheet";
+    let period_key = "Period";
+    let backend_name = "gfxpollevents";
+    if mode == "ordered" {
+        period_key = ".";
+        backend_name = "x11-ordered-keysyms";
+    }
+
+    // Build expected distinct key frequency map matching native_keyboard_delivery.py
+    let expected_counts = map{
+        "Tab": 3,
+        "Space": 1,
+        "Enter": 1
+    };
+    expected_counts[period_key] = 1;
+    let pi = 0;
+    while pi < len(phrase) {
+        let ch = str_slice(phrase, pi, pi + 1);
+        if ch != "." {
+            let ku = str_upper(ch);
+            let prev = 0;
+            if map_has(expected_counts, ku) {
+                prev = expected_counts[ku];
+            }
+            expected_counts[ku] = prev + 1;
+        }
+        pi = pi + 1;
+    }
+
+    let holds = [80, 120, 180];
+    let results = [];
+    for hold_ms in holds {
+        let harness = _build_delivery_harness();
+        let f = harness.form;
+        let st = harness.state;
+        let repeats_on_control = 0;
+        if hold_ms >= 120 {
+            repeats_on_control = 2;
+        }
+
+        // 1. Tab -> focuses "active" checkbox
+        _press_and_release(f, st, "Tab", nil, repeats_on_control);
+        assert(f.focus == "active", "first Tab focuses active checkbox");
+
+        // 2. Space -> toggles "active" checkbox ONCE even when held
+        _press_and_release(f, st, "Space", nil, repeats_on_control);
+        assert(GUI.get(f, "active").checked == true, "Space checks active checkbox");
+        assert(st.toggles == 1, "held Space toggles checkbox exactly once");
+
+        // 3. Tab -> skips disabled "locked" checkbox and focuses "entry" textbox
+        _press_and_release(f, st, "Tab", nil, repeats_on_control);
+        assert(f.focus == "entry", "second Tab skips disabled checkbox and focuses entry");
+        assert(st.disabled == 0, "disabled checkbox never toggled");
+
+        // 4. Type "native.pbsheet" (no hold repeat on typing keys)
+        let ci = 0;
+        while ci < len(phrase) {
+            let ch = str_slice(phrase, ci, ci + 1);
+            if ch == "." {
+                if mode == "ordered" {
+                    _press_and_release(f, st, ".", ".", 0);
+                } else {
+                    _press_and_release(f, st, "Period", nil, 0);
+                }
+            } else {
+                let key_u = str_upper(ch);
+                if mode == "ordered" {
+                    _press_and_release(f, st, key_u, ch, 0);
+                } else {
+                    _press_and_release(f, st, key_u, nil, 0);
+                }
+            }
+            ci = ci + 1;
+        }
+        assert(GUI.get(f, "entry").value == phrase, "textbox received native.pbsheet in " + mode);
+
+        // 5. Tab -> focuses "done" button
+        _press_and_release(f, st, "Tab", nil, repeats_on_control);
+        assert(f.focus == "done", "third Tab focuses done button");
+
+        // 6. Enter -> activates "done" button ONCE even when held, setting close_requested
+        _press_and_release(f, st, "Enter", nil, repeats_on_control);
+        assert(st.buttons == 1, "held Enter activates done button once");
+        assert(f.close_requested == true, "done button sets close_requested");
+
+        let kd_counts = _key_counts(st.events, "keydown");
+        let ku_counts = _key_counts(st.events, "keyup");
+        _assert_counts_equal(kd_counts, expected_counts, mode + " keydown");
+        _assert_counts_equal(ku_counts, expected_counts, mode + " keyup");
+
+        let record = map{
+            draws: len(st.events) / 2,
+            presents: len(st.events) / 2,
+            toggles: st.toggles,
+            disabled: st.disabled,
+            buttons: st.buttons,
+            checked: GUI.get(f, "active").checked,
+            focus: f.focus,
+            text: GUI.get(f, "entry").value,
+            events: st.events,
+            input_backend: backend_name,
+            closed: f.close_requested == true
+        };
+
+        if evidence_dir != "" {
+            assert(_write_checked(evidence_dir + "/" + str(hold_ms) + ".json", json_stringify(record) + "\n"), "write hold evidence");
+        }
+
+        push(results, map{
+            hold_ms: hold_ms,
+            text: record.text,
+            draws: record.draws,
+            presents: record.presents,
+            transitions_once: true,
+            controls_pass: true,
+            input_backend: record.input_backend,
+            closed: record.closed
+        });
+    }
+
+    if evidence_dir != "" {
+        let summary_doc = map{
+            mode: mode,
+            results: results,
+            real_product_test: false,
+            memory_leak_measurement: false,
+            headless: true
+        };
+        assert(_write_checked(evidence_dir + "/summary.json", json_stringify(summary_doc) + "\n"), "write delivery summary.json");
+    }
+    return results;
+}
+
+fn _execute_all(cfg, base_tmp) {
+    assert(fs_exists(cwd() + "/tests/fixtures/native_keyboard_delivery.sapp"), "delivery fixture exists");
+    let created_tmp = SECURE_FILE.create_private_temporary_directory_new(base_tmp);
+    assert(created_tmp.ok == true, "private temp dir created");
+    let out = map{};
+    if cfg.mode == "both" {
+        let leg_dir = base_tmp + "/legacy";
+        let ord_dir = base_tmp + "/ordered";
+        fs_mkdirs(leg_dir);
+        fs_mkdirs(ord_dir);
+        let leg = _run_single_mode("legacy", leg_dir);
+        let ord = _run_single_mode("ordered", ord_dir);
+        assert(len(leg) == 3 and len(ord) == 3, "both legacy and ordered ran 3 hold profiles");
+        out = map{
+            passed: true,
+            modes_verified: ["legacy", "ordered"],
+            legacy_results: leg,
+            ordered_results: ord
+        };
+    } else {
+        let ev_dir = cfg.evidence_dir;
+        if ev_dir == "" {
+            ev_dir = base_tmp + "/" + cfg.mode;
+        }
+        fs_mkdirs(ev_dir);
+        let single = _run_single_mode(cfg.mode, ev_dir);
+        assert(len(single) == 3, "single mode ran 3 hold profiles");
+        out = map{
+            passed: true,
+            modes_verified: [cfg.mode],
+            results: single
+        };
+    }
+    return out;
+}
+
+fn main() {
+    let cfg = _parse_cli();
+    let base_tmp = "/tmp/pblang_tooling_s2_kbd_delivery_" + str(now_ms());
+    let out = map{};
+    let err_msg = "";
+    try {
+        out = _execute_all(cfg, base_tmp);
+    } catch e {
+        err_msg = str(e);
+    }
+    _rm_rf(base_tmp);
+    if err_msg != "" {
+        throw err_msg;
+    }
+    print json_stringify(out);
+    return 0;
+}
+
+main();

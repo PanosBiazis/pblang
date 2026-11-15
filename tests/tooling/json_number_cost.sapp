@@ -1,0 +1,353 @@
+// Paired JSON decoding timing and full binary64 output parity verification for
+// stdlib/json_decode.sapp (`parse` and `parse_exact`) in pure PBLang.
+
+let SECURE = import("stdlib:secure_file.sapp");
+
+fn _same_binary64(actual, expected) {
+    let ta = type(actual);
+    let te = type(expected);
+    if te == "nil" or te == "bool" or te == "string" {
+        return ta == te and actual == expected;
+    }
+    if te == "number" {
+        return ta == "number" and num_to_le_bytes(actual) == num_to_le_bytes(expected);
+    }
+    if te == "array" {
+        if ta != "array" or len(actual) != len(expected) { return false; }
+        let i = 0;
+        while i < len(expected) {
+            if not _same_binary64(actual[i], expected[i]) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    if te == "map" {
+        if ta != "map" { return false; }
+        let ek = map_keys(expected);
+        let ak = map_keys(actual);
+        if len(ek) != len(ak) { return false; }
+        let i = 0;
+        while i < len(ek) {
+            let k = ek[i];
+            if not map_has(actual, k) { return false; }
+            if not _same_binary64(actual[k], expected[k]) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn _repeat_csv(token, count) {
+    let parts = [];
+    let i = 0;
+    while i < count {
+        array_push(parts, token);
+        i = i + 1;
+    }
+    return str_join(parts, ",");
+}
+
+fn _build_fixtures(scale_mode) {
+    // Full benchmark scale when invoked with explicit --baseline/--candidate,
+    // bounded fast scale when invoked standalone with default arguments.
+    let vec_dim = if scale_mode == "full" { 256 } else { 16 };
+    let item_cnt = if scale_mode == "full" { 256 } else { 16 };
+    let dist_cnt = if scale_mode == "full" { 65536 } else { 512 };
+    let alt_pairs = if scale_mode == "full" { 32768 } else { 256 };
+    let bound_cnt = if scale_mode == "full" { 110376 } else { 512 };
+    let dense_cnt = if scale_mode == "full" { 1048575 } else { 1024 };
+
+    let qvec = [];
+    let qi = 0;
+    while qi < vec_dim { array_push(qvec, 0.5); qi = qi + 1; }
+    let items = [];
+    let ii = 0;
+    while ii < item_cnt {
+        array_push(items, map{ id: str(ii), vector: qvec });
+        ii = ii + 1;
+    }
+    let frame = map{
+        jsonrpc: "2.0",
+        id: "cost",
+        method: "tools/call",
+        params: map{
+            name: "ai_vector_search",
+            arguments: map{ query: qvec, items: items, top_k: 1 }
+        }
+    };
+
+    let dist_parts = [];
+    let di = 0;
+    while di < dist_cnt {
+        array_push(dist_parts, str(di) + ".125");
+        di = di + 1;
+    }
+
+    let alt_parts = [];
+    let ai = 0;
+    while ai < alt_pairs {
+        array_push(alt_parts, "0.5");
+        array_push(alt_parts, "0.25");
+        ai = ai + 1;
+    }
+
+    return [
+        map{ label: "fractional_cells", doc: json_stringify(frame), method: "parse" },
+        map{ label: "distinct_decimals", doc: "[" + str_join(dist_parts, ",") + "]", method: "parse" },
+        map{ label: "alternating_decimals", doc: "[" + str_join(alt_parts, ",") + "]", method: "parse" },
+        map{ label: "boundary_repeat", doc: "[" + _repeat_csv("9007199254740991.0", bound_cnt) + "]", method: "parse" },
+        map{ label: "strict_exact_1024", doc: "[" + _repeat_csv("0.5", 1024) + "]", method: "parse_exact" },
+        map{ label: "dense_integer", doc: "[" + _repeat_csv("0", dense_cnt) + "]", method: "parse" },
+        map{ label: "small_decimal_object", doc: "{\"x\":0.1,\"y\":1.25,\"z\":-0.0}", method: "parse" }
+    ];
+}
+
+fn _sort_nums(vals) {
+    let arr = [];
+    let i = 0;
+    while i < len(vals) { array_push(arr, vals[i]); i = i + 1; }
+    let n = len(arr);
+    let a = 0;
+    while a < n {
+        let b = a + 1;
+        while b < n {
+            if arr[b] < arr[a] {
+                let tmp = arr[a];
+                arr[a] = arr[b];
+                arr[b] = tmp;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    return arr;
+}
+
+fn _median(vals) {
+    let s = _sort_nums(vals);
+    let n = len(s);
+    let mid = num_floor(n / 2);
+    if n % 2 == 1 { return s[mid]; }
+    return (s[mid - 1] + s[mid]) / 2.0;
+}
+
+fn _rm_tree(path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            _rm_tree(path + "/" + entries[i]);
+            i = i + 1;
+        }
+    }
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _resolve_release(dir_or_root) {
+    let bin = dir_or_root + "/pblang";
+    if fs_exists(dir_or_root + "/bin/pblang") {
+        bin = dir_or_root + "/bin/pblang";
+    } elif fs_exists(dir_or_root + "/target/release/pblang") {
+        bin = dir_or_root + "/target/release/pblang";
+    }
+    let dec = dir_or_root + "/stdlib/json_decode.sapp";
+    assert(fs_exists(bin) and fs_exists(dec), "json_number_cost: release binary or json_decode.sapp missing at " + dir_or_root);
+    return map{ bin: bin, stdlib: dir_or_root + "/stdlib", decoder: dec };
+}
+
+fn main() {
+    let raw_args = os_args();
+    let baseline_arg = "";
+    let candidate_arg = "";
+    let report_arg = "";
+    let start_idx = 0;
+    let count_val = -1;
+    let pairs_val = -1;
+    let i = 0;
+    while i < len(raw_args) {
+        let a = raw_args[i];
+        if a == "--baseline" and i + 1 < len(raw_args) {
+            baseline_arg = raw_args[i + 1];
+            i = i + 1;
+        } elif a == "--candidate" and i + 1 < len(raw_args) {
+            candidate_arg = raw_args[i + 1];
+            i = i + 1;
+        } elif a == "--report" and i + 1 < len(raw_args) {
+            report_arg = raw_args[i + 1];
+            i = i + 1;
+        } elif a == "--start" and i + 1 < len(raw_args) {
+            start_idx = num_floor(json_parse(raw_args[i + 1]));
+            i = i + 1;
+        } elif a == "--count" and i + 1 < len(raw_args) {
+            count_val = num_floor(json_parse(raw_args[i + 1]));
+            i = i + 1;
+        } elif a == "--pairs" and i + 1 < len(raw_args) {
+            pairs_val = num_floor(json_parse(raw_args[i + 1]));
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+
+    let repo_root = cwd();
+    let explicit_mode = baseline_arg != "" and candidate_arg != "";
+    let scale_mode = if explicit_mode { "full" } else { "standalone" };
+    let all_fixtures = _build_fixtures(scale_mode);
+
+    if count_val < 0 {
+        count_val = if explicit_mode { 1 } else { len(all_fixtures) };
+    }
+    if pairs_val < 0 {
+        pairs_val = if explicit_mode { 5 } else { 1 };
+    }
+    assert(pairs_val >= 1 and pairs_val <= 10, "pairs must be in 1..10");
+
+    let cand_rel = _resolve_release(if candidate_arg != "" { candidate_arg } else { repo_root });
+    let base_rel = if baseline_arg != "" { _resolve_release(baseline_arg) } else { cand_rel };
+
+    let scratch = "/tmp/pblang_tooling_s1_json_cost_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(scratch).ok, "create private scratch");
+
+    let prev_prof = env_get("PBLANG_CHECK_PROFILE");
+    let prev_sargs = env_get("PBLANG_SCRIPT_ARGS");
+    env_set("PBLANG_CHECK_PROFILE", "");
+    env_set("PBLANG_SCRIPT_ARGS", "");
+
+    let rows = [];
+    let run_one = fn(rel, document, method, label) {
+        let in_path = scratch + "/input.json";
+        let dec_path = scratch + "/json_decode.sapp";
+        let main_path = scratch + "/main.sapp";
+        fs_write(in_path, document);
+        fs_write(dec_path, fs_read(rel.decoder));
+        // Check negative-zero preservation directly in child when label == small_decimal_object
+        let neg_zero_guard = if label == "small_decimal_object" {
+            "assert(num_to_le_bytes(value.z) == [0,0,0,0,0,0,0,128], \"negative zero binary64 bits preserved\");"
+        } else {
+            ""
+        };
+        let child_src = "let D = import(" + json_stringify(dec_path) + ");\n"
+            + "let text = fs_read(" + json_stringify(in_path) + ");\n"
+            + "let warm = D." + method + "(text);\n"
+            + "warm = nil;\n"
+            + "let t0 = now_ms();\n"
+            + "let value = D." + method + "(text);\n"
+            + "let elapsed = now_ms() - t0;\n"
+            + neg_zero_guard + "\n"
+            + "print elapsed;\n"
+            + "print json_stringify(value);\n";
+        fs_write(main_path, child_src);
+
+        let proc_t0 = now_ms();
+        let p = proc_spawn_wait(rel.bin, [
+            "run",
+            main_path,
+            "--deny-net", "--deny-http", "--deny-exec", "--deny-ffi", "--deny-spawn", "--deny-gfx", "--deny-sqlite"
+        ]);
+        let proc_sec = (now_ms() - proc_t0) / 1000.0;
+        if p.exit_code != 0 {
+            print "COST_CHILD_FAIL [" + label + "]: code=" + str(p.exit_code) + " err=" + p.stderr;
+            return nil;
+        }
+        let nl = str_index_of(p.stdout, "\n");
+        if nl <= 0 {
+            print "COST_STDOUT_FAIL [" + label + "]: " + p.stdout;
+            return nil;
+        }
+        let elapsed_ms = parse_number(str_trim(str_slice(p.stdout, 0, nl)));
+        let json_out = str_trim(str_slice(p.stdout, nl + 1, len(p.stdout)));
+        let DEC = import("stdlib:json_decode.sapp");
+        let actual_val = DEC.parse(json_out);
+        let expected_val = DEC.parse(document);
+        if label == "small_decimal_object" {
+            if not (num_to_le_bytes(actual_val.x) == num_to_le_bytes(0.1) and num_to_le_bytes(actual_val.y) == num_to_le_bytes(1.25)) {
+                print "COST_PARITY_FAIL [" + label + "]";
+                return nil;
+            }
+        } elif not _same_binary64(actual_val, expected_val) {
+            print "COST_PARITY_FAIL [" + label + "]";
+            return nil;
+        }
+        return map{ parse_ms: elapsed_ms, process_seconds: proc_sec };
+    };
+
+    let exec_suite = fn() {
+        let end_idx = start_idx + count_val;
+        if end_idx > len(all_fixtures) { end_idx = len(all_fixtures); }
+        let fi = start_idx;
+        while fi < end_idx {
+            let fx = all_fixtures[fi];
+            let samples = [];
+            let pi = 0;
+            while pi < pairs_val {
+                let sample = map{ pair: pi };
+                if explicit_mode {
+                    if pi % 2 == 0 {
+                        sample["baseline"] = run_one(base_rel, fx.doc, fx.method, fx.label);
+                        sample["candidate"] = run_one(cand_rel, fx.doc, fx.method, fx.label);
+                    } else {
+                        sample["candidate"] = run_one(cand_rel, fx.doc, fx.method, fx.label);
+                        sample["baseline"] = run_one(base_rel, fx.doc, fx.method, fx.label);
+                    }
+                    assert(sample["baseline"] != nil and sample["candidate"] != nil, "sample failed");
+                } else {
+                    let c_res = run_one(cand_rel, fx.doc, fx.method, fx.label);
+                    assert(c_res != nil, "standalone sample failed");
+                    sample["candidate"] = c_res;
+                    sample["baseline"] = c_res;
+                }
+                array_push(samples, sample);
+                pi = pi + 1;
+            }
+            let c_times = [];
+            let b_times = [];
+            let si = 0;
+            while si < len(samples) {
+                array_push(c_times, samples[si].candidate.parse_ms);
+                array_push(b_times, samples[si].baseline.parse_ms);
+                si = si + 1;
+            }
+            array_push(rows, map{
+                label: fx.label,
+                bytes: len(str_to_bytes(fx.doc)),
+                fixture_sha256: sha256(fx.doc),
+                method: fx.method,
+                samples: samples,
+                summary: map{
+                    baseline: map{ median_parse_ms: _median(b_times) },
+                    candidate: map{ median_parse_ms: _median(c_times) }
+                },
+                full_output_binary64_parity: true
+            });
+            fi = fi + 1;
+        }
+        return true;
+    };
+
+    let ok = try exec_suite() catch false;
+    if prev_prof != nil { env_set("PBLANG_CHECK_PROFILE", prev_prof); }
+    if prev_sargs != nil { env_set("PBLANG_SCRIPT_ARGS", prev_sargs); }
+    _rm_tree(scratch);
+    assert(not fs_exists(scratch), "json_number_cost scratch cleaned up");
+
+    let out_report = map{
+        passed: ok and len(rows) > 0,
+        pairs: pairs_val,
+        decoder_sha256: map{
+            baseline: sha256(fs_read(base_rel.decoder)),
+            candidate: sha256(fs_read(cand_rel.decoder))
+        },
+        rows: rows
+    };
+
+    if report_arg != "" {
+        let pdir = path_dirname(report_arg);
+        if pdir != "" and pdir != "." { fs_mkdirs(pdir); }
+        fs_write(report_arg, json_stringify(out_report) + "\n");
+    }
+
+    assert(out_report.passed, "json_number_cost failed");
+    print "json_number_cost_pass: fixtures=" + str(len(rows));
+}
+
+main();

@@ -1,0 +1,489 @@
+// Bounded exclusive-write failure, namespace-replacement preservation, facade,
+// and complete-caller stop checks for stdlib/linux_dirfs.sapp, stdlib/posix_dirfs.sapp,
+// and stdlib/secure_file.sapp in pure PBLang.
+
+let SECURE = import("stdlib:secure_file.sapp");
+
+let MODEL_SRC = "let state=map{};\n"
+    + "fn configure(wrote,fc,pc) {state.wrote=wrote;state.fc=fc;state.pc=pc;state.closes=[];state.writes=0;state.opens=0;state.parents=0;state.unlinks=0;state.bytes=nil;state.open_ok=true;state.parent_ok=true;}\n"
+    + "fn parent() {state.parents=state.parents+1;return if state.parent_ok {map{ok:true,fd:10,name:\"value\"}} else {map{ok:false,error:\"parent rejected\"}};}\n"
+    + "fn open() {state.opens=state.opens+1;return if state.open_ok {20} else {-1};}\n"
+    + "fn close(fd) {array_push(state.closes,fd);let value=if fd==20 {state.fc} else {state.pc};if value==\"throw\" {throw \"modeled close exception\";}return value;}\n"
+    + "fn unlink() {state.unlinks=state.unlinks+1;return 0;}\n"
+    + "fn write(bytes) {state.writes=state.writes+1;state.bytes=bytes;if not state.wrote {throw \"modeled write failure\";}}\n"
+    + "export state,configure,parent,open,close,unlink,write;\n";
+
+let CALLER_ADAPTER_SRC = "let S = import(\"facade.sapp\");\n"
+    + "let state = map{removes: 0, atomic_writes: 0};\n"
+    + "fn create_private_temporary_directory_new(path) { let _p = path; return map{ok: true}; }\n"
+    + "fn write_text_new_exclusive(path, text, create = true, private = false) {\n"
+    + "    let _p = path; let _c = create; let _pr = private;\n"
+    + "    return S.write_text_new_exclusive(\"owned/value\", text, false, false);\n"
+    + "}\n"
+    + "fn remove(path, private = false) { let _p = path; let _pr = private; state.removes = state.removes + 1; return map{ok: true}; }\n"
+    + "fn write_text_atomic(path, text, create = true, private = false) {\n"
+    + "    let _p = path; let _t = text; let _c = create; let _pr = private;\n"
+    + "    state.atomic_writes = state.atomic_writes + 1; return map{ok: true};\n"
+    + "}\n"
+    + "export state, create_private_temporary_directory_new, write_text_new_exclusive, remove, write_text_atomic;\n";
+
+fn _find_libc() {
+    let paths = [
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/usr/lib/libc.so.6",
+        "/lib/libc.so.6"
+    ];
+    let i = 0;
+    while i < len(paths) {
+        if fs_exists(paths[i]) { return paths[i]; }
+        i = i + 1;
+    }
+    throw "dirfs_exclusive_failure_check: libc.so.6 not found";
+}
+
+fn _rm_tree_libc(libc, path) {
+    let entries = try fs_listdir(path) catch nil;
+    if entries != nil {
+        let i = 0;
+        while i < len(entries) {
+            let child = path + "/" + entries[i];
+            if ffi_call_typed(libc, "unlink", "i32(cstr)", [child]) != 0 {
+                _rm_tree_libc(libc, child);
+            }
+            i = i + 1;
+        }
+    }
+    let _u = ffi_call_typed(libc, "unlink", "i32(cstr)", [path]);
+    let _d = ffi_call_typed(libc, "rmdir", "i32(cstr)", [path]);
+    let _r = try fs_remove(path) catch false;
+}
+
+fn _replace_once(text, needle, replacement) {
+    let pos = str_index_of(text, needle);
+    assert(pos >= 0, "replace_once needle missing: " + needle);
+    return str_slice(text, 0, pos) + replacement + str_slice(text, pos + len(needle), len(text));
+}
+
+fn _body_replace(text, name, body) {
+    let aliases = map{
+        "_openat": "fs, dirfd, name, flags, mode = 0",
+        "_close_fd": "fs, fd"
+    };
+    let alias_line = "let " + name + " = READ_CORE." + name + ";";
+    if str_contains(text, alias_line) {
+        assert(map_has(aliases, name), "missing alias signature for " + name);
+        return _replace_once(text, alias_line, "fn " + name + "(" + aliases[name] + ") {\n" + body + "\n}");
+    }
+    let target = "fn " + name + "(";
+    let start = str_index_of(text, target);
+    assert(start >= 0, "function missing for body_replace: " + name);
+    let tail = str_slice(text, start, len(text));
+    let rel_open = str_index_of(tail, "{");
+    assert(rel_open >= 0, "opening brace missing for " + name);
+    let opening = start + rel_open;
+    let depth = 1;
+    let quoted = false;
+    let escaped = false;
+    let idx = opening + 1;
+    let n = len(text);
+    while idx < n {
+        let ch = str_slice(text, idx, idx + 1);
+        if quoted {
+            if escaped { escaped = false; }
+            elif ch == "\\" { escaped = true; }
+            elif ch == "\"" { quoted = false; }
+        } elif ch == "\"" {
+            quoted = true;
+        } elif ch == "{" {
+            depth = depth + 1;
+        } elif ch == "}" {
+            depth = depth - 1;
+            if depth == 0 {
+                return str_slice(text, 0, opening + 1) + "\n" + body + "\n" + str_slice(text, idx, n);
+            }
+        }
+        idx = idx + 1;
+    }
+    throw "unclosed function body: " + name;
+}
+
+fn _modeled(raw, posix) {
+    let out = _body_replace(raw, "_parent", "return B.parent();");
+    out = _body_replace(out, "_openat", "return B.open();");
+    out = _body_replace(out, "_close_fd", "return B.close(fd);");
+    if posix and str_contains(out, "fn _exclusive_close_fd(") {
+        out = _body_replace(out, "_exclusive_close_fd", "return B.close(fd);");
+    }
+    out = _body_replace(out, "_unlinkat", "return B.unlink();");
+    let call_pat = if posix { "fs_write_bytes(_fd_path(fs, fd), bytes)" } else { "fs_write_bytes(_fd_path(fd), bytes)" };
+    let wstart = str_index_of(out, "fn write_new_exclusive(");
+    assert(wstart >= 0, "write_new_exclusive missing");
+    let prefix = str_slice(out, 0, wstart);
+    let suffix = _replace_once(str_slice(out, wstart, len(out)), call_pat, "B.write(bytes)");
+    out = prefix + suffix;
+    if not posix {
+        out = out + "\nfn profile(name) { let _n = name; return map{}; }\nexport profile;\n";
+    }
+    return "let B=import(\"model.sapp\");\n" + out;
+}
+
+fn _instrument(raw, mode, libc_path) {
+    let wstart = str_index_of(raw, "fn write_new_exclusive(");
+    assert(wstart >= 0, "instrument: write_new_exclusive missing");
+    let after_w = str_slice(raw, wstart + 1, len(raw));
+    let rel_end = str_index_of(after_w, "\nfn ");
+    assert(rel_end >= 0, "instrument: next fn missing");
+    let wend = wstart + 1 + rel_end;
+    let part = str_slice(raw, wstart, wend);
+    part = str_replace_all(part, "_close_fd(", "_tracked_close(");
+    part = str_replace_all(part, "_unlinkat(", "_tracked_unlink(");
+    if mode == "partial" {
+        part = _replace_once(part, "fs_write_bytes(_fd_path(fd), bytes)", "_partial_write(fd, bytes)");
+    } elif mode == "replacement" {
+        part = _replace_once(part, "fs_write_bytes(_fd_path(fd), bytes)", "_replacement_write(fd, bytes)");
+    }
+    let helpers = "\nlet trace=map{closes:[],unlinks:0};\n"
+        + "fn _tracked_close(fs,fd) {array_push(trace.closes,fd);return _close_fd(fs,fd);}\n"
+        + "fn _tracked_unlink(fs,parent,name,flags) {trace.unlinks=trace.unlinks+1;return _unlinkat(fs,parent,name,flags);}\n"
+        + "fn _partial_write(fd,bytes) {\n"
+        + "    fs_write_bytes(_fd_path(fd), slice(bytes, 0, 16));\n"
+        + "    throw \"injected partial write failure\";\n"
+        + "}\n"
+        + "fn _replacement_write(fd,bytes) {\n"
+        + "    fs_write_bytes(_fd_path(fd), slice(bytes, 0, 16));\n"
+        + "    let lc = ffi_load(" + json_stringify(libc_path) + ");\n"
+        + "    assert(ffi_call_typed(lc, \"rename\", \"i32(cstr,cstr)\", [\"scratch/target\", \"scratch/held-original\"]) == 0, \"rename target\");\n"
+        + "    ffi_close(lc);\n"
+        + "    fs_write_bytes(\"scratch/target\", str_to_bytes(\"FOREIGN REPLACEMENT\"));\n"
+        + "    throw \"injected write failure after real prefix and namespace replacement\";\n"
+        + "}\n"
+        + "export trace;\n";
+    return str_slice(raw, 0, wstart) + part + str_slice(raw, wend, len(raw)) + helpers;
+}
+
+fn _file_mode_octal(path) {
+    let st_bin = if fs_exists("/usr/bin/stat") { "/usr/bin/stat" } else { "/bin/stat" };
+    let r = proc_spawn_wait(st_bin, ["-c", "%a", path]);
+    if r.exit_code != 0 { return ""; }
+    return str_trim(r.stdout);
+}
+
+fn _bind_stdlib_imports(text, stdlib_dir) {
+    let out = str_replace_all(text, "import(\"stdlib:", "import(\"" + stdlib_dir + "/");
+    out = str_replace_all(out, "import(\"stdlib/", "import(\"" + stdlib_dir + "/");
+    return out;
+}
+
+fn main() {
+    let raw_args = os_args();
+    let runtime_arg = "";
+    let baseline_arg = "";
+    let report_arg = "";
+    let idx = 0;
+    while idx < len(raw_args) {
+        let a = raw_args[idx];
+        if a == "--runtime" and idx + 1 < len(raw_args) {
+            runtime_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--baseline" and idx + 1 < len(raw_args) {
+            baseline_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        } elif a == "--report" and idx + 1 < len(raw_args) {
+            report_arg = raw_args[idx + 1];
+            idx = idx + 1;
+        }
+        idx = idx + 1;
+    }
+
+    let repo_root = cwd();
+    let runtime_bin = repo_root + "/pblang";
+    if runtime_arg != "" {
+        if fs_exists(runtime_arg + "/bin/pblang") { runtime_bin = runtime_arg + "/bin/pblang"; }
+        elif fs_exists(runtime_arg) { runtime_bin = runtime_arg; }
+    }
+    assert(fs_exists(runtime_bin), "dirfs_exclusive_failure_check: runtime binary missing");
+
+    let libc_path = _find_libc();
+    let libc = ffi_load(libc_path);
+
+    let root_base = "/tmp/pblang_tooling_s1_dirfs_excl_" + str(num_floor(now_ms()));
+    assert(SECURE.create_private_temporary_directory_new(root_base).ok, "create root_base");
+
+    let rows = [];
+    let case_seq = 0;
+
+    let run_isolated = fn(source_root, files_map, real_ffi) {
+        let stdlib_dir = source_root + "/stdlib";
+        let work = root_base + "/case_" + str(case_seq);
+        case_seq = case_seq + 1;
+        fs_mkdirs(work);
+        let scr = work + "/scratch";
+        fs_mkdirs(scr);
+        assert(ffi_call_typed(libc, "chmod", "i32(cstr,u32)", [scr, 448]) == 0, "chmod 0700 scratch");
+
+        fs_write_bytes(scr + "/input", str_to_bytes("KEEP INPUT"));
+        fs_write_bytes(scr + "/existing", str_to_bytes("KEEP OUTPUT"));
+        assert(ffi_call_typed(libc, "link", "i32(cstr,cstr)", [scr + "/input", scr + "/alias"]) == 0, "hardlink alias");
+        assert(ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", ["input", scr + "/link"]) == 0, "symlink link");
+        assert(ffi_call_typed(libc, "symlink", "i32(cstr,cstr)", [".", scr + "/dirlink"]) == 0, "symlink dirlink");
+
+        let core_src = _bind_stdlib_imports(fs_read(stdlib_dir + "/linux_dirfs_read_core.sapp"), stdlib_dir);
+        fs_write(work + "/core.sapp", core_src);
+
+        let fkeys = map_keys(files_map);
+        let fi = 0;
+        while fi < len(fkeys) {
+            let k = fkeys[fi];
+            let txt = str_replace_all(files_map[k], "import(\"stdlib:linux_dirfs_read_core.sapp\")", "import(\"core.sapp\")");
+            txt = _bind_stdlib_imports(txt, stdlib_dir);
+            txt = str_replace_all(txt, "\"scratch\"", json_stringify(scr));
+            txt = str_replace_all(txt, "\"scratch/", "\"" + scr + "/");
+            let local_names = ["dirfs.sapp", "model.sapp", "semantic.sapp", "facade.sapp", "caller_adapter.sapp", "caller.sapp", "core.sapp"];
+            let li = 0;
+            while li < len(local_names) {
+                let ln = local_names[li];
+                txt = str_replace_all(txt, "import(\"" + ln + "\")", "import(\"" + work + "/" + ln + "\")");
+                li = li + 1;
+            }
+            fs_write(work + "/" + k, txt);
+            fi = fi + 1;
+        }
+
+        let args = ["run", "--deny-net", "--deny-http", "--deny-env", "--deny-spawn", "--deny-gfx", "--deny-sqlite"];
+        if real_ffi {
+            array_push(args, "--allow-ffi");
+        } else {
+            array_push(args, "--deny-ffi");
+            array_push(args, "--deny-exec");
+        }
+        array_push(args, work + "/main.sapp");
+
+        let p = proc_spawn_wait(runtime_bin, args);
+        let inputs_unchanged = bytes_to_str(fs_read_bytes(scr + "/input")) == "KEEP INPUT"
+            and bytes_to_str(fs_read_bytes(scr + "/existing")) == "KEEP OUTPUT";
+        return map{
+            exit: p.exit_code,
+            stdout: p.stdout,
+            stderr: p.stderr,
+            bounded: len(p.stdout) < 65536 and len(p.stderr) < 65536,
+            inputs_unchanged: inputs_unchanged,
+            scratch: scr
+        };
+    };
+
+    let record_row = fn(label, res, ok) {
+        let passed = ok and res.bounded and res.inputs_unchanged and res.exit == 0 and res.stderr == "";
+        array_push(rows, map{ label: label, passed: passed, exit: res.exit, stdout: res.stdout, stderr: res.stderr });
+        if not passed {
+            print "FAIL_DIRFS_ROW: " + label + " exit=" + str(res.exit) + " stderr=" + res.stderr + " stdout=" + res.stdout;
+        }
+        assert(passed, "dirfs_exclusive_failure_check failed: " + label);
+    };
+
+    let run_all = fn() {
+        let semantic_src = fs_read(repo_root + "/tests/semantics/dirfs_exclusive_failure_test.sapp");
+        let variants = [];
+        if baseline_arg != "" and fs_exists(baseline_arg) {
+            array_push(variants, map{ name: "baseline", root: baseline_arg, is_base: true });
+        }
+        array_push(variants, map{ name: "candidate", root: repo_root, is_base: false });
+
+        let vi = 0;
+        while vi < len(variants) {
+            let v = variants[vi];
+            let vname = v.name;
+            let sroot = v.root;
+            let is_base = v.is_base;
+            let expected_cases = if is_base { "\"cases\":38" } else { "\"cases\":57" };
+
+            // 1. Modeled Linux and POSIX 57-case matrices
+            let posix_flags = [false, true];
+            let pfi = 0;
+            while pfi < len(posix_flags) {
+                let is_posix = posix_flags[pfi];
+                let mod_file = if is_posix { "posix_dirfs.sapp" } else { "linux_dirfs.sapp" };
+                let raw_mod = fs_read(sroot + "/stdlib/" + mod_file);
+                let main_mod = "let D=import(\"dirfs.sapp\");let B=import(\"model.sapp\");let T=import(\"semantic.sapp\");print json_stringify(T.run(D,B,"
+                    + (if is_base { "true" } else { "false" }) + "," + (if is_posix { "true" } else { "false" }) + "));";
+                let r_mod = run_isolated(sroot, map{
+                    "dirfs.sapp": _modeled(raw_mod, is_posix),
+                    "model.sapp": MODEL_SRC,
+                    "semantic.sapp": semantic_src,
+                    "main.sapp": main_mod
+                }, false);
+                record_row(vname + (if is_posix { "/posix-model" } else { "/linux-model" }), r_mod, str_contains(r_mod.stdout, expected_cases));
+                pfi = pfi + 1;
+            }
+
+            // 2. Real Linux exclusive write + partial write failure + namespace replacement
+            let raw_linux = fs_read(sroot + "/stdlib/linux_dirfs.sapp");
+            let main_normal = "let D=import(\"dirfs.sapp\");let fs=D.open_absolute(\"scratch\",false);assert(fs.ok,\"open root\");"
+                + "let r=D.write_new_exclusive(fs,\"target\",[0,127,255],false);assert(r.ok,\"write\");"
+                + "assert(D.write_new_exclusive(fs,\"empty\",[],false).ok,\"empty\");"
+                + "assert(D.write_new_exclusive(fs,\"utf8\",str_to_bytes(\"α\"),false).ok,\"utf8\");"
+                + "for path in [\"existing\",\"alias\",\"link\",\"dirlink/new\",\"missing/new\"] {assert(not D.write_new_exclusive(fs,path,[65],false).ok,\"refuse\");}"
+                + "assert(D.close(fs),\"root close\");print json_stringify(map{result:r,trace:D.trace});";
+            let r_norm = run_isolated(sroot, map{
+                "dirfs.sapp": _instrument(raw_linux, "normal", libc_path),
+                "main.sapp": main_normal
+            }, true);
+            let norm_ok = r_norm.exit == 0
+                and fs_exists(r_norm.scratch + "/target")
+                and fs_exists(r_norm.scratch + "/empty")
+                and fs_exists(r_norm.scratch + "/utf8")
+                and fs_read_bytes(r_norm.scratch + "/target") == [0, 127, 255]
+                and fs_read_bytes(r_norm.scratch + "/empty") == []
+                and fs_read_bytes(r_norm.scratch + "/utf8") == [206, 177]
+                and _file_mode_octal(r_norm.scratch + "/target") == "600"
+                and _file_mode_octal(r_norm.scratch + "/empty") == "600"
+                and _file_mode_octal(r_norm.scratch + "/utf8") == "600";
+            record_row(vname + "/normal", r_norm, norm_ok);
+
+            let fail_cases = ["partial-production", "partial-unlink-test-only", "replacement"];
+            let fci = 0;
+            while fci < len(fail_cases) {
+                let fc = fail_cases[fci];
+                let imode = if fc == "replacement" { "replacement" } else { "partial" };
+                let main_fail = "let D=import(\"dirfs.sapp\");let fs=D.open_absolute(\"scratch\",false);assert(fs.ok,\"open root\");"
+                    + "let r=D.write_new_exclusive(fs,\"target\",str_to_bytes(\"0123456789abcdef0123456789abcdef\"),false);assert(not r.ok,\"write failure\");"
+                    + "assert(D.close(fs),\"root close\");print json_stringify(map{result:r,trace:D.trace});";
+                let r_fc = run_isolated(sroot, map{
+                    "dirfs.sapp": _instrument(raw_linux, imode, libc_path),
+                    "main.sapp": main_fail
+                }, true);
+                let parsed = try json_parse(str_trim(r_fc.stdout)) catch nil;
+                let fc_good = r_fc.exit == 0 and parsed != nil and len(parsed.trace.closes) == 2 and parsed.trace.unlinks == (if is_base { 1 } else { 0 });
+                if fc_good and fc == "replacement" {
+                    fc_good = fs_exists(r_fc.scratch + "/held-original")
+                        and bytes_to_str(fs_read_bytes(r_fc.scratch + "/held-original")) == "0123456789abcdef"
+                        and (if is_base { not fs_exists(r_fc.scratch + "/target") } else { fs_exists(r_fc.scratch + "/target") and bytes_to_str(fs_read_bytes(r_fc.scratch + "/target")) == "FOREIGN REPLACEMENT" });
+                } elif fc_good {
+                    fc_good = fs_exists(r_fc.scratch + "/target") and bytes_to_str(fs_read_bytes(r_fc.scratch + "/target")) == "0123456789abcdef";
+                }
+                if not is_base and fc_good {
+                    let res_obj = parsed.result;
+                    fc_good = res_obj.error == "exclusive destination write failed; output may remain"
+                        and res_obj.cleanup_uncertain == true
+                        and res_obj.rollback_attempted == false
+                        and res_obj.file_close_confirmed == true
+                        and res_obj.dirfs_parent_close_confirmed == true;
+                }
+                record_row(vname + "/" + fc, r_fc, fc_good);
+                fci = fci + 1;
+            }
+
+            // 3. Real secure_file facade (bytes & text, normal & partial)
+            let facade_real = _replace_once(
+                fs_read(sroot + "/stdlib/secure_file.sapp"),
+                "let LinuxDirFS = import(\"stdlib:linux_dirfs.sapp\");",
+                "let LinuxDirFS = import(\"dirfs.sapp\");"
+            );
+            let apis = ["bytes", "text"];
+            let ai = 0;
+            while ai < len(apis) {
+                let api = apis[ai];
+                let partials = [false, true];
+                let pi = 0;
+                while pi < len(partials) {
+                    let is_part = partials[pi];
+                    let payload_expr = if api == "bytes" { "str_to_bytes(\"0123456789abcdef0123456789abcdef\")" } else { "\"0123456789abcdef0123456789abcdef\"" };
+                    let method_nm = if api == "bytes" { "write_new_exclusive" } else { "write_text_new_exclusive" };
+                    let main_fac = "let S=import(\"facade.sapp\");let r=S." + method_nm + "(\"scratch/target\"," + payload_expr + ",false,false);print json_stringify(r);";
+                    let dirfs_src = if is_part { _instrument(raw_linux, "partial", libc_path) } else { raw_linux };
+                    let r_fac = run_isolated(sroot, map{
+                        "dirfs.sapp": dirfs_src,
+                        "facade.sapp": facade_real,
+                        "main.sapp": main_fac
+                    }, true);
+                    let fdata = try json_parse(str_trim(r_fac.stdout)) catch nil;
+                    let exp_str = if is_part { "0123456789abcdef" } else { "0123456789abcdef0123456789abcdef" };
+                    let fgood = r_fac.exit == 0
+                        and fdata != nil
+                        and fdata.ok == (not is_part)
+                        and fs_exists(r_fac.scratch + "/target")
+                        and bytes_to_str(fs_read_bytes(r_fac.scratch + "/target")) == exp_str
+                        and _file_mode_octal(r_fac.scratch + "/target") == "600";
+                    if is_part and not is_base and fgood {
+                        fgood = fdata.cleanup_uncertain == true
+                            and fdata.rollback_attempted == false
+                            and fdata.dirfs_parent_close_confirmed == true
+                            and fdata.file_close_confirmed == true;
+                    }
+                    record_row(vname + "/facade-real-" + api + (if is_part { "-partial" } else { "-normal" }), r_fac, fgood);
+                    pi = pi + 1;
+                }
+                ai = ai + 1;
+            }
+
+            // 4. Complete effectful callers (polyglot_web, polyglot_build) and modeled facade
+            if not is_base {
+                let backend = _modeled(raw_linux, false);
+                backend = _body_replace(backend, "open", "return map{ok:true};");
+                backend = _body_replace(backend, "open_absolute", "return map{ok:true};");
+                backend = _body_replace(backend, "close", "return true;");
+
+                let callers = ["polyglot_web", "polyglot_build"];
+                let cli = 0;
+                while cli < len(callers) {
+                    let caller = callers[cli];
+                    let caller_txt = _replace_once(
+                        fs_read(sroot + "/stdlib/" + caller + ".sapp"),
+                        "let SECURE_FILE = import(\"stdlib:secure_file.sapp\");",
+                        "let SECURE_FILE = import(\"caller_adapter.sapp\");"
+                    );
+                    let call_expr = if caller == "polyglot_web" {
+                        "C.bundle(\"synthetic\",\"\",\"\")"
+                    } else {
+                        "C.build_language(\"python\",\"sample\",\"synthetic\",\"/tmp\",map{unsafe_polyglot:true,trusted_source:true,allow_toolchain_effects:true,unsafe_polyglot_sha256:H.sha256_hex_bytes(str_to_bytes(\"synthetic\"))})"
+                    };
+                    let main_caller = "let B=import(\"model.sapp\");let A=import(\"caller_adapter.sapp\");let C=import(\"caller.sapp\");let H=import(\"stdlib:sha256_pb.sapp\");"
+                        + "B.configure(false,true,true);let fn_c=fn(){let _x=" + call_expr + ";return false;};let failed=try fn_c() catch true;"
+                        + "assert(failed and B.state.writes==1 and B.state.closes==[20,10] and B.state.unlinks==0 and A.state.removes==0 and A.state.atomic_writes==0,\"new backend failure stops complete caller\");print \"caller-pass\";";
+                    let r_cal = run_isolated(sroot, map{
+                        "model.sapp": MODEL_SRC,
+                        "dirfs.sapp": backend,
+                        "facade.sapp": facade_real,
+                        "caller_adapter.sapp": CALLER_ADAPTER_SRC,
+                        "caller.sapp": caller_txt,
+                        "main.sapp": main_caller
+                    }, false);
+                    record_row("candidate/" + caller, r_cal, r_cal.stdout == "caller-pass\n");
+                    cli = cli + 1;
+                }
+
+                let main_fmod = "let B=import(\"model.sapp\");let S=import(\"facade.sapp\");B.configure(false,true,false);"
+                    + "let r=S.write_new_exclusive(\"owned/value\",[65],false);"
+                    + "assert(not r.ok and r.cleanup_uncertain and r.file_close_confirmed and not r.dirfs_parent_close_confirmed and not r.rollback_attempted,\"facade preserves backend failure\");"
+                    + "print \"facade-pass\";";
+                let r_fm = run_isolated(sroot, map{
+                    "model.sapp": MODEL_SRC,
+                    "dirfs.sapp": backend,
+                    "facade.sapp": facade_real,
+                    "main.sapp": main_fmod
+                }, false);
+                record_row("candidate/facade", r_fm, r_fm.stdout == "facade-pass\n");
+            }
+            vi = vi + 1;
+        }
+        return true;
+    };
+
+    let ok = try run_all() catch false;
+    _rm_tree_libc(libc, root_base);
+    ffi_close(libc);
+    assert(not fs_exists(root_base), "dirfs_exclusive_failure_check scratch cleaned up");
+
+    if report_arg != "" {
+        let pdir = path_dirname(report_arg);
+        if pdir != "" and pdir != "." { fs_mkdirs(pdir); }
+        fs_write(report_arg, json_stringify(rows) + "\n");
+    }
+
+    assert(ok and len(rows) >= 13, "dirfs_exclusive_failure_check failed");
+    print "dirfs_exclusive_failure_check_pass: cases=" + str(len(rows));
+}
+
+main();
