@@ -1,0 +1,1329 @@
+// stdlib/net/udp_dns_quic_realtime.sapp — Pure-PBLang Cross-Platform UDP Engine,
+// RFC 1035 DNS Codec, RFC 5389 STUN NAT Discovery & RFC 9000/9221 QUIC Real-Time
+// Authenticated Telemetry (v4.2.0).
+//
+// Architecture:
+//   1. Cross-Platform Non-Blocking/Timeout UDP Sockets (`udp_bind`, `udp_sendto`,
+//      `udp_recvfrom`, `udp_close`) via typed POSIX/macOS/Winsock FFI + `poll()`
+//   2. RFC 1035 Binary DNS Query/Response Encoder & Decoder (`A`, `AAAA`, `TXT`,
+//      `MX`, `SRV`, `CNAME`) with `0xC0xx` compression pointer cycle/loop guard
+//   3. RFC 5389 STUN Binding Request/Response & `XOR-MAPPED-ADDRESS` (`0x2112A442`)
+//   4. RFC 9000 QUIC VarInt + Long/Short Header Codec, RFC 9221 `DATAGRAM` (`0x30/0x31`)
+//      Framing & AES-256-GCM AEAD Sequenced Anti-Replay Telemetry Channel
+
+let AES_GCM = import("stdlib:aes_gcm.sapp");
+
+let DNS_TYPE_A = 1;
+let DNS_TYPE_NS = 2;
+let DNS_TYPE_CNAME = 5;
+let DNS_TYPE_SOA = 6;
+let DNS_TYPE_PTR = 12;
+let DNS_TYPE_MX = 15;
+let DNS_TYPE_TXT = 16;
+let DNS_TYPE_AAAA = 28;
+let DNS_TYPE_SRV = 33;
+let DNS_CLASS_IN = 1;
+
+let STUN_BINDING_REQUEST = 1;
+let STUN_BINDING_RESPONSE = 257;
+let STUN_ATTR_MAPPED_ADDRESS = 1;
+let STUN_ATTR_XOR_MAPPED_ADDRESS = 32;
+let STUN_MAGIC_COOKIE_BYTES = [33, 18, 164, 66]; // 0x2112A442
+
+let QUIC_VERSION_1 = 1;
+let QUIC_PKT_INITIAL = 0;
+let QUIC_PKT_0RTT = 1;
+let QUIC_PKT_HANDSHAKE = 2;
+let QUIC_PKT_RETRY = 3;
+let QUIC_FRAME_DATAGRAM = 48;     // 0x30
+let QUIC_FRAME_DATAGRAM_LEN = 49; // 0x31
+
+let _UDP_SYS_CACHE = map{};
+let _UDP_SYS_MTX = mutex_new();
+
+// ── Byte & Endian Helpers ────────────────────────────────────────────────────
+
+fn _ct_eq_bytes(a, b) {
+    if len(a) != len(b) { return false; }
+    let diff = 0;
+    let i = 0;
+    while i < len(a) {
+        diff = bit_or(diff, bit_xor(a[i], b[i]));
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+fn _opt(m, key, fallback) {
+    if is_map(m) and map_has(m, key) and m[key] != nil {
+        return m[key];
+    }
+    return fallback;
+}
+
+fn _append_bytes(dst, src) {
+    let i = 0;
+    let n = len(src);
+    while i < n {
+        array_push(dst, src[i]);
+        i = i + 1;
+    }
+    return dst;
+}
+
+fn array_join(arr, sep) {
+    let out = "";
+    let i = 0;
+    let n = len(arr);
+    while i < n {
+        if i > 0 { out = out + sep; }
+        out = out + str(arr[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _zeros(n) {
+    let out = [];
+    let i = 0;
+    while i < n {
+        array_push(out, 0);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _push_u16_be(buf, v) {
+    array_push(buf, bit_and(bit_shr(v, 8), 255));
+    array_push(buf, bit_and(v, 255));
+}
+
+fn _push_u32_be(buf, v) {
+    let hi = num_floor(v / 65536);
+    let lo = v - hi * 65536;
+    _push_u16_be(buf, hi);
+    _push_u16_be(buf, lo);
+}
+
+fn _push_u64_be(buf, v) {
+    let hi = num_floor(v / 4294967296.0);
+    let lo = v - hi * 4294967296.0;
+    _push_u32_be(buf, hi);
+    _push_u32_be(buf, lo);
+}
+
+fn _read_u16_be(b, pos) {
+    return b[pos] * 256 + b[pos + 1];
+}
+
+fn _read_u32_be(b, pos) {
+    return ((b[pos] * 256 + b[pos + 1]) * 256 + b[pos + 2]) * 256 + b[pos + 3];
+}
+
+fn _read_u64_be(b, pos) {
+    let hi = _read_u32_be(b, pos);
+    let lo = _read_u32_be(b, pos + 4);
+    return hi * 4294967296.0 + lo;
+}
+
+fn _i32_le_bytes(v) {
+    let u = v;
+    if u < 0 { u = 4294967296 + u; }
+    let b0 = u % 256;
+    let r1 = num_floor(u / 256);
+    let b1 = r1 % 256;
+    let r2 = num_floor(r1 / 256);
+    let b2 = r2 % 256;
+    let b3 = num_floor(r2 / 256) % 256;
+    return [b0, b1, b2, b3];
+}
+
+// ── Cross-Platform FFI UDP Socket Layer (`libc` / `libSystem` / `ws2_32`) ────
+
+fn _alloc_ffi_buf(init_bytes) {
+    let s = bytes_to_str(init_bytes);
+    let mutable_buf = ffi_ptr_read(ffi_bytes_ptr(s), len(init_bytes));
+    return map{
+        buf: mutable_buf,
+        ptr: ffi_bytes_ptr(mutable_buf),
+        size: len(init_bytes)
+    };
+}
+
+fn _pbbytes_to_array(pb, count) {
+    let out = [];
+    let i = 0;
+    while i < count {
+        array_push(out, pb[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _get_udp_sys() {
+    mutex_lock(_UDP_SYS_MTX);
+    if map_has(_UDP_SYS_CACHE, "sys") {
+        let cached = _UDP_SYS_CACHE["sys"];
+        mutex_unlock(_UDP_SYS_MTX);
+        return cached;
+    }
+    let lib = try ffi_load("libc.so.6") catch nil;
+    let is_win = false;
+    let is_bsd = false;
+
+    if lib == nil {
+        lib = try ffi_load("libc.so") catch nil;
+    }
+    if lib == nil {
+        lib = try ffi_load("libSystem.B.dylib") catch (try ffi_load("libc.dylib") catch nil);
+        if lib != nil {
+            is_bsd = true;
+        }
+    }
+    if lib == nil {
+        lib = try ffi_load("ws2_32.dll") catch nil;
+        if lib == nil {
+            mutex_unlock(_UDP_SYS_MTX);
+            throw "udp_dns_quic_realtime: failed to load system socket library";
+        }
+        is_win = true;
+        let wsa_mem = _alloc_ffi_buf(_zeros(512));
+        ffi_call_typed(lib, "WSAStartup", "i32,ptr->i32", [514, wsa_mem.ptr]); // MAKEWORD(2,2) = 0x0202 = 514
+        let has_wsapoll = (try ffi_call_typed(lib, "WSAPoll", "ptr,u64,i32->i32", [0, 0, 0]) catch nil) != nil;
+        let sys_w = map{
+            is_win: true,
+            is_bsd: false,
+            lib: lib,
+            sym_close: "closesocket",
+            sym_poll: if has_wsapoll { "WSAPoll" } else { nil }
+        };
+        _UDP_SYS_CACHE["sys"] = sys_w;
+        mutex_unlock(_UDP_SYS_MTX);
+        return sys_w;
+    }
+
+    let sys_u = map{
+        is_win: is_win,
+        is_bsd: is_bsd,
+        lib: lib,
+        sym_close: "close",
+        sym_poll: "poll"
+    };
+    _UDP_SYS_CACHE["sys"] = sys_u;
+    mutex_unlock(_UDP_SYS_MTX);
+    return sys_u;
+}
+
+fn _parse_ipv4_host(host_str) {
+    let h = str_trim(str(host_str));
+    if h == "" or h == "0.0.0.0" or h == "*" {
+        return [0, 0, 0, 0];
+    }
+    if str_lower(h) == "localhost" {
+        return [127, 0, 0, 1];
+    }
+    let parts = str_split(h, ".");
+    if len(parts) != 4 {
+        throw "udp_dns_quic_realtime: IPv4 dotted address expected, got '" + h + "'";
+    }
+    let out = [];
+    let i = 0;
+    while i < 4 {
+        let v = parse_number(parts[i]);
+        if type(v) != "number" or v < 0 or v > 255 or v != num_floor(v) {
+            throw "udp_dns_quic_realtime: invalid IPv4 octet in '" + h + "'";
+        }
+        array_push(out, v);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _parse_host_port(addr_str) {
+    let s = str_trim(str(addr_str));
+    let colon = str_index_of(s, ":");
+    if colon < 0 {
+        throw "udp_dns_quic_realtime: expected 'host:port', got '" + s + "'";
+    }
+    let host = str_slice(s, 0, colon);
+    let port = parse_number(str_slice(s, colon + 1, len(s)));
+    if type(port) != "number" or port < 0 or port > 65535 or port != num_floor(port) {
+        throw "udp_dns_quic_realtime: invalid UDP port in '" + s + "'";
+    }
+    return map{ host: host, port: port, ip4: _parse_ipv4_host(host) };
+}
+
+fn _pack_sockaddr_in(sys, ip4, port) {
+    let sa = [];
+    if sys.is_bsd {
+        array_push(sa, 16); // sin_len = 16
+        array_push(sa, 2);  // AF_INET = 2
+    } else {
+        array_push(sa, 2);  // AF_INET = 2 (u16_le)
+        array_push(sa, 0);
+    }
+    _push_u16_be(sa, port);
+    _append_bytes(sa, ip4);
+    _append_bytes(sa, [0, 0, 0, 0, 0, 0, 0, 0]);
+    return sa;
+}
+
+fn _unpack_sockaddr_in(raw16) {
+    let port = _read_u16_be(raw16, 2);
+    let host = str(raw16[4]) + "." + str(raw16[5]) + "." + str(raw16[6]) + "." + str(raw16[7]);
+    return map{
+        host: host,
+        port: port,
+        addr: host + ":" + str(port)
+    };
+}
+
+fn udp_local_addr(sock) {
+    return sock.local_addr;
+}
+
+fn udp_close(sock) {
+    if not is_map(sock) or not sock.open { return false; }
+    let sys = _get_udp_sys();
+    ffi_call_typed(sys.lib, sys.sym_close, "i32->i32", [sock.fd]);
+    sock.open = false;
+    return true;
+}
+
+fn udp_sendto(sock, data_bytes_or_str, target_addr) {
+    if not is_map(sock) or not sock.open {
+        throw "udp_dns_quic_realtime: UDP socket is closed";
+    }
+    let sys = _get_udp_sys();
+    let dest = _parse_host_port(target_addr);
+    let payload = if is_array(data_bytes_or_str) { data_bytes_or_str } else { str_to_bytes(str(data_bytes_or_str)) };
+    let sa_mem = _alloc_ffi_buf(_pack_sockaddr_in(sys, dest.ip4, dest.port));
+
+    if len(payload) == 0 {
+        let z_mem = _alloc_ffi_buf([0]);
+        let sent0 = ffi_call_typed(sys.lib, "sendto", "i32,ptr,u64,i32,ptr,i32->i64", [sock.fd, z_mem.ptr, 0, 0, sa_mem.ptr, 16]);
+        if sent0 < 0 { throw "udp_dns_quic_realtime: sendto failed"; }
+        return 0;
+    }
+
+    let pay_mem = _alloc_ffi_buf(payload);
+    let sent = ffi_call_typed(sys.lib, "sendto", "i32,ptr,u64,i32,ptr,i32->i64", [sock.fd, pay_mem.ptr, len(payload), 0, sa_mem.ptr, 16]);
+    if sent < 0 {
+        throw "udp_dns_quic_realtime: sendto failed (rc=" + str(sent) + ")";
+    }
+    return sent;
+}
+
+fn udp_recvfrom(sock, max_bytes = 2048, timeout_ms = 2000) {
+    if not is_map(sock) or not sock.open {
+        throw "udp_dns_quic_realtime: UDP socket is closed";
+    }
+    let sys = _get_udp_sys();
+    let cap = if max_bytes < 1 { 1 } elif max_bytes > 65536 { 65536 } else { num_floor(max_bytes) };
+
+    if timeout_ms >= 0 and sys.sym_poll != nil {
+        // struct pollfd { i32 fd; i16 events (POLLIN=1); i16 revents; }
+        let pfd_bytes = [];
+        _append_bytes(pfd_bytes, _i32_le_bytes(sock.fd));
+        if sys.is_win {
+            // WSAPoll POLLRDNORM = 0x0100 -> [0x00, 0x01]
+            _append_bytes(pfd_bytes, [0, 1, 0, 0]);
+        } else {
+            // POSIX POLLIN = 0x0001 -> [0x01, 0x00]
+            _append_bytes(pfd_bytes, [1, 0, 0, 0]);
+        }
+        let pfd_mem = _alloc_ffi_buf(pfd_bytes);
+        let ready = ffi_call_typed(sys.lib, sys.sym_poll, "ptr,u64,i32->i32", [pfd_mem.ptr, 1, timeout_ms]);
+        if ready == 0 {
+            return map{
+                ok: false,
+                timed_out: true,
+                data: [],
+                text: "",
+                host: "",
+                port: 0,
+                addr: ""
+            };
+        }
+        if ready < 0 {
+            throw "udp_dns_quic_realtime: poll() failed on UDP socket";
+        }
+    }
+
+    let rx_mem = _alloc_ffi_buf(_zeros(cap));
+    let peer_sa = _alloc_ffi_buf(_zeros(16));
+    let peer_len = _alloc_ffi_buf([16, 0, 0, 0]);
+    let got = ffi_call_typed(sys.lib, "recvfrom", "i32,ptr,u64,i32,ptr,ptr->i64", [
+        sock.fd, rx_mem.ptr, cap, 0, peer_sa.ptr, peer_len.ptr
+    ]);
+    if got < 0 or got > cap {
+        throw "udp_dns_quic_realtime: recvfrom failed (rc=" + str(got) + ")";
+    }
+    let raw_data = _pbbytes_to_array(rx_mem.buf, got);
+    let raw_sa = _pbbytes_to_array(peer_sa.buf, 16);
+    let peer = _unpack_sockaddr_in(raw_sa);
+
+    return map{
+        ok: true,
+        timed_out: false,
+        data: raw_data,
+        text: bytes_to_str(raw_data),
+        host: peer.host,
+        port: peer.port,
+        addr: peer.addr
+    };
+}
+
+fn udp_bind(addr_str = "127.0.0.1:0") {
+    let sys = _get_udp_sys();
+    let parsed = _parse_host_port(addr_str);
+    let proto = if sys.is_win { 17 } else { 0 }; // AF_INET=2, SOCK_DGRAM=2
+    let fd = ffi_call_typed(sys.lib, "socket", "i32,i32,i32->i32", [2, 2, proto]);
+    if fd < 0 {
+        throw "udp_dns_quic_realtime: socket(AF_INET, SOCK_DGRAM) failed";
+    }
+
+    let sa_mem = _alloc_ffi_buf(_pack_sockaddr_in(sys, parsed.ip4, parsed.port));
+    let brc = ffi_call_typed(sys.lib, "bind", "i32,ptr,i32->i32", [fd, sa_mem.ptr, 16]);
+    if brc != 0 {
+        ffi_call_typed(sys.lib, sys.sym_close, "i32->i32", [fd]);
+        throw "udp_dns_quic_realtime: bind('" + addr_str + "') failed (rc=" + str(brc) + ")";
+    }
+
+    let out_sa = _alloc_ffi_buf(_zeros(16));
+    let out_len = _alloc_ffi_buf([16, 0, 0, 0]);
+    ffi_call_typed(sys.lib, "getsockname", "i32,ptr,ptr->i32", [fd, out_sa.ptr, out_len.ptr]);
+    let bound = _unpack_sockaddr_in(_pbbytes_to_array(out_sa.buf, 16));
+
+    let sock = map{
+        format: "pblang.net.udp_socket.v1",
+        fd: fd,
+        host: bound.host,
+        port: bound.port,
+        local_addr: bound.addr,
+        open: true
+    };
+    return sock;
+}
+
+// ── RFC 1035 Binary DNS Packet Encoder, Pointer-Safe Decoder & Lookup ────────
+
+fn encode_dns_name(domain) {
+    let s = str_trim(str(domain));
+    while str_ends_with(s, ".") {
+        s = str_slice(s, 0, len(s) - 1);
+    }
+    if s == "" {
+        return [0];
+    }
+    if len(s) > 253 {
+        throw "udp_dns_quic_realtime: DNS domain name exceeds 253 bytes";
+    }
+    let labels = str_split(s, ".");
+    let out = [];
+    let i = 0;
+    while i < len(labels) {
+        let lb = str_to_bytes(labels[i]);
+        if len(lb) == 0 or len(lb) > 63 {
+            throw "udp_dns_quic_realtime: invalid DNS label length (" + str(len(lb)) + ")";
+        }
+        array_push(out, len(lb));
+        _append_bytes(out, lb);
+        i = i + 1;
+    }
+    array_push(out, 0);
+    return out;
+}
+
+fn decode_dns_name(pkt, start_pos) {
+    let n = len(pkt);
+    if start_pos < 0 or start_pos >= n {
+        throw "udp_dns_quic_realtime: DNS name offset out of bounds";
+    }
+    let labels = [];
+    let pos = start_pos;
+    let next_after_initial = -1;
+    let jumped = false;
+    let jumps = 0;
+    let visited = map{};
+    let total_chars = 0;
+
+    while true {
+        if pos < 0 or pos >= n {
+            throw "udp_dns_quic_realtime: truncated DNS name";
+        }
+        let pos_key = str(pos);
+        if map_has(visited, pos_key) {
+            throw "udp_dns_quic_realtime: DNS compression pointer loop/attack detected";
+        }
+        visited[pos_key] = true;
+
+        let b0 = pkt[pos];
+        if b0 == 0 {
+            if not jumped {
+                next_after_initial = pos + 1;
+            }
+            break;
+        }
+
+        let top2 = bit_and(b0, 192);
+        if top2 == 192 {
+            // 14-bit compression pointer: 0xC0xx
+            if pos + 1 >= n {
+                throw "udp_dns_quic_realtime: truncated DNS compression pointer";
+            }
+            jumps = jumps + 1;
+            if jumps > 32 {
+                throw "udp_dns_quic_realtime: DNS compression pointer max jumps exceeded";
+            }
+            let target = bit_or(bit_shl(bit_and(b0, 63), 8), pkt[pos + 1]);
+            if target >= n {
+                throw "udp_dns_quic_realtime: DNS compression pointer out of packet bounds";
+            }
+            if not jumped {
+                next_after_initial = pos + 2;
+                jumped = true;
+            }
+            pos = target;
+        } elif top2 == 0 {
+            let llen = b0;
+            if pos + 1 + llen > n {
+                throw "udp_dns_quic_realtime: DNS label extends past packet end";
+            }
+            total_chars = total_chars + llen + 1;
+            if total_chars > 255 {
+                throw "udp_dns_quic_realtime: decoded DNS name exceeds 255 bytes";
+            }
+            array_push(labels, bytes_to_str(slice(pkt, pos + 1, pos + 1 + llen)));
+            pos = pos + 1 + llen;
+        } else {
+            throw "udp_dns_quic_realtime: unsupported/reserved DNS label flag " + str(top2);
+        }
+    }
+
+    return map{
+        name: array_join(labels, "."),
+        next: next_after_initial
+    };
+}
+
+fn encode_dns_query(domain, qtype = 1, tx_id = nil, recursion_desired = true) {
+    let id_u16 = if tx_id != nil {
+        bit_and(tx_id, 65535)
+    } else {
+        let rb = random_bytes(2);
+        rb[0] * 256 + rb[1]
+    };
+    let flags = if recursion_desired { 256 } else { 0 }; // RD = 0x0100
+    let pkt = [];
+    _push_u16_be(pkt, id_u16);
+    _push_u16_be(pkt, flags);
+    _push_u16_be(pkt, 1); // QDCOUNT = 1
+    _push_u16_be(pkt, 0); // ANCOUNT = 0
+    _push_u16_be(pkt, 0); // NSCOUNT = 0
+    _push_u16_be(pkt, 0); // ARCOUNT = 0
+    _append_bytes(pkt, encode_dns_name(domain));
+    _push_u16_be(pkt, qtype);
+    _push_u16_be(pkt, DNS_CLASS_IN);
+    return map{
+        id: id_u16,
+        packet: pkt
+    };
+}
+
+fn _parse_ipv6_16bytes(ipv6_str) {
+    let s = str_trim(str(ipv6_str));
+    if str_contains(s, "::") {
+        let halves = str_split(s, "::");
+        let left = if halves[0] == "" { [] } else { str_split(halves[0], ":") };
+        let right = if len(halves) > 1 and halves[1] != "" { str_split(halves[1], ":") } else { [] };
+        let missing = 8 - (len(left) + len(right));
+        let full = [];
+        let i = 0;
+        while i < len(left) { array_push(full, left[i]); i = i + 1; }
+        let m = 0;
+        while m < missing { array_push(full, "0"); m = m + 1; }
+        let j = 0;
+        while j < len(right) { array_push(full, right[j]); j = j + 1; }
+        s = array_join(full, ":");
+    }
+    let groups = str_split(s, ":");
+    if len(groups) != 8 {
+        throw "udp_dns_quic_realtime: invalid IPv6 address '" + ipv6_str + "'";
+    }
+    let out = [];
+    let g = 0;
+    while g < 8 {
+        let hs = groups[g];
+        while len(hs) < 4 { hs = "0" + hs; }
+        let raw2 = str_to_bytes(hex_decode(hs));
+        _append_bytes(out, raw2);
+        g = g + 1;
+    }
+    return out;
+}
+
+fn _format_ipv6_16bytes(b16) {
+    let groups = [];
+    let i = 0;
+    while i < 16 {
+        let hx = hex_encode(bytes_to_str([b16[i], b16[i + 1]]));
+        // Strip leading zeros per group (keep at least "0")
+        while len(hx) > 1 and str_starts_with(hx, "0") {
+            hx = str_slice(hx, 1, len(hx));
+        }
+        array_push(groups, hx);
+        i = i + 2;
+    }
+    return array_join(groups, ":");
+}
+
+fn encode_dns_response(tx_id, questions, answers, opts = nil) {
+    let rcode = bit_and(_opt(opts, "rcode", 0), 15);
+    let flags = bit_or(33152, rcode); // QR=1 (0x8000) | RD=1 (0x0100) | RA=1 (0x0080) = 0x8180 (33152)
+    let compress = _opt(opts, "compress_names", true) == true;
+
+    let pkt = [];
+    _push_u16_be(pkt, bit_and(tx_id, 65535));
+    _push_u16_be(pkt, flags);
+    _push_u16_be(pkt, len(questions));
+    _push_u16_be(pkt, len(answers));
+    _push_u16_be(pkt, 0);
+    _push_u16_be(pkt, 0);
+
+    let name_offsets = map{};
+    let q = 0;
+    while q < len(questions) {
+        let qitem = questions[q];
+        let qname = str_lower(str(_opt(qitem, "name", "")));
+        name_offsets[qname] = len(pkt);
+        _append_bytes(pkt, encode_dns_name(qname));
+        _push_u16_be(pkt, _opt(qitem, "qtype", DNS_TYPE_A));
+        _push_u16_be(pkt, _opt(qitem, "qclass", DNS_CLASS_IN));
+        q = q + 1;
+    }
+
+    let a = 0;
+    while a < len(answers) {
+        let rec = answers[a];
+        let rname = str_lower(str(_opt(rec, "name", "")));
+        let rtype = _opt(rec, "type", DNS_TYPE_A);
+        let ttl = _opt(rec, "ttl", 300);
+
+        if compress and map_has(name_offsets, rname) and name_offsets[rname] < 16384 {
+            let ptr_val = bit_or(49152, name_offsets[rname]); // 0xC000 | offset
+            _push_u16_be(pkt, ptr_val);
+        } else {
+            name_offsets[rname] = len(pkt);
+            _append_bytes(pkt, encode_dns_name(rname));
+        }
+        _push_u16_be(pkt, rtype);
+        _push_u16_be(pkt, _opt(rec, "class", DNS_CLASS_IN));
+        _push_u32_be(pkt, ttl);
+
+        let rdata = [];
+        if rtype == DNS_TYPE_A {
+            _append_bytes(rdata, _parse_ipv4_host(_opt(rec, "value", "127.0.0.1")));
+        } elif rtype == DNS_TYPE_AAAA {
+            _append_bytes(rdata, _parse_ipv6_16bytes(_opt(rec, "value", "::1")));
+        } elif rtype == DNS_TYPE_CNAME or rtype == DNS_TYPE_NS or rtype == DNS_TYPE_PTR {
+            let target_d = str_lower(str(_opt(rec, "value", "")));
+            if compress and map_has(name_offsets, target_d) and name_offsets[target_d] < 16384 {
+                _push_u16_be(rdata, bit_or(49152, name_offsets[target_d]));
+            } else {
+                _append_bytes(rdata, encode_dns_name(target_d));
+            }
+        } elif rtype == DNS_TYPE_TXT {
+            let txt_b = str_to_bytes(str(_opt(rec, "value", "")));
+            let ti = 0;
+            if len(txt_b) == 0 {
+                array_push(rdata, 0);
+            } else {
+                while ti < len(txt_b) {
+                    let chunk_n = if len(txt_b) - ti > 255 { 255 } else { len(txt_b) - ti };
+                    array_push(rdata, chunk_n);
+                    _append_bytes(rdata, slice(txt_b, ti, ti + chunk_n));
+                    ti = ti + chunk_n;
+                }
+            }
+        } elif rtype == DNS_TYPE_MX {
+            _push_u16_be(rdata, _opt(rec, "preference", 10));
+            _append_bytes(rdata, encode_dns_name(_opt(rec, "exchange", _opt(rec, "value", ""))));
+        } elif rtype == DNS_TYPE_SRV {
+            _push_u16_be(rdata, _opt(rec, "priority", 10));
+            _push_u16_be(rdata, _opt(rec, "weight", 5));
+            _push_u16_be(rdata, _opt(rec, "port", 443));
+            _append_bytes(rdata, encode_dns_name(_opt(rec, "target", _opt(rec, "value", ""))));
+        } else {
+            let raw_rd = _opt(rec, "rdata", []);
+            _append_bytes(rdata, raw_rd);
+        }
+
+        _push_u16_be(pkt, len(rdata));
+        _append_bytes(pkt, rdata);
+        a = a + 1;
+    }
+
+    return pkt;
+}
+
+fn _decode_dns_rr_section(pkt, pos, count) {
+    let records = [];
+    let i = 0;
+    while i < count {
+        let nm = decode_dns_name(pkt, pos);
+        pos = nm.next;
+        if pos + 10 > len(pkt) {
+            throw "udp_dns_quic_realtime: truncated DNS resource record header";
+        }
+        let rtype = _read_u16_be(pkt, pos);
+        let rclass = _read_u16_be(pkt, pos + 2);
+        let ttl = _read_u32_be(pkt, pos + 4);
+        let rdlen = _read_u16_be(pkt, pos + 8);
+        pos = pos + 10;
+        if pos + rdlen > len(pkt) {
+            throw "udp_dns_quic_realtime: DNS RDATA exceeds packet length";
+        }
+
+        let val = nil;
+        if rtype == DNS_TYPE_A and rdlen == 4 {
+            val = str(pkt[pos]) + "." + str(pkt[pos + 1]) + "." + str(pkt[pos + 2]) + "." + str(pkt[pos + 3]);
+        } elif rtype == DNS_TYPE_AAAA and rdlen == 16 {
+            val = _format_ipv6_16bytes(slice(pkt, pos, pos + 16));
+        } elif rtype == DNS_TYPE_CNAME or rtype == DNS_TYPE_NS or rtype == DNS_TYPE_PTR {
+            val = decode_dns_name(pkt, pos).name;
+        } elif rtype == DNS_TYPE_TXT {
+            let parts = [];
+            let tp = pos;
+            let tend = pos + rdlen;
+            while tp < tend {
+                let slen = pkt[tp];
+                tp = tp + 1;
+                if tp + slen > tend {
+                    throw "udp_dns_quic_realtime: malformed DNS TXT character-string length";
+                }
+                array_push(parts, bytes_to_str(slice(pkt, tp, tp + slen)));
+                tp = tp + slen;
+            }
+            val = array_join(parts, "");
+        } elif rtype == DNS_TYPE_MX and rdlen >= 3 {
+            let pref = _read_u16_be(pkt, pos);
+            let exch = decode_dns_name(pkt, pos + 2).name;
+            val = map{ preference: pref, exchange: exch };
+        } elif rtype == DNS_TYPE_SRV and rdlen >= 7 {
+            let prio = _read_u16_be(pkt, pos);
+            let wgt = _read_u16_be(pkt, pos + 2);
+            let prt = _read_u16_be(pkt, pos + 4);
+            let tgt = decode_dns_name(pkt, pos + 6).name;
+            val = map{ priority: prio, weight: wgt, port: prt, target: tgt };
+        } else {
+            val = slice(pkt, pos, pos + rdlen);
+        }
+
+        array_push(records, map{
+            name: nm.name,
+            type: rtype,
+            class: rclass,
+            ttl: ttl,
+            value: val
+        });
+        pos = pos + rdlen;
+        i = i + 1;
+    }
+    return map{ records: records, next: pos };
+}
+
+fn decode_dns_packet(pkt_bytes) {
+    let pkt = if is_array(pkt_bytes) { pkt_bytes } else { str_to_bytes(str(pkt_bytes)) };
+    if len(pkt) < 12 {
+        throw "udp_dns_quic_realtime: DNS packet shorter than 12-byte header";
+    }
+    let id = _read_u16_be(pkt, 0);
+    let flags = _read_u16_be(pkt, 2);
+    let qdcount = _read_u16_be(pkt, 4);
+    let ancount = _read_u16_be(pkt, 6);
+    let nscount = _read_u16_be(pkt, 8);
+    let arcount = _read_u16_be(pkt, 10);
+
+    let pos = 12;
+    let questions = [];
+    let q = 0;
+    while q < qdcount {
+        let nm = decode_dns_name(pkt, pos);
+        pos = nm.next;
+        if pos + 4 > len(pkt) {
+            throw "udp_dns_quic_realtime: truncated DNS question entry";
+        }
+        array_push(questions, map{
+            name: nm.name,
+            qtype: _read_u16_be(pkt, pos),
+            qclass: _read_u16_be(pkt, pos + 2)
+        });
+        pos = pos + 4;
+        q = q + 1;
+    }
+
+    let an = _decode_dns_rr_section(pkt, pos, ancount);
+    let ns = _decode_dns_rr_section(pkt, an.next, nscount);
+    let ar = _decode_dns_rr_section(pkt, ns.next, arcount);
+
+    return map{
+        id: id,
+        qr: bit_and(bit_shr(flags, 15), 1) == 1,
+        opcode: bit_and(bit_shr(flags, 11), 15),
+        aa: bit_and(bit_shr(flags, 10), 1) == 1,
+        tc: bit_and(bit_shr(flags, 9), 1) == 1,
+        rd: bit_and(bit_shr(flags, 8), 1) == 1,
+        ra: bit_and(bit_shr(flags, 7), 1) == 1,
+        rcode: bit_and(flags, 15),
+        questions: questions,
+        answers: an.records,
+        authorities: ns.records,
+        additionals: ar.records
+    };
+}
+
+fn decode_dns_response(pkt_bytes) {
+    return decode_dns_packet(pkt_bytes);
+}
+
+fn dns_lookup_udp(domain, qtype = 1, server_addr = "127.0.0.1:53", timeout_ms = 2000) {
+    let q = encode_dns_query(domain, qtype, nil, true);
+    let sock = udp_bind("127.0.0.1:0");
+    let res = try map{
+        ok: true,
+        val: fn() {
+            udp_sendto(sock, q.packet, server_addr);
+            let rx = udp_recvfrom(sock, 4096, timeout_ms);
+            if not rx.ok {
+                throw "udp_dns_quic_realtime: DNS UDP query timed out";
+            }
+            let dec = decode_dns_packet(rx.data);
+            if dec.id != q.id {
+                throw "udp_dns_quic_realtime: DNS transaction ID mismatch (anti-spoofing guard)";
+            }
+            return dec;
+        }()
+    } catch map{ ok: false, val: nil };
+    udp_close(sock);
+    if not res.ok {
+        throw "udp_dns_quic_realtime: dns_lookup_udp failed";
+    }
+    return res.val;
+}
+
+// ── RFC 5389 STUN Binding Request / XOR-MAPPED-ADDRESS Codec ─────────────────
+
+fn encode_stun_binding_request(tx_id_12 = nil) {
+    let tid = if is_array(tx_id_12) and len(tx_id_12) == 12 { tx_id_12 } else { random_bytes(12) };
+    let pkt = [];
+    _push_u16_be(pkt, STUN_BINDING_REQUEST); // 0x0001
+    _push_u16_be(pkt, 0);                    // attr length = 0
+    _append_bytes(pkt, STUN_MAGIC_COOKIE_BYTES);
+    _append_bytes(pkt, tid);
+    return map{
+        tx_id: tid,
+        packet: pkt
+    };
+}
+
+fn encode_stun_binding_response(tx_id_12, mapped_ip, mapped_port) {
+    if not is_array(tx_id_12) or len(tx_id_12) != 12 {
+        throw "udp_dns_quic_realtime: STUN transaction ID must be 12 bytes";
+    }
+    let attr = [];
+    let is_v6 = str_contains(str(mapped_ip), ":");
+    let xport_hi = bit_xor(bit_and(bit_shr(mapped_port, 8), 255), STUN_MAGIC_COOKIE_BYTES[0]);
+    let xport_lo = bit_xor(bit_and(mapped_port, 255), STUN_MAGIC_COOKIE_BYTES[1]);
+
+    if is_v6 {
+        let ip16 = _parse_ipv6_16bytes(mapped_ip);
+        let mask16 = [];
+        _append_bytes(mask16, STUN_MAGIC_COOKIE_BYTES);
+        _append_bytes(mask16, tx_id_12);
+        _push_u16_be(attr, STUN_ATTR_XOR_MAPPED_ADDRESS); // 0x0020
+        _push_u16_be(attr, 20);
+        array_push(attr, 0);
+        array_push(attr, 2); // IPv6 = 0x02
+        array_push(attr, xport_hi);
+        array_push(attr, xport_lo);
+        let i = 0;
+        while i < 16 {
+            array_push(attr, bit_xor(ip16[i], mask16[i]));
+            i = i + 1;
+        }
+    } else {
+        let ip4 = _parse_ipv4_host(mapped_ip);
+        _push_u16_be(attr, STUN_ATTR_XOR_MAPPED_ADDRESS); // 0x0020
+        _push_u16_be(attr, 8);
+        array_push(attr, 0);
+        array_push(attr, 1); // IPv4 = 0x01
+        array_push(attr, xport_hi);
+        array_push(attr, xport_lo);
+        let j = 0;
+        while j < 4 {
+            array_push(attr, bit_xor(ip4[j], STUN_MAGIC_COOKIE_BYTES[j]));
+            j = j + 1;
+        }
+    }
+
+    let pkt = [];
+    _push_u16_be(pkt, STUN_BINDING_RESPONSE); // 0x0101
+    _push_u16_be(pkt, len(attr));
+    _append_bytes(pkt, STUN_MAGIC_COOKIE_BYTES);
+    _append_bytes(pkt, tx_id_12);
+    _append_bytes(pkt, attr);
+    return pkt;
+}
+
+fn decode_stun_packet(pkt_bytes, expected_tx_id = nil) {
+    let b = if is_array(pkt_bytes) { pkt_bytes } else { str_to_bytes(str(pkt_bytes)) };
+    if len(b) < 20 {
+        throw "udp_dns_quic_realtime: STUN packet shorter than 20-byte header";
+    }
+    if bit_and(b[0], 192) != 0 {
+        throw "udp_dns_quic_realtime: invalid STUN top two header bits (RFC 5389 §6)";
+    }
+    let msg_type = _read_u16_be(b, 0);
+    let msg_len = _read_u16_be(b, 2);
+    if b[4] != 33 or b[5] != 18 or b[6] != 164 or b[7] != 66 {
+        throw "udp_dns_quic_realtime: invalid STUN magic cookie";
+    }
+    if 20 + msg_len > len(b) {
+        throw "udp_dns_quic_realtime: truncated STUN attributes";
+    }
+    let tid = slice(b, 8, 20);
+    if expected_tx_id != nil {
+        if not _ct_eq_bytes(tid, expected_tx_id) {
+            throw "udp_dns_quic_realtime: STUN transaction ID mismatch";
+        }
+    }
+
+    let mapped_ip = nil;
+    let mapped_port = nil;
+    let family = nil;
+
+    let pos = 20;
+    let end_pos = 20 + msg_len;
+    while pos + 4 <= end_pos {
+        let atype = _read_u16_be(b, pos);
+        let alen = _read_u16_be(b, pos + 2);
+        pos = pos + 4;
+        if pos + alen > end_pos {
+            throw "udp_dns_quic_realtime: STUN attribute exceeds message length";
+        }
+
+        if atype == STUN_ATTR_XOR_MAPPED_ADDRESS and alen >= 8 {
+            let fam = b[pos + 1];
+            let xp_hi = bit_xor(b[pos + 2], STUN_MAGIC_COOKIE_BYTES[0]);
+            let xp_lo = bit_xor(b[pos + 3], STUN_MAGIC_COOKIE_BYTES[1]);
+            mapped_port = xp_hi * 256 + xp_lo;
+            if fam == 1 and alen >= 8 {
+                family = "IPv4";
+                let a0 = bit_xor(b[pos + 4], STUN_MAGIC_COOKIE_BYTES[0]);
+                let a1 = bit_xor(b[pos + 5], STUN_MAGIC_COOKIE_BYTES[1]);
+                let a2 = bit_xor(b[pos + 6], STUN_MAGIC_COOKIE_BYTES[2]);
+                let a3 = bit_xor(b[pos + 7], STUN_MAGIC_COOKIE_BYTES[3]);
+                mapped_ip = str(a0) + "." + str(a1) + "." + str(a2) + "." + str(a3);
+            } elif fam == 2 and alen >= 20 {
+                family = "IPv6";
+                let mask16 = [];
+                _append_bytes(mask16, STUN_MAGIC_COOKIE_BYTES);
+                _append_bytes(mask16, tid);
+                let ip16 = [];
+                let k = 0;
+                while k < 16 {
+                    array_push(ip16, bit_xor(b[pos + 4 + k], mask16[k]));
+                    k = k + 1;
+                }
+                mapped_ip = _format_ipv6_16bytes(ip16);
+            }
+        } elif atype == STUN_ATTR_MAPPED_ADDRESS and alen >= 8 and mapped_ip == nil {
+            let fam2 = b[pos + 1];
+            mapped_port = _read_u16_be(b, pos + 2);
+            if fam2 == 1 {
+                family = "IPv4";
+                mapped_ip = str(b[pos + 4]) + "." + str(b[pos + 5]) + "." + str(b[pos + 6]) + "." + str(b[pos + 7]);
+            }
+        }
+
+        // RFC 5389 attributes are padded to 4-byte boundaries
+        let pad = (4 - (alen % 4)) % 4;
+        pos = pos + alen + pad;
+    }
+
+    return map{
+        ok: true,
+        msg_type: msg_type,
+        tx_id: tid,
+        family: family,
+        mapped_ip: mapped_ip,
+        mapped_port: mapped_port
+    };
+}
+
+fn stun_discover_udp(server_addr, timeout_ms = 2000) {
+    let req = encode_stun_binding_request(nil);
+    let sock = udp_bind("127.0.0.1:0");
+    let res = try map{
+        ok: true,
+        val: fn() {
+            udp_sendto(sock, req.packet, server_addr);
+            let rx = udp_recvfrom(sock, 1024, timeout_ms);
+            if not rx.ok { throw "udp_dns_quic_realtime: STUN request timed out"; }
+            return decode_stun_packet(rx.data, req.tx_id);
+        }()
+    } catch map{ ok: false, val: nil };
+    udp_close(sock);
+    if not res.ok { throw "udp_dns_quic_realtime: stun_discover_udp failed"; }
+    return res.val;
+}
+
+// ── RFC 9000 / RFC 9221 QUIC Variable-Length Ints, Headers & DATAGRAM Frames ─
+
+fn quic_encode_varint(n) {
+    if type(n) != "number" or n < 0 or n != num_floor(n) {
+        throw "udp_dns_quic_realtime: QUIC varint requires non-negative integer";
+    }
+    if n <= 63 {
+        return [n];
+    }
+    if n <= 16383 {
+        return [bit_or(64, bit_and(bit_shr(n, 8), 63)), bit_and(n, 255)];
+    }
+    if n <= 1073741823 {
+        let out4 = [];
+        _push_u32_be(out4, n);
+        out4[0] = bit_or(128, bit_and(out4[0], 63));
+        return out4;
+    }
+    if n <= 9007199254740991 {
+        let out8 = [];
+        _push_u64_be(out8, n);
+        out8[0] = bit_or(192, bit_and(out8[0], 63));
+        return out8;
+    }
+    throw "udp_dns_quic_realtime: QUIC varint exceeds safe integer precision";
+}
+
+fn quic_decode_varint(b, pos) {
+    if pos >= len(b) {
+        throw "udp_dns_quic_realtime: truncated QUIC varint";
+    }
+    let first = b[pos];
+    let prefix = bit_shr(first, 6);
+    let vlen = bit_shl(1, prefix);
+    if pos + vlen > len(b) {
+        throw "udp_dns_quic_realtime: truncated QUIC varint payload";
+    }
+    let val = bit_and(first, 63);
+    let i = 1;
+    while i < vlen {
+        val = val * 256.0 + b[pos + i];
+        i = i + 1;
+    }
+    return map{ value: val, next: pos + vlen, byte_len: vlen };
+}
+
+fn quic_encode_long_header(pkt_type, version_u32, dcid_bytes, scid_bytes, pkt_num_u32, payload_bytes) {
+    if len(dcid_bytes) > 20 or len(scid_bytes) > 20 {
+        throw "udp_dns_quic_realtime: QUICv1 CID length cannot exceed 20 bytes";
+    }
+    // Header Form = 1 (0x80) | Fixed Bit = 1 (0x40) | Long Packet Type (bits 4..5) | 4-byte PN (0x03)
+    let first_byte = bit_or(bit_or(192, bit_shl(bit_and(pkt_type, 3), 4)), 3);
+    let out = [first_byte];
+    _push_u32_be(out, version_u32);
+    array_push(out, len(dcid_bytes));
+    _append_bytes(out, dcid_bytes);
+    array_push(out, len(scid_bytes));
+    _append_bytes(out, scid_bytes);
+    if pkt_type == QUIC_PKT_INITIAL {
+        array_push(out, 0); // Token Length = 0
+    }
+    let rem_len = 4 + len(payload_bytes);
+    _append_bytes(out, quic_encode_varint(rem_len));
+    _push_u32_be(out, pkt_num_u32);
+    _append_bytes(out, payload_bytes);
+    return out;
+}
+
+fn quic_encode_short_header(dcid_bytes, pkt_seq_u64, payload_bytes = nil) {
+    // Header Form = 0 | Fixed Bit = 1 (0x40) | Packet Number marker (0x03)
+    let hdr = [67]; // 0x43
+    _append_bytes(hdr, dcid_bytes);
+    _push_u64_be(hdr, pkt_seq_u64);
+    if payload_bytes != nil {
+        _append_bytes(hdr, payload_bytes);
+    }
+    return hdr;
+}
+
+fn quic_decode_header(pkt_bytes, short_dcid_len = 8) {
+    let b = if is_array(pkt_bytes) { pkt_bytes } else { str_to_bytes(str(pkt_bytes)) };
+    if len(b) < 2 {
+        throw "udp_dns_quic_realtime: QUIC packet too short";
+    }
+    let first = b[0];
+    if bit_and(first, 64) == 0 {
+        throw "udp_dns_quic_realtime: QUIC Fixed Bit (0x40) must be 1";
+    }
+    let is_long = bit_and(first, 128) != 0;
+    if is_long {
+        if len(b) < 7 { throw "udp_dns_quic_realtime: truncated QUIC Long Header"; }
+        let ltype = bit_and(bit_shr(first, 4), 3);
+        let ver = _read_u32_be(b, 1);
+        let dcid_len = b[5];
+        let pos = 6;
+        let dcid = slice(b, pos, pos + dcid_len);
+        pos = pos + dcid_len;
+        let scid_len = b[pos];
+        pos = pos + 1;
+        let scid = slice(b, pos, pos + scid_len);
+        pos = pos + scid_len;
+        if ltype == QUIC_PKT_INITIAL {
+            let tok_vi = quic_decode_varint(b, pos);
+            pos = tok_vi.next + tok_vi.value;
+        }
+        let len_vi = quic_decode_varint(b, pos);
+        pos = len_vi.next;
+        let pnum = _read_u32_be(b, pos);
+        pos = pos + 4;
+        return map{
+            form: "long",
+            packet_type: ltype,
+            version: ver,
+            dcid: dcid,
+            scid: scid,
+            packet_number: pnum,
+            payload_offset: pos,
+            payload: slice(b, pos, len(b))
+        };
+    }
+
+    let need = 1 + short_dcid_len + 8;
+    if len(b) < need {
+        throw "udp_dns_quic_realtime: truncated QUIC Short 1-RTT Header";
+    }
+    let dcid_s = slice(b, 1, 1 + short_dcid_len);
+    let seq = _read_u64_be(b, 1 + short_dcid_len);
+    return map{
+        form: "short",
+        first_byte: first,
+        dcid: dcid_s,
+        packet_number: seq,
+        payload_offset: need,
+        payload: slice(b, need, len(b))
+    };
+}
+
+fn quic_encode_datagram_frame(app_bytes_or_str, include_length = true) {
+    let raw = if is_array(app_bytes_or_str) { app_bytes_or_str } else { str_to_bytes(str(app_bytes_or_str)) };
+    let out = [];
+    if include_length {
+        array_push(out, QUIC_FRAME_DATAGRAM_LEN); // 0x31
+        _append_bytes(out, quic_encode_varint(len(raw)));
+    } else {
+        array_push(out, QUIC_FRAME_DATAGRAM);     // 0x30
+    }
+    _append_bytes(out, raw);
+    return out;
+}
+
+fn quic_decode_datagram_frame(frame_bytes, pos = 0) {
+    if pos >= len(frame_bytes) {
+        throw "udp_dns_quic_realtime: empty QUIC DATAGRAM frame";
+    }
+    let ftype = frame_bytes[pos];
+    if ftype == QUIC_FRAME_DATAGRAM {
+        return map{
+            frame_type: ftype,
+            data: slice(frame_bytes, pos + 1, len(frame_bytes)),
+            next: len(frame_bytes)
+        };
+    }
+    if ftype == QUIC_FRAME_DATAGRAM_LEN {
+        let vi = quic_decode_varint(frame_bytes, pos + 1);
+        let end_p = vi.next + vi.value;
+        if end_p > len(frame_bytes) {
+            throw "udp_dns_quic_realtime: truncated QUIC DATAGRAM(0x31) payload";
+        }
+        return map{
+            frame_type: ftype,
+            data: slice(frame_bytes, vi.next, end_p),
+            next: end_p
+        };
+    }
+    throw "udp_dns_quic_realtime: unexpected QUIC frame type " + str(ftype);
+}
+
+// ── Authenticated Anti-Replay QUIC 1-RTT Real-Time Telemetry Channel ─────────
+
+fn _normalize_key32(secret) {
+    if is_array(secret) {
+        if len(secret) == 32 { return secret; }
+        return str_to_bytes(hex_decode(sha256(bytes_to_str(secret))));
+    }
+    let s = str(secret);
+    let bs = str_to_bytes(s);
+    if len(bs) == 32 { return bs; }
+    return str_to_bytes(hex_decode(sha256(s)));
+}
+
+fn _derive_packet_nonce12(iv_base12, seq_u64) {
+    let seq_be8 = [];
+    _push_u64_be(seq_be8, seq_u64);
+    let nonce = [];
+    let i = 0;
+    while i < 4 {
+        array_push(nonce, iv_base12[i]);
+        i = i + 1;
+    }
+    let j = 0;
+    while j < 8 {
+        array_push(nonce, bit_xor(iv_base12[4 + j], seq_be8[j]));
+        j = j + 1;
+    }
+    return nonce;
+}
+
+fn new_telemetry_channel(shared_key, opts = nil) {
+    let key32 = _normalize_key32(shared_key);
+    let dcid = _opt(opts, "dcid", nil);
+    if not is_array(dcid) or len(dcid) != 8 {
+        dcid = slice(str_to_bytes(hex_decode(sha256("pblang-quic-dcid:" + bytes_to_str(key32)))), 0, 8);
+    }
+    let iv_base12 = slice(str_to_bytes(hex_decode(sha256("pblang-quic-iv:" + bytes_to_str(key32)))), 0, 12);
+    let win_size = _opt(opts, "replay_window", 64);
+    if type(win_size) != "number" or win_size < 8 { win_size = 64; }
+
+    return map{
+        format: "pblang.net.quic_telemetry.v1",
+        key32: key32,
+        dcid: dcid,
+        iv_base12: iv_base12,
+        tx_seq: 0,
+        max_rx_seq: 0,
+        seen_seqs: map{},
+        replay_window: win_size,
+        packets_sent: 0,
+        packets_received: 0,
+        replays_blocked: 0
+    };
+}
+
+fn encode_telemetry_datagram(chan, payload_bytes_or_str) {
+    chan.tx_seq = chan.tx_seq + 1;
+    let seq = chan.tx_seq;
+    let hdr_aad = quic_encode_short_header(chan.dcid, seq, nil); // 1 + 8 + 8 = 17 bytes AAD
+    let frame_plain = quic_encode_datagram_frame(payload_bytes_or_str, true);
+    let nonce12 = _derive_packet_nonce12(chan.iv_base12, seq);
+    let enc = AES_GCM.aes256_gcm_encrypt_bytes_with_aad(frame_plain, chan.key32, nonce12, hdr_aad);
+
+    let wire = [];
+    _append_bytes(wire, hdr_aad);
+    _append_bytes(wire, enc.ciphertext);
+    _append_bytes(wire, enc.tag); // 16-byte GCM authentication tag
+    chan.packets_sent = chan.packets_sent + 1;
+    return wire;
+}
+
+fn decode_telemetry_datagram(chan, wire_bytes) {
+    let b = if is_array(wire_bytes) { wire_bytes } else { str_to_bytes(str(wire_bytes)) };
+    // Minimum size: 17-byte Short Header + 2-byte minimal DATAGRAM frame + 16-byte AEAD tag = 35 bytes
+    if len(b) < 35 {
+        throw "udp_dns_quic_realtime: QUIC telemetry datagram too short";
+    }
+    let hdr = quic_decode_header(b, 8);
+    if hdr.form != "short" {
+        throw "udp_dns_quic_realtime: expected QUIC Short 1-RTT header";
+    }
+    if not _ct_eq_bytes(hdr.dcid, chan.dcid) {
+        throw "udp_dns_quic_realtime: QUIC DCID mismatch";
+    }
+
+    let seq = hdr.packet_number;
+    if seq < 1 {
+        throw "udp_dns_quic_realtime: invalid packet number 0";
+    }
+    if chan.max_rx_seq > chan.replay_window and seq <= chan.max_rx_seq - chan.replay_window {
+        chan.replays_blocked = chan.replays_blocked + 1;
+        throw "udp_dns_quic_realtime: ancient packet outside anti-replay window rejected";
+    }
+    let skey = str(seq);
+    if map_has(chan.seen_seqs, skey) {
+        chan.replays_blocked = chan.replays_blocked + 1;
+        throw "udp_dns_quic_realtime: replayed QUIC packet sequence " + skey + " rejected";
+    }
+
+    let hdr_aad = slice(b, 0, 17);
+    let ct_end = len(b) - 16;
+    let ct = slice(b, 17, ct_end);
+    let tag16 = slice(b, ct_end, len(b));
+    let nonce12 = _derive_packet_nonce12(chan.iv_base12, seq);
+
+    let dec = AES_GCM.aes256_gcm_decrypt_bytes_with_aad(ct, chan.key32, nonce12, tag16, hdr_aad);
+    if not dec.ok {
+        throw "udp_dns_quic_realtime: QUIC AEAD authentication failed (tampered or wrong key)";
+    }
+
+    // Update anti-replay window ONLY after cryptographic authentication succeeds (RFC 9000 §21.3)!
+    chan.seen_seqs[skey] = true;
+    if seq > chan.max_rx_seq {
+        chan.max_rx_seq = seq;
+        // Prune expired sequence keys outside window
+        let cutoff = chan.max_rx_seq - chan.replay_window;
+        if cutoff > 0 {
+            let ks = map_keys(chan.seen_seqs);
+            let i = 0;
+            while i < len(ks) {
+                if parse_number(ks[i]) <= cutoff {
+                    map_remove(chan.seen_seqs, ks[i]);
+                }
+                i = i + 1;
+            }
+        }
+    }
+    chan.packets_received = chan.packets_received + 1;
+
+    let dgram = quic_decode_datagram_frame(dec.plaintext, 0);
+    return map{
+        ok: true,
+        seq: seq,
+        dcid: hdr.dcid,
+        data: dgram.data,
+        text: bytes_to_str(dgram.data)
+    };
+}
+
+fn udp_telemetry_send(sock, chan, payload_bytes_or_str, target_addr) {
+    let wire = encode_telemetry_datagram(chan, payload_bytes_or_str);
+    return udp_sendto(sock, wire, target_addr);
+}
+
+fn udp_telemetry_recv(sock, chan, timeout_ms = 2000) {
+    let rx = udp_recvfrom(sock, 4096, timeout_ms);
+    if not rx.ok {
+        return map{ ok: false, timed_out: true };
+    }
+    let dec = decode_telemetry_datagram(chan, rx.data);
+    dec.peer_addr = rx.addr;
+    dec.peer_host = rx.host;
+    dec.peer_port = rx.port;
+    return dec;
+}
+
+export DNS_TYPE_A, DNS_TYPE_NS, DNS_TYPE_CNAME, DNS_TYPE_SOA, DNS_TYPE_PTR,
+       DNS_TYPE_MX, DNS_TYPE_TXT, DNS_TYPE_AAAA, DNS_TYPE_SRV, DNS_CLASS_IN,
+       STUN_BINDING_REQUEST, STUN_BINDING_RESPONSE,
+       STUN_ATTR_MAPPED_ADDRESS, STUN_ATTR_XOR_MAPPED_ADDRESS,
+       QUIC_VERSION_1, QUIC_PKT_INITIAL, QUIC_PKT_0RTT, QUIC_PKT_HANDSHAKE, QUIC_PKT_RETRY,
+       QUIC_FRAME_DATAGRAM, QUIC_FRAME_DATAGRAM_LEN,
+       udp_bind, udp_local_addr, udp_sendto, udp_recvfrom, udp_close,
+       encode_dns_name, decode_dns_name, encode_dns_query, encode_dns_response,
+       decode_dns_packet, decode_dns_response, dns_lookup_udp,
+       encode_stun_binding_request, encode_stun_binding_response, decode_stun_packet, stun_discover_udp,
+       quic_encode_varint, quic_decode_varint,
+       quic_encode_long_header, quic_encode_short_header, quic_decode_header,
+       quic_encode_datagram_frame, quic_decode_datagram_frame,
+       new_telemetry_channel, encode_telemetry_datagram, decode_telemetry_datagram,
+       udp_telemetry_send, udp_telemetry_recv;

@@ -196,7 +196,8 @@ typedef enum {
     ZR_NET_NONE = 0,
     ZR_NET_LISTENER,
     ZR_NET_TLS_LISTENER,
-    ZR_NET_STREAM
+    ZR_NET_STREAM,
+    ZR_NET_UDP
 } ZrNetKind;
 
 typedef struct {
@@ -658,14 +659,15 @@ static ptrdiff_t zr_find_bytes(const uint8_t *hay, size_t hlen, const uint8_t *n
 
 static bool bi_tcp_read_until(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_NET), "tcp_read_until", "net")) return false;
-    if (argc != 3 || !val_is_obj(argv[1], OBJ_STR) || argv[2].tag != VAL_NUM || argv[2].u.num < 0.0) {
-        vm_raise(vm, "tcp_read_until(handle, delim, max_bytes) expects (handle, string, number)");
+    if ((argc != 2 && argc != 3) || !val_is_obj(argv[1], OBJ_STR) ||
+        (argc == 3 && (argv[2].tag != VAL_NUM || argv[2].u.num < 0.0))) {
+        vm_raise(vm, "tcp_read_until(handle, delim[, max_bytes]) expects (handle, string[, number])");
         return false;
     }
     size_t id = 0;
     if (!zr_net_arg_handle(vm, argv[0], "tcp_read_until", &id)) return false;
     PbStr *delim = (PbStr *)val_as_obj(argv[1]);
-    size_t max_bytes = (size_t)argv[2].u.num;
+    size_t max_bytes = (argc == 3) ? (size_t)argv[2].u.num : 65536u;
 
     ZrNetEntry *e = zr_net_checkout(id);
     if (!e || e->kind != ZR_NET_STREAM) {
@@ -1065,17 +1067,171 @@ static bool zr_parse_url(const char *url, bool *is_https, char host[512], uint16
     return host[0] != '\0';
 }
 
-#if !defined(_WIN32)
-static bool zr_decode_chunked_body(const uint8_t *in, size_t in_len, ZrBuf *out) {
+static inline char zr_ascii_lc(char c) {
+    return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+}
+
+static bool zr_ieq_str(const char *a, const char *b) {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        if (zr_ascii_lc(*a) != zr_ascii_lc(*b)) return false;
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static inline bool zr_istarts_with(const char *s, const char *pfx) {
+    while (*pfx) {
+        if (!*s || zr_ascii_lc(*s) != zr_ascii_lc(*pfx)) return false;
+        s++;
+        pfx++;
+    }
+    return true;
+}
+
+static bool zr_icontains_sub(const char *hay, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0) return true;
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nlen && p[i] && zr_ascii_lc(p[i]) == zr_ascii_lc(needle[i])) i++;
+        if (i == nlen) return true;
+    }
+    return false;
+}
+
+/* ---- 8-Slot Thread-Safe HTTP/1.1 Keep-Alive Connection Pool ---- */
+#define ZR_HTTP_POOL_CAP 8
+typedef struct {
+    bool      active;
+    bool      is_https;
+    uint16_t  port;
+    char      host[512];
+    ZrSock    sock;
+    ZrSslCtx *ssl_ctx;
+    ZrSsl    *ssl;
+    uint64_t  last_tick;
+} ZrHttpPoolSlot;
+
+static ZrHttpPoolSlot g_zr_http_pool[ZR_HTTP_POOL_CAP];
+static uint64_t       g_zr_http_pool_tick = 0;
+
+static bool zr_sock_idle_healthy(ZrSock s) {
+    if (s == ZR_INVALID_SOCK) return false;
+#if defined(__wasi__)
+    return false;
+#elif defined(_WIN32)
+    fd_set rfds, efds;
+    FD_ZERO(&rfds);
+    FD_ZERO(&efds);
+    FD_SET(s, &rfds);
+    FD_SET(s, &efds);
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    /* Any readable/error readiness on an idle keep-alive client socket means peer FIN or stale unread data */
+    if (select(0, &rfds, NULL, &efds, &tv) != 0) return false;
+    return true;
+#else
+    struct pollfd pfd;
+    pfd.fd = s;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    if (poll(&pfd, 1, 0) != 0) return false;
+    return true;
+#endif
+}
+
+static void zr_http_pool_close_slot_unlocked(ZrHttpPoolSlot *sl) {
+    if (!sl->active) return;
+    ZrNetEntry tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.kind = ZR_NET_STREAM;
+    tmp.sock = sl->sock;
+    tmp.ssl_ctx = sl->ssl_ctx;
+    tmp.ssl = sl->ssl;
+    zr_net_destroy_entry(&tmp);
+    memset(sl, 0, sizeof(*sl));
+    sl->sock = ZR_INVALID_SOCK;
+}
+
+static bool zr_http_pool_acquire(const char *host, uint16_t port, bool is_https, uint64_t timeout_ms, ZrNetEntry *out_e) {
+    zr_net_subsystem_init();
+    zr_mutex_lock(&g_zr_net_mtx);
+    for (size_t i = 0; i < ZR_HTTP_POOL_CAP; i++) {
+        ZrHttpPoolSlot *sl = &g_zr_http_pool[i];
+        if (sl->active && sl->is_https == is_https && sl->port == port && zr_ieq_str(sl->host, host)) {
+            if (!zr_sock_idle_healthy(sl->sock)) {
+                zr_http_pool_close_slot_unlocked(sl);
+                continue;
+            }
+            memset(out_e, 0, sizeof(*out_e));
+            out_e->kind = ZR_NET_STREAM;
+            out_e->sock = sl->sock;
+            out_e->ssl_ctx = sl->ssl_ctx;
+            out_e->ssl = sl->ssl;
+            zr_set_sock_timeouts(out_e->sock, timeout_ms ? timeout_ms : 15000ULL);
+            memset(sl, 0, sizeof(*sl));
+            sl->sock = ZR_INVALID_SOCK;
+            zr_mutex_unlock(&g_zr_net_mtx);
+            return true;
+        }
+    }
+    zr_mutex_unlock(&g_zr_net_mtx);
+    return false;
+}
+
+static void zr_http_pool_release(const char *host, uint16_t port, bool is_https, ZrNetEntry *e) {
+    if (!e || e->sock == ZR_INVALID_SOCK) return;
+    zr_net_subsystem_init();
+    zr_mutex_lock(&g_zr_net_mtx);
+    if (!zr_sock_idle_healthy(e->sock)) {
+        zr_mutex_unlock(&g_zr_net_mtx);
+        zr_net_destroy_entry(e);
+        return;
+    }
+    size_t target = 0;
+    bool found_free = false;
+    uint64_t oldest_tick = UINT64_MAX;
+    for (size_t i = 0; i < ZR_HTTP_POOL_CAP; i++) {
+        if (!g_zr_http_pool[i].active) {
+            target = i;
+            found_free = true;
+            break;
+        }
+        if (g_zr_http_pool[i].last_tick < oldest_tick) {
+            oldest_tick = g_zr_http_pool[i].last_tick;
+            target = i;
+        }
+    }
+    if (!found_free) {
+        zr_http_pool_close_slot_unlocked(&g_zr_http_pool[target]);
+    }
+    ZrHttpPoolSlot *sl = &g_zr_http_pool[target];
+    sl->active = true;
+    sl->is_https = is_https;
+    sl->port = port;
+    snprintf(sl->host, sizeof(sl->host), "%.510s", host);
+    sl->sock = e->sock;
+    sl->ssl_ctx = e->ssl_ctx;
+    sl->ssl = e->ssl;
+    sl->last_tick = ++g_zr_http_pool_tick;
+    zr_buf_free(&e->rx_buf);
+    memset(e, 0, sizeof(*e));
+    e->sock = ZR_INVALID_SOCK;
+    zr_mutex_unlock(&g_zr_net_mtx);
+}
+
+static inline bool zr_decode_chunked_body(const uint8_t *in, size_t in_len, ZrBuf *out) {
     size_t pos = 0;
     while (pos < in_len) {
-        /* Find \r\n ending chunk size line */
         size_t line_end = pos;
         while (line_end + 1 < in_len && !(in[line_end] == '\r' && in[line_end + 1] == '\n')) line_end++;
         if (line_end + 1 >= in_len) break;
         size_t chunk_sz = 0;
         for (size_t i = pos; i < line_end; i++) {
-            if (in[i] == ';') break;
+            if (in[i] == ';' || in[i] == ' ' || in[i] == '\t') break;
             int nib = zr_hex_nibble((char)in[i]);
             if (nib < 0) break;
             chunk_sz = (chunk_sz << 4) | (size_t)nib;
@@ -1092,12 +1248,364 @@ static bool zr_decode_chunked_body(const uint8_t *in, size_t in_len, ZrBuf *out)
     }
     return true;
 }
-#endif
 
-static bool zr_http_request_exec(PbVM *vm, const char *method, const char *url,
-                                 const char **hdr_keys, const char **hdr_vals, size_t nhdrs,
-                                 const uint8_t *body, size_t body_len, ZrBuf *resp_body,
-                                 int redirect_depth, bool raise_on_http_error, int *out_status) {
+typedef struct {
+    PbValue  on_chunk;
+    bool     has_cb;
+    int      status_code;
+    PbMap   *headers_map;
+    size_t   bytes_received;
+    size_t   chunks_delivered;
+    bool     stopped_by_cb;
+} ZrHttpStreamSink;
+
+static bool zr_http_deliver_slice(PbVM *vm, ZrHttpStreamSink *sink, ZrBuf *resp_body,
+                                  const uint8_t *data, size_t len) {
+    if (len == 0) return true;
+    sink->bytes_received += len;
+    if (sink->has_cb) {
+        PbStr *chunk_s = vm_new_str(vm, (const char *)data, len);
+        vm_temp_push(vm, val_obj(chunk_s));
+        int cb_argc = 2;
+        if (sink->on_chunk.tag == VAL_OBJ && sink->on_chunk.as.obj->type == OBJ_CLOSURE) {
+            PbClosure *cl = (PbClosure *)sink->on_chunk.as.obj;
+            if (!cl->fn->is_vararg && cl->fn->arity == 1) cb_argc = 1;
+        }
+        PbValue args[2];
+        args[0] = val_obj(chunk_s);
+        args[1] = val_nil();
+        if (cb_argc == 2) {
+            PbMap *meta = vm_new_map(vm, 4);
+            vm_temp_push(vm, val_obj(meta));
+            map_set(meta, vm_const_str(vm, "status"), val_num((double)sink->status_code));
+            if (sink->headers_map) map_set(meta, vm_const_str(vm, "headers"), val_obj(sink->headers_map));
+            map_set(meta, vm_const_str(vm, "bytes_so_far"), val_num((double)sink->bytes_received));
+            map_set(meta, vm_const_str(vm, "chunk_index"), val_num((double)sink->chunks_delivered));
+            args[1] = val_obj(meta);
+        }
+        sink->chunks_delivered++;
+        PbValue ret = val_nil();
+        bool ok = vm_call_value_sync(vm, sink->on_chunk, cb_argc, args, &ret);
+        vm_temp_pop(vm, (cb_argc == 2) ? 2 : 1);
+        if (!ok) return false;
+        if (ret.tag == VAL_BOOL && !ret.as.b) {
+            sink->stopped_by_cb = true;
+            return true;
+        }
+        return true;
+    }
+    if (resp_body) zr_buf_append(resp_body, data, len);
+    return true;
+}
+
+static ptrdiff_t zr_find_hdr_end(const uint8_t *buf, size_t len, size_t *out_sep_len) {
+    for (size_t i = 0; i + 1 < len; i++) {
+        if (buf[i] == '\r' && i + 3 < len && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+            *out_sep_len = 4;
+            return (ptrdiff_t)i;
+        }
+        if (buf[i] == '\n' && buf[i + 1] == '\n') {
+            *out_sep_len = 2;
+            return (ptrdiff_t)i;
+        }
+    }
+    return -1;
+}
+
+static void zr_parse_http_headers_into(PbVM *vm, const char *hdr_str, PbMap *hdr_map,
+                                       bool *is_http10, bool *conn_close, bool *conn_keep_alive,
+                                       bool *is_chunked, bool *has_cl, uint64_t *content_length,
+                                       char loc_out[2048]) {
+    *is_http10 = (strncmp(hdr_str, "HTTP/1.0", 8) == 0);
+    *conn_close = false;
+    *conn_keep_alive = false;
+    *is_chunked = false;
+    *has_cl = false;
+    *content_length = 0;
+    if (loc_out) loc_out[0] = '\0';
+
+    const char *line = strchr(hdr_str, '\n');
+    if (!line) return;
+    line++;
+    while (*line) {
+        const char *eol = strchr(line, '\n');
+        size_t llen = eol ? (size_t)(eol - line) : strlen(line);
+        if (llen > 0 && line[llen - 1] == '\r') llen--;
+        const char *colon = (const char *)memchr(line, ':', llen);
+        if (colon && colon > line) {
+            size_t klen = (size_t)(colon - line);
+            while (klen > 0 && (line[klen - 1] == ' ' || line[klen - 1] == '\t')) klen--;
+            const char *vp = colon + 1;
+            size_t vlen = llen - (size_t)(vp - line);
+            while (vlen > 0 && (*vp == ' ' || *vp == '\t')) { vp++; vlen--; }
+            while (vlen > 0 && (vp[vlen - 1] == ' ' || vp[vlen - 1] == '\t')) vlen--;
+
+            char klow[256];
+            size_t kl = klen < sizeof(klow) - 1 ? klen : sizeof(klow) - 1;
+            for (size_t i = 0; i < kl; i++) klow[i] = zr_ascii_lc(line[i]);
+            klow[kl] = '\0';
+
+            char *vcopy = (char *)zr_xmalloc(vlen + 1);
+            memcpy(vcopy, vp, vlen);
+            vcopy[vlen] = '\0';
+
+            if (hdr_map) {
+                PbStr *ks = vm_new_str(vm, klow, kl);
+                vm_temp_push(vm, val_obj(ks));
+                PbStr *vs = vm_new_str(vm, vcopy, vlen);
+                map_set(hdr_map, ks, val_obj(vs));
+                vm_temp_pop(vm, 1);
+            }
+            if (strcmp(klow, "connection") == 0) {
+                if (zr_icontains_sub(vcopy, "close")) *conn_close = true;
+                if (zr_icontains_sub(vcopy, "keep-alive")) *conn_keep_alive = true;
+            } else if (strcmp(klow, "transfer-encoding") == 0) {
+                if (zr_icontains_sub(vcopy, "chunked")) *is_chunked = true;
+            } else if (strcmp(klow, "content-length") == 0) {
+                char *endp = NULL;
+                unsigned long long clv = strtoull(vcopy, &endp, 10);
+                if (endp && endp != vcopy) {
+                    *has_cl = true;
+                    *content_length = (uint64_t)clv;
+                }
+            } else if (loc_out && strcmp(klow, "location") == 0) {
+                snprintf(loc_out, 2048, "%s", vcopy);
+            }
+            free(vcopy);
+        }
+        if (!eol) break;
+        line = eol + 1;
+    }
+    if (*is_chunked) *has_cl = false;
+}
+
+static bool zr_http_read_response_on_entry(PbVM *vm, ZrNetEntry *e, const char *method, const char *url,
+                                           const char *host, uint16_t port, bool is_https,
+                                           bool caller_wants_close, ZrBuf *resp_body,
+                                           ZrHttpStreamSink *sink, PbMap *hdr_map,
+                                           int *out_status, char redirect_loc[2048],
+                                           bool *out_zero_bytes_eof, char err_out[256]) {
+    *out_zero_bytes_eof = false;
+    if (redirect_loc) redirect_loc[0] = '\0';
+
+    ZrBuf raw;
+    zr_buf_init(&raw);
+    uint8_t rbuf[16384];
+    int status_code = 0;
+    size_t body_offset = 0;
+    bool is_http10 = false, conn_close = false, conn_keep_alive = false, is_chunked = false, has_cl = false;
+    uint64_t content_length = 0;
+
+    for (;;) {
+        size_t sep_len = 0;
+        ptrdiff_t sep = raw.data ? zr_find_hdr_end((const uint8_t *)raw.data, raw.len, &sep_len) : -1;
+        if (sep >= 0) {
+            char *hdr_str = (char *)zr_xmalloc((size_t)sep + 1);
+            memcpy(hdr_str, raw.data, (size_t)sep);
+            hdr_str[sep] = '\0';
+            status_code = 0;
+            sscanf(hdr_str, "HTTP/%*s %d", &status_code);
+            if (status_code >= 100 && status_code < 200 && status_code != 101) {
+                free(hdr_str);
+                size_t drop = (size_t)sep + sep_len;
+                if (raw.len > drop) memmove(raw.data, raw.data + drop, raw.len - drop);
+                raw.len -= drop;
+                continue;
+            }
+            zr_parse_http_headers_into(vm, hdr_str, hdr_map, &is_http10, &conn_close, &conn_keep_alive,
+                                       &is_chunked, &has_cl, &content_length, redirect_loc);
+            free(hdr_str);
+            body_offset = (size_t)sep + sep_len;
+            break;
+        }
+        if (raw.len > 65536) {
+            zr_buf_free(&raw);
+            snprintf(err_out, 256, "HTTP response headers exceed 64 KiB for '%s'", url);
+            return false;
+        }
+        ssize_t n = zr_stream_read_some(e, rbuf, sizeof(rbuf), err_out);
+        if (n <= 0) {
+            if (raw.len == 0) *out_zero_bytes_eof = true;
+            zr_buf_free(&raw);
+            if (err_out[0] == '\0') snprintf(err_out, 256, "unexpected EOF reading HTTP headers from '%s'", url);
+            return false;
+        }
+        zr_buf_append(&raw, rbuf, (size_t)n);
+    }
+
+    if (out_status) *out_status = status_code;
+    sink->status_code = status_code;
+
+    /* Bodyless responses per RFC 9112 */
+    bool no_body = (zr_ieq_str(method, "HEAD") || status_code == 204 || status_code == 304 ||
+                    (status_code >= 100 && status_code < 200));
+    bool framing_clean = false;
+
+    if (no_body) {
+        framing_clean = (raw.len == body_offset);
+    } else if (is_chunked) {
+        ZrBuf cbuf;
+        zr_buf_init(&cbuf);
+        if (raw.len > body_offset) {
+            zr_buf_append(&cbuf, (const uint8_t *)raw.data + body_offset, raw.len - body_offset);
+        }
+        size_t cpos = 0;
+        bool done_chunks = false;
+        while (!done_chunks && !sink->stopped_by_cb) {
+            /* Compact consumed prefix periodically */
+            if (cpos > 32768) {
+                if (cbuf.len > cpos) memmove(cbuf.data, cbuf.data + cpos, cbuf.len - cpos);
+                cbuf.len -= cpos;
+                cpos = 0;
+            }
+            /* Find \r\n terminating chunk-size line */
+            size_t line_end = cpos;
+            while (line_end + 1 < cbuf.len && !(cbuf.data[line_end] == '\r' && cbuf.data[line_end + 1] == '\n')) line_end++;
+            if (line_end + 1 >= cbuf.len) {
+                ssize_t n = zr_stream_read_some(e, rbuf, sizeof(rbuf), err_out);
+                if (n <= 0) break;
+                zr_buf_append(&cbuf, rbuf, (size_t)n);
+                continue;
+            }
+            size_t chunk_sz = 0;
+            bool hex_ok = false;
+            for (size_t i = cpos; i < line_end; i++) {
+                char ch = cbuf.data[i];
+                if (ch == ';' || ch == ' ' || ch == '\t') break;
+                int nib = zr_hex_nibble(ch);
+                if (nib < 0) { hex_ok = false; break; }
+                hex_ok = true;
+                chunk_sz = (chunk_sz << 4) | (size_t)nib;
+            }
+            if (!hex_ok) break;
+            cpos = line_end + 2;
+
+            if (chunk_sz == 0) {
+                /* Consume optional trailer headers + final \r\n */
+                for (;;) {
+                    if (cbuf.len - cpos >= 2 && cbuf.data[cpos] == '\r' && cbuf.data[cpos + 1] == '\n') {
+                        cpos += 2;
+                        framing_clean = (cpos == cbuf.len);
+                        done_chunks = true;
+                        break;
+                    }
+                    ptrdiff_t tr_end = (cbuf.len > cpos)
+                        ? zr_find_bytes((const uint8_t *)cbuf.data + cpos, cbuf.len - cpos, (const uint8_t *)"\r\n\r\n", 4)
+                        : -1;
+                    if (tr_end >= 0) {
+                        cpos += (size_t)tr_end + 4;
+                        framing_clean = (cpos == cbuf.len);
+                        done_chunks = true;
+                        break;
+                    }
+                    ssize_t n = zr_stream_read_some(e, rbuf, sizeof(rbuf), err_out);
+                    if (n <= 0) { done_chunks = true; break; }
+                    zr_buf_append(&cbuf, rbuf, (size_t)n);
+                }
+                break;
+            }
+
+            /* Stream/buffer chunk_sz bytes incrementally */
+            size_t rem = chunk_sz;
+            while (rem > 0 && !sink->stopped_by_cb) {
+                size_t avail = cbuf.len - cpos;
+                if (avail > 0) {
+                    size_t take = avail < rem ? avail : rem;
+                    if (!zr_http_deliver_slice(vm, sink, resp_body, (const uint8_t *)cbuf.data + cpos, take)) {
+                        zr_buf_free(&cbuf);
+                        zr_buf_free(&raw);
+                        return false;
+                    }
+                    cpos += take;
+                    rem -= take;
+                } else {
+                    size_t to_read = rem < sizeof(rbuf) ? rem : sizeof(rbuf);
+                    ssize_t n = zr_stream_read_some(e, rbuf, to_read, err_out);
+                    if (n <= 0) { rem = 0; done_chunks = true; break; }
+                    if (!zr_http_deliver_slice(vm, sink, resp_body, rbuf, (size_t)n)) {
+                        zr_buf_free(&cbuf);
+                        zr_buf_free(&raw);
+                        return false;
+                    }
+                    rem -= (size_t)n;
+                }
+            }
+            if (done_chunks || sink->stopped_by_cb) break;
+
+            /* Consume trailing \r\n after chunk data */
+            while (cbuf.len - cpos < 2) {
+                ssize_t n = zr_stream_read_some(e, rbuf, sizeof(rbuf), err_out);
+                if (n <= 0) { done_chunks = true; break; }
+                zr_buf_append(&cbuf, rbuf, (size_t)n);
+            }
+            if (cbuf.len - cpos >= 2 && cbuf.data[cpos] == '\r' && cbuf.data[cpos + 1] == '\n') {
+                cpos += 2;
+            } else {
+                break;
+            }
+        }
+        zr_buf_free(&cbuf);
+    } else if (has_cl) {
+        uint64_t rem = content_length;
+        size_t init_avail = (raw.len > body_offset) ? (raw.len - body_offset) : 0;
+        if (init_avail > 0 && rem > 0) {
+            size_t take = ((uint64_t)init_avail < rem) ? init_avail : (size_t)rem;
+            if (!zr_http_deliver_slice(vm, sink, resp_body, (const uint8_t *)raw.data + body_offset, take)) {
+                zr_buf_free(&raw);
+                return false;
+            }
+            rem -= (uint64_t)take;
+        }
+        while (rem > 0 && !sink->stopped_by_cb) {
+            size_t want = (rem < (uint64_t)sizeof(rbuf)) ? (size_t)rem : sizeof(rbuf);
+            ssize_t n = zr_stream_read_some(e, rbuf, want, err_out);
+            if (n <= 0) break;
+            if (!zr_http_deliver_slice(vm, sink, resp_body, rbuf, (size_t)n)) {
+                zr_buf_free(&raw);
+                return false;
+            }
+            rem -= (uint64_t)n;
+        }
+        if (rem == 0 && !sink->stopped_by_cb && init_avail <= content_length) {
+            framing_clean = true;
+        }
+    } else {
+        /* Close-delimited response body */
+        if (raw.len > body_offset) {
+            if (!zr_http_deliver_slice(vm, sink, resp_body, (const uint8_t *)raw.data + body_offset, raw.len - body_offset)) {
+                zr_buf_free(&raw);
+                return false;
+            }
+        }
+        while (!sink->stopped_by_cb) {
+            ssize_t n = zr_stream_read_some(e, rbuf, sizeof(rbuf), err_out);
+            if (n <= 0) break;
+            if (!zr_http_deliver_slice(vm, sink, resp_body, rbuf, (size_t)n)) {
+                zr_buf_free(&raw);
+                return false;
+            }
+            if (!sink->has_cb && resp_body && resp_body->len > 64 * 1024 * 1024) break;
+        }
+        framing_clean = false;
+    }
+
+    zr_buf_free(&raw);
+
+    bool keep_open = framing_clean && !sink->stopped_by_cb && !caller_wants_close &&
+                     !conn_close && (!is_http10 || conn_keep_alive);
+    if (keep_open) {
+        zr_http_pool_release(host, port, is_https, e);
+    } else {
+        zr_net_destroy_entry(e);
+    }
+    return true;
+}
+
+static bool zr_http_exchange(PbVM *vm, const char *method, const char *url,
+                             const char **hdr_keys, const char **hdr_vals, size_t nhdrs,
+                             const uint8_t *body, size_t body_len, ZrBuf *resp_body,
+                             PbMap *out_headers, ZrHttpStreamSink *opt_sink,
+                             int redirect_depth, bool raise_on_http_error, int *out_status) {
     if (out_status) *out_status = 0;
     if (redirect_depth > 5) {
         vm_raise(vm, "http_%s(): too many redirects", method);
@@ -1111,108 +1619,139 @@ static bool zr_http_request_exec(PbVM *vm, const char *method, const char *url,
         return false;
     }
 
+    ZrHttpStreamSink default_sink;
+    memset(&default_sink, 0, sizeof(default_sink));
+    default_sink.on_chunk = val_nil();
+    default_sink.headers_map = out_headers;
+    ZrHttpStreamSink *sink = opt_sink ? opt_sink : &default_sink;
+    sink->headers_map = out_headers;
+
 #if defined(_WIN32)
-    /* Native WinHTTP path on Windows (handles system TLS 1.3 + OS root store automatically) */
-    wchar_t whost[512], wpath[2048], wmethod[16];
-    MultiByteToWideChar(CP_UTF8, 0, host, -1, whost, 512);
-    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 2048);
-    MultiByteToWideChar(CP_UTF8, 0, method, -1, wmethod, 16);
+    /* On Windows, use WinHTTP for HTTPS when OpenSSL DLL is not present so OS root store works natively;
+       for HTTP (and HTTPS with OpenSSL), use the fast pooled HTTP/1.1 Keep-Alive engine! */
+    char ssl_probe[256];
+    ssl_probe[0] = '\0';
+    if (is_https && !zr_ensure_openssl(ssl_probe)) {
+        wchar_t whost[512], wpath[2048], wmethod[16];
+        MultiByteToWideChar(CP_UTF8, 0, host, -1, whost, 512);
+        MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 2048);
+        MultiByteToWideChar(CP_UTF8, 0, method, -1, wmethod, 16);
 
-    HINTERNET hSession = WinHttpOpen(L"pblang-zr/3.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) { vm_raise(vm, "WinHttpOpen failed"); return false; }
-    int tms = (int)(vm->caps.io_timeout_ms ? vm->caps.io_timeout_ms : 30000);
-    WinHttpSetTimeouts(hSession, tms, tms, tms, tms);
+        HINTERNET hSession = WinHttpOpen(L"pblang-zr/4.2", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) { vm_raise(vm, "WinHttpOpen failed"); return false; }
+        int tms = (int)(vm->caps.io_timeout_ms ? vm->caps.io_timeout_ms : 30000);
+        WinHttpSetTimeouts(hSession, tms, tms, tms, tms);
 
-    HINTERNET hConnect = WinHttpConnect(hSession, whost, (INTERNET_PORT)port, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); vm_raise(vm, "WinHttpConnect failed"); return false; }
+        HINTERNET hConnect = WinHttpConnect(hSession, whost, (INTERNET_PORT)port, 0);
+        if (!hConnect) { WinHttpCloseHandle(hSession); vm_raise(vm, "WinHttpConnect failed"); return false; }
 
-    DWORD flags = is_https ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hReq = WinHttpOpenRequest(hConnect, wmethod, wpath, NULL, WINHTTP_NO_REFERER,
-                                        WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hReq) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); vm_raise(vm, "WinHttpOpenRequest failed"); return false; }
+        HINTERNET hReq = WinHttpOpenRequest(hConnect, wmethod, wpath, NULL, WINHTTP_NO_REFERER,
+                                            WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!hReq) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); vm_raise(vm, "WinHttpOpenRequest failed"); return false; }
 
-    for (size_t i = 0; i < nhdrs; i++) {
-        char hline[2048];
-        snprintf(hline, sizeof(hline), "%s: %s", hdr_keys[i], hdr_vals[i]);
-        wchar_t whline[2048];
-        MultiByteToWideChar(CP_UTF8, 0, hline, -1, whline, 2048);
-        WinHttpAddRequestHeaders(hReq, whline, (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-    }
+        for (size_t i = 0; i < nhdrs; i++) {
+            char hline[2048];
+            snprintf(hline, sizeof(hline), "%s: %s", hdr_keys[i], hdr_vals[i]);
+            wchar_t whline[2048];
+            MultiByteToWideChar(CP_UTF8, 0, hline, -1, whline, 2048);
+            WinHttpAddRequestHeaders(hReq, whline, (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        }
 
-    BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                 (LPVOID)body, (DWORD)body_len, (DWORD)body_len, 0);
-    if (ok) ok = WinHttpReceiveResponse(hReq, NULL);
-    if (!ok) {
-        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
-        vm_raise(vm, "WinHTTP request failed for '%s'", url);
-        return false;
-    }
-    DWORD wstatus = 200;
-    DWORD wstatus_sz = sizeof(wstatus);
-    WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                        WINHTTP_HEADER_NAME_BY_INDEX, &wstatus, &wstatus_sz, WINHTTP_NO_HEADER_INDEX);
-    if (out_status) *out_status = (int)wstatus;
-    if (raise_on_http_error && wstatus >= 400) {
-        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
-        vm_raise(vm, "http status %d for '%s'", (int)wstatus, url);
-        return false;
-    }
-    DWORD avail = 0;
-    while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
-        uint8_t *tmp = (uint8_t *)zr_xmalloc(avail);
-        DWORD got = 0;
-        if (WinHttpReadData(hReq, tmp, avail, &got) && got > 0) zr_buf_append(resp_body, tmp, got);
-        free(tmp);
-    }
-    WinHttpCloseHandle(hReq);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
-    return true;
-#else
-    char port_s[16], err[256];
-    snprintf(port_s, sizeof(port_s), "%u", (unsigned)port);
-    ZrSock s = zr_connect_tcp_raw(host, port_s, vm->caps.io_timeout_ms, err);
-    if (s == ZR_INVALID_SOCK) { vm_raise(vm, "http %s '%s': %s", method, url, err); return false; }
-
-    ZrNetEntry tmp_e;
-    memset(&tmp_e, 0, sizeof(tmp_e));
-    tmp_e.kind = ZR_NET_STREAM;
-    tmp_e.sock = s;
-    if (is_https) {
-        if (!zr_tls_client_wrap(s, host, &tmp_e.ssl_ctx, &tmp_e.ssl, err)) {
-            zr_close_raw_sock(s);
-            vm_raise(vm, "https %s '%s': %s", method, url, err);
+        BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                     (LPVOID)body, (DWORD)body_len, (DWORD)body_len, 0);
+        if (ok) ok = WinHttpReceiveResponse(hReq, NULL);
+        if (!ok) {
+            WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+            vm_raise(vm, "WinHTTP request failed for '%s'", url);
             return false;
         }
+        DWORD wstatus = 200;
+        DWORD wstatus_sz = sizeof(wstatus);
+        WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &wstatus, &wstatus_sz, WINHTTP_NO_HEADER_INDEX);
+        if (out_status) *out_status = (int)wstatus;
+        sink->status_code = (int)wstatus;
+        if (out_headers) {
+            DWORD rh_sz = 0;
+            WinHttpQueryHeaders(hReq, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX,
+                                NULL, &rh_sz, WINHTTP_NO_HEADER_INDEX);
+            if (rh_sz > 0 && rh_sz < 131072) {
+                wchar_t *whdrs = (wchar_t *)zr_xcalloc(rh_sz + 4, 1);
+                if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX,
+                                        whdrs, &rh_sz, WINHTTP_NO_HEADER_INDEX)) {
+                    int u8len = WideCharToMultiByte(CP_UTF8, 0, whdrs, -1, NULL, 0, NULL, NULL);
+                    if (u8len > 0) {
+                        char *u8h = (char *)zr_xmalloc((size_t)u8len + 1);
+                        WideCharToMultiByte(CP_UTF8, 0, whdrs, -1, u8h, u8len, NULL, NULL);
+                        u8h[u8len] = '\0';
+                        bool d1, d2, d3, d4, d5;
+                        uint64_t dcl;
+                        zr_parse_http_headers_into(vm, u8h, out_headers, &d1, &d2, &d3, &d4, &d5, &dcl, NULL);
+                        free(u8h);
+                    }
+                }
+                free(whdrs);
+            }
+        }
+        if (raise_on_http_error && wstatus >= 400) {
+            WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+            vm_raise(vm, "http status %d for '%s'", (int)wstatus, url);
+            return false;
+        }
+        DWORD avail = 0;
+        while (!sink->stopped_by_cb && WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
+            uint8_t *tmp = (uint8_t *)zr_xmalloc(avail);
+            DWORD got = 0;
+            bool step_ok = true;
+            if (WinHttpReadData(hReq, tmp, avail, &got) && got > 0) {
+                step_ok = zr_http_deliver_slice(vm, sink, resp_body, tmp, (size_t)got);
+            }
+            free(tmp);
+            if (!step_ok) {
+                WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+                return false;
+            }
+        }
+        WinHttpCloseHandle(hReq);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return true;
     }
+#endif
 
-    bool has_ua = false;
+    bool has_ua = false, has_conn = false, has_cl_hdr = false, caller_wants_close = false;
     for (size_t i = 0; i < nhdrs; i++) {
-        if (hdr_keys[i] && strcasecmp(hdr_keys[i], "User-Agent") == 0) {
-            has_ua = true;
-            break;
+        if (!hdr_keys[i]) continue;
+        if (zr_ieq_str(hdr_keys[i], "User-Agent")) has_ua = true;
+        if (zr_ieq_str(hdr_keys[i], "Content-Length")) has_cl_hdr = true;
+        if (zr_ieq_str(hdr_keys[i], "Connection")) {
+            has_conn = true;
+            if (hdr_vals[i] && zr_icontains_sub(hdr_vals[i], "close")) caller_wants_close = true;
         }
     }
+
     ZrBuf req;
     zr_buf_init(&req);
     char head_top[3072];
-    const char *def_ua = has_ua ? "" : "User-Agent: pblang/3.0\r\n";
+    const char *def_ua = has_ua ? "" : "User-Agent: pblang/4.2\r\n";
+    const char *def_conn = has_conn ? "" : "Connection: keep-alive\r\n";
     if ((is_https && port == 443) || (!is_https && port == 80)) {
-        snprintf(head_top, sizeof(head_top), "%s %s HTTP/1.1\r\nHost: %s\r\n%sConnection: close\r\n",
-                 method, path, host, def_ua);
+        snprintf(head_top, sizeof(head_top), "%s %s HTTP/1.1\r\nHost: %s\r\n%s%s",
+                 method, path, host, def_ua, def_conn);
     } else {
-        snprintf(head_top, sizeof(head_top), "%s %s HTTP/1.1\r\nHost: %s:%u\r\n%sConnection: close\r\n",
-                 method, path, host, (unsigned)port, def_ua);
+        snprintf(head_top, sizeof(head_top), "%s %s HTTP/1.1\r\nHost: %s:%u\r\n%s%s",
+                 method, path, host, (unsigned)port, def_ua, def_conn);
     }
     zr_buf_append_cstr(&req, head_top);
     for (size_t i = 0; i < nhdrs; i++) {
+        if (!hdr_keys[i] || !hdr_vals[i]) continue;
         zr_buf_append_cstr(&req, hdr_keys[i]);
         zr_buf_append_cstr(&req, ": ");
         zr_buf_append_cstr(&req, hdr_vals[i]);
         zr_buf_append_cstr(&req, "\r\n");
     }
-    if (body_len > 0 || strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0 || strcmp(method, "PATCH") == 0) {
+    if (!has_cl_hdr && (body_len > 0 || zr_ieq_str(method, "POST") || zr_ieq_str(method, "PUT") || zr_ieq_str(method, "PATCH"))) {
         char cl[64];
         snprintf(cl, sizeof(cl), "Content-Length: %zu\r\n", body_len);
         zr_buf_append_cstr(&req, cl);
@@ -1220,91 +1759,150 @@ static bool zr_http_request_exec(PbVM *vm, const char *method, const char *url,
     zr_buf_append_cstr(&req, "\r\n");
     if (body_len > 0) zr_buf_append(&req, body, body_len);
 
-    if (zr_stream_write_all(&tmp_e, (const uint8_t *)req.data, req.len, err) < 0) {
-        zr_buf_free(&req);
-        zr_net_destroy_entry(&tmp_e);
-        vm_raise(vm, "http write '%s': %s", url, err);
-        return false;
-    }
-    zr_buf_free(&req);
+    char port_s[16], err[256];
+    snprintf(port_s, sizeof(port_s), "%u", (unsigned)port);
+    err[0] = '\0';
 
-    ZrBuf raw;
-    zr_buf_init(&raw);
-    uint8_t rbuf[8192];
-    for (;;) {
-        ssize_t n = zr_stream_read_some(&tmp_e, rbuf, sizeof(rbuf), err);
-        if (n <= 0) break;
-        zr_buf_append(&raw, rbuf, (size_t)n);
-        if (raw.len > 64 * 1024 * 1024) break;
-    }
-    zr_net_destroy_entry(&tmp_e);
+    ZrNetEntry tmp_e;
+    memset(&tmp_e, 0, sizeof(tmp_e));
+    tmp_e.sock = ZR_INVALID_SOCK;
+    bool reused = zr_http_pool_acquire(host, port, is_https, vm->caps.io_timeout_ms, &tmp_e);
 
-    ptrdiff_t sep = zr_find_bytes((const uint8_t *)raw.data, raw.len, (const uint8_t *)"\r\n\r\n", 4);
-    if (sep < 0) {
-        zr_buf_free(&raw);
-        vm_raise(vm, "http '%s': malformed HTTP response", url);
-        return false;
-    }
-
-    char *hdr_str = (char *)zr_xmalloc((size_t)sep + 1);
-    memcpy(hdr_str, raw.data, (size_t)sep);
-    hdr_str[sep] = '\0';
-
-    int status_code = 0;
-    sscanf(hdr_str, "HTTP/%*s %d", &status_code);
-    if (out_status) *out_status = status_code;
-
-    /* Check Redirect 301/302/303/307/308 */
-    if (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308) {
-        char *loc = NULL;
-        for (char *p = hdr_str; *p; p++) {
-            if ((p == hdr_str || p[-1] == '\n') && strncasecmp(p, "location:", 9) == 0) {
-                loc = p + 9;
-                while (*loc == ' ' || *loc == '\t') loc++;
-                char *eol = strpbrk(loc, "\r\n");
-                if (eol) *eol = '\0';
-                break;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        err[0] = '\0';
+        if (!reused) {
+            ZrSock s = zr_connect_tcp_raw(host, port_s, vm->caps.io_timeout_ms, err);
+            if (s == ZR_INVALID_SOCK) {
+                zr_buf_free(&req);
+                vm_raise(vm, "http %s '%s': %s", method, url, err);
+                return false;
+            }
+            memset(&tmp_e, 0, sizeof(tmp_e));
+            tmp_e.kind = ZR_NET_STREAM;
+            tmp_e.sock = s;
+            if (is_https) {
+                if (!zr_tls_client_wrap(s, host, &tmp_e.ssl_ctx, &tmp_e.ssl, err)) {
+                    zr_close_raw_sock(s);
+                    zr_buf_free(&req);
+                    vm_raise(vm, "https %s '%s': %s", method, url, err);
+                    return false;
+                }
             }
         }
-        if (loc && loc[0]) {
+
+        if (zr_stream_write_all(&tmp_e, (const uint8_t *)req.data, req.len, err) < 0) {
+            zr_net_destroy_entry(&tmp_e);
+            if (reused && attempt == 0) { reused = false; continue; }
+            zr_buf_free(&req);
+            vm_raise(vm, "http write '%s': %s", url, err);
+            return false;
+        }
+
+        int status_code = 0;
+        char redirect_loc[2048];
+        redirect_loc[0] = '\0';
+        bool zero_eof = false;
+        ZrBuf step_body;
+        zr_buf_init(&step_body);
+
+        /* Hold back streaming callback if we might follow a 3xx redirect; wait: zr_http_read_response_on_entry
+           only streams body bytes — for 3xx redirects we buffer into step_body and recurse! */
+        bool pass_ok = zr_http_read_response_on_entry(
+            vm, &tmp_e, method, url, host, port, is_https, caller_wants_close,
+            sink->has_cb ? NULL : &step_body, sink, out_headers,
+            &status_code, redirect_loc, &zero_eof, err);
+
+        if (!pass_ok) {
+            zr_buf_free(&step_body);
+            zr_net_destroy_entry(&tmp_e);
+            if (reused && zero_eof && attempt == 0 && sink->chunks_delivered == 0) {
+                reused = false;
+                continue;
+            }
+            zr_buf_free(&req);
+            if (vm->err_msg[0] == '\0') vm_raise(vm, "http '%s': %s", url, err[0] ? err : "read failed");
+            return false;
+        }
+
+        zr_buf_free(&req);
+        if (out_status) *out_status = status_code;
+
+        if (!sink->has_cb && redirect_loc[0] != '\0' &&
+            (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308)) {
             char next_url[2560];
-            if (strncmp(loc, "http://", 7) == 0 || strncmp(loc, "https://", 8) == 0) {
-                snprintf(next_url, sizeof(next_url), "%s", loc);
+            if (strncmp(redirect_loc, "http://", 7) == 0 || strncmp(redirect_loc, "https://", 8) == 0) {
+                snprintf(next_url, sizeof(next_url), "%s", redirect_loc);
             } else {
                 snprintf(next_url, sizeof(next_url), "%s://%s:%u%s%s",
                          is_https ? "https" : "http", host, (unsigned)port,
-                         loc[0] == '/' ? "" : "/", loc);
+                         redirect_loc[0] == '/' ? "" : "/", redirect_loc);
             }
-            free(hdr_str);
-            zr_buf_free(&raw);
-            return zr_http_request_exec(vm, (status_code == 303) ? "GET" : method, next_url,
-                                        hdr_keys, hdr_vals, nhdrs,
-                                        (status_code == 303) ? NULL : body,
-                                        (status_code == 303) ? 0 : body_len,
-                                        resp_body, redirect_depth + 1, raise_on_http_error, out_status);
+            zr_buf_free(&step_body);
+            if (out_headers) {
+                for (size_t hi = 0; hi < out_headers->used; hi++) out_headers->entries[hi].active = false;
+                out_headers->used = 0;
+                out_headers->len = 0;
+                if (out_headers->buckets) {
+                    for (size_t bi = 0; bi < out_headers->bcap; bi++) out_headers->buckets[bi] = -1;
+                }
+            }
+            return zr_http_exchange(vm, (status_code == 303) ? "GET" : method, next_url,
+                                    hdr_keys, hdr_vals, nhdrs,
+                                    (status_code == 303) ? NULL : body,
+                                    (status_code == 303) ? 0 : body_len,
+                                    resp_body, out_headers, opt_sink,
+                                    redirect_depth + 1, raise_on_http_error, out_status);
         }
+
+        if (raise_on_http_error && status_code >= 400) {
+            zr_buf_free(&step_body);
+            vm_raise(vm, "http status %d for '%s'", status_code, url);
+            return false;
+        }
+        if (resp_body && step_body.len > 0) {
+            zr_buf_append(resp_body, (const uint8_t *)step_body.data, step_body.len);
+        }
+        zr_buf_free(&step_body);
+        return true;
     }
 
-    bool is_chunked = false;
-    for (char *p = hdr_str; *p; p++) {
-        if ((p == hdr_str || p[-1] == '\n') && strncasecmp(p, "transfer-encoding:", 18) == 0) {
-            if (strstr(p + 18, "chunked") || strstr(p + 18, "CHUNKED")) is_chunked = true;
-        }
-    }
-    free(hdr_str);
+    zr_buf_free(&req);
+    return false;
+}
 
-    const uint8_t *bstart = (const uint8_t *)(raw.data + sep + 4);
-    size_t blen = raw.len - (size_t)sep - 4;
-    if (raise_on_http_error && status_code >= 400) {
-        zr_buf_free(&raw);
-        vm_raise(vm, "http status %d for '%s'", status_code, url);
+static bool zr_http_request_exec(PbVM *vm, const char *method, const char *url,
+                                 const char **hdr_keys, const char **hdr_vals, size_t nhdrs,
+                                 const uint8_t *body, size_t body_len, ZrBuf *resp_body,
+                                 int redirect_depth, bool raise_on_http_error, int *out_status) {
+    return zr_http_exchange(vm, method, url, hdr_keys, hdr_vals, nhdrs, body, body_len,
+                            resp_body, NULL, NULL, redirect_depth, raise_on_http_error, out_status);
+}
+
+static bool zr_extract_headers_arg(PbVM *vm, PbValue hval, const char *fn_name,
+                                   const char ***out_hk, const char ***out_hv, size_t *out_nh) {
+    *out_hk = NULL;
+    *out_hv = NULL;
+    *out_nh = 0;
+    if (hval.tag == VAL_NIL) return true;
+    if (!val_is_obj(hval, OBJ_MAP)) {
+        vm_raise(vm, "%s(): headers argument must be map or nil", fn_name);
         return false;
     }
-    if (is_chunked) zr_decode_chunked_body(bstart, blen, resp_body);
-    else zr_buf_append(resp_body, bstart, blen);
-    zr_buf_free(&raw);
+    PbMap *m = (PbMap *)val_as_obj(hval);
+    const char **hk = (const char **)zr_xmalloc((m->count + 1) * sizeof(char *));
+    const char **hv = (const char **)zr_xmalloc((m->count + 1) * sizeof(char *));
+    size_t nh = 0;
+    for (size_t i = 0; i < m->used; i++) {
+        if (m->entries[i].active && m->entries[i].key && val_is_obj(m->entries[i].val, OBJ_STR)) {
+            hk[nh] = m->entries[i].key->chars;
+            hv[nh] = ((PbStr *)val_as_obj(m->entries[i].val))->chars;
+            nh++;
+        }
+    }
+    *out_hk = hk;
+    *out_hv = hv;
+    *out_nh = nh;
     return true;
-#endif
 }
 
 static bool bi_http_get(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
@@ -1364,17 +1962,9 @@ static bool bi_http_get_auth(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     int st = 0;
     bool ok = false;
     if (val_is_obj(argv[1], OBJ_MAP)) {
-        PbMap *m = (PbMap *)val_as_obj(argv[1]);
-        const char **hk = (const char **)zr_xmalloc((m->count + 1) * sizeof(char *));
-        const char **hv = (const char **)zr_xmalloc((m->count + 1) * sizeof(char *));
+        const char **hk = NULL, **hv = NULL;
         size_t nh = 0;
-        for (size_t i = 0; i < m->used; i++) {
-            if (m->entries[i].active && m->entries[i].key && val_is_obj(m->entries[i].val, OBJ_STR)) {
-                hk[nh] = m->entries[i].key->chars;
-                hv[nh] = ((PbStr *)val_as_obj(m->entries[i].val))->chars;
-                nh++;
-            }
-        }
+        zr_extract_headers_arg(vm, argv[1], "http_get_auth", &hk, &hv, &nh);
         ok = zr_http_request_exec(vm, "GET", ((PbStr *)val_as_obj(argv[0]))->chars, hk, hv, nh, NULL, 0, &resp, 0, true, &st);
         free(hk);
         free(hv);
@@ -1406,20 +1996,10 @@ static bool bi_http_post_auth(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (!zr_check_taint_sink(vm, argv[0], "http_post_auth")) return false;
     if (!zr_check_taint_sink(vm, argv[1], "http_post_auth")) return false;
     if (!zr_check_taint_sink(vm, argv[2], "http_post_auth")) return false;
-    const char **hk = NULL;
-    const char **hv = NULL;
+    const char **hk = NULL, **hv = NULL;
     size_t nh = 0;
     if (val_is_obj(argv[1], OBJ_MAP)) {
-        PbMap *m = (PbMap *)val_as_obj(argv[1]);
-        hk = (const char **)zr_xmalloc((m->count + 1) * sizeof(char *));
-        hv = (const char **)zr_xmalloc((m->count + 1) * sizeof(char *));
-        for (size_t i = 0; i < m->used; i++) {
-            if (m->entries[i].active && m->entries[i].key && val_is_obj(m->entries[i].val, OBJ_STR)) {
-                hk[nh] = m->entries[i].key->chars;
-                hv[nh] = ((PbStr *)val_as_obj(m->entries[i].val))->chars;
-                nh++;
-            }
-        }
+        zr_extract_headers_arg(vm, argv[1], "http_post_auth", &hk, &hv, &nh);
     }
     PbStr *body = (PbStr *)val_as_obj(argv[2]);
     ZrBuf resp;
@@ -1436,7 +2016,8 @@ static bool bi_http_post_auth(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_http_request(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_HTTP), "http_request", "http")) return false;
+    bool has_cap = vm_effective_cap(vm, CAP_HTTP) || vm_effective_cap(vm, CAP_NET);
+    if (!vm_check_cap(vm, has_cap, "http_request", "http")) return false;
     if (argc < 2 || argc > 4 || !val_is_obj(argv[0], OBJ_STR) || !val_is_obj(argv[1], OBJ_STR)) {
         vm_raise(vm, "http_request(method, url[, headers_map[, body]]) expects (string, string[, map|nil[, string|bytes|nil]])");
         return false;
@@ -1447,25 +2028,10 @@ static bool bi_http_request(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 
     const char *method = ((PbStr *)val_as_obj(argv[0]))->chars;
     const char *url = ((PbStr *)val_as_obj(argv[1]))->chars;
-    const char **hk = NULL;
-    const char **hv = NULL;
+    const char **hk = NULL, **hv = NULL;
     size_t nh = 0;
-    if (argc >= 3 && argv[2].tag != VAL_NIL) {
-        if (!val_is_obj(argv[2], OBJ_MAP)) {
-            vm_raise(vm, "http_request(): headers argument must be map or nil");
-            return false;
-        }
-        PbMap *m = (PbMap *)val_as_obj(argv[2]);
-        hk = (const char **)zr_xmalloc((m->count + 1) * sizeof(char *));
-        hv = (const char **)zr_xmalloc((m->count + 1) * sizeof(char *));
-        for (size_t i = 0; i < m->used; i++) {
-            if (m->entries[i].active && m->entries[i].key && val_is_obj(m->entries[i].val, OBJ_STR)) {
-                hk[nh] = m->entries[i].key->chars;
-                hv[nh] = ((PbStr *)val_as_obj(m->entries[i].val))->chars;
-                nh++;
-            }
-        }
-    }
+    if (argc >= 3 && !zr_extract_headers_arg(vm, argv[2], "http_request", &hk, &hv, &nh)) return false;
+
     const uint8_t *bptr = NULL;
     size_t blen = 0;
     if (argc >= 4 && argv[3].tag != VAL_NIL) {
@@ -1484,25 +2050,972 @@ static bool bi_http_request(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         }
     }
 
+    PbMap *resp_hdrs = vm_new_map(vm, 8);
+    vm_temp_push(vm, val_obj(resp_hdrs));
+
     ZrBuf resp;
     zr_buf_init(&resp);
     int status_code = 0;
-    bool ok = zr_http_request_exec(vm, method, url, hk, hv, nh, bptr, blen, &resp, 0, false, &status_code);
+    bool ok = zr_http_exchange(vm, method, url, hk, hv, nh, bptr, blen, &resp, resp_hdrs, NULL, 0, false, &status_code);
     free(hk);
     free(hv);
     if (!ok) {
+        vm_temp_pop(vm, 1);
         zr_buf_free(&resp);
         return false;
     }
 
-    PbMap *res = vm_new_map(vm, 4);
+    PbMap *res = vm_new_map(vm, 8);
     vm_temp_push(vm, val_obj(res));
     map_set(res, vm_const_str(vm, "ok"), val_bool(status_code >= 200 && status_code < 300));
     map_set(res, vm_const_str(vm, "status"), val_num((double)status_code));
+    map_set(res, vm_const_str(vm, "headers"), val_obj(resp_hdrs));
     map_set(res, vm_const_str(vm, "body"), val_obj(vm_new_str(vm, (const char *)(resp.data ? resp.data : ""), resp.len)));
-    vm_temp_pop(vm, 1);
+    vm_temp_pop(vm, 2);
     zr_buf_free(&resp);
     *out = val_obj(res);
+    return true;
+}
+
+static bool zr_is_callable_val(PbValue v) {
+    if (v.tag == VAL_BUILTIN) return true;
+    if (v.tag == VAL_OBJ && v.as.obj) {
+        return v.as.obj->type == OBJ_CLOSURE || v.as.obj->type == OBJ_FUNC || v.as.obj->type == OBJ_MAP;
+    }
+    return false;
+}
+
+static bool bi_http_stream_get(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    bool has_cap = vm_effective_cap(vm, CAP_HTTP) || vm_effective_cap(vm, CAP_NET);
+    if (!vm_check_cap(vm, has_cap, "http_stream_get", "http")) return false;
+    if ((argc < 2 || argc > 4) || !val_is_obj(argv[0], OBJ_STR) || !zr_is_callable_val(argv[1])) {
+        vm_raise(vm, "http_stream_get(url, on_chunk[, headers_map[, timeout_ms]]) expects (string, fn[, map|nil[, number]])");
+        return false;
+    }
+    if (!zr_check_taint_sink(vm, argv[0], "http_stream_get")) return false;
+    if (argc >= 3 && !zr_check_taint_sink(vm, argv[2], "http_stream_get")) return false;
+
+    const char **hk = NULL, **hv = NULL;
+    size_t nh = 0;
+    if (argc >= 3 && !zr_extract_headers_arg(vm, argv[2], "http_stream_get", &hk, &hv, &nh)) return false;
+
+    uint32_t saved_timeout = vm->caps.io_timeout_ms;
+    if (argc >= 4 && argv[3].tag == VAL_NUM && argv[3].u.num > 0.0) {
+        vm->caps.io_timeout_ms = (uint32_t)argv[3].u.num;
+    }
+
+    PbMap *resp_hdrs = vm_new_map(vm, 8);
+    vm_temp_push(vm, val_obj(resp_hdrs));
+    vm_temp_push(vm, argv[1]);
+
+    ZrHttpStreamSink sink;
+    memset(&sink, 0, sizeof(sink));
+    sink.has_cb = true;
+    sink.on_chunk = argv[1];
+    sink.headers_map = resp_hdrs;
+
+    int status_code = 0;
+    bool ok = zr_http_exchange(vm, "GET", ((PbStr *)val_as_obj(argv[0]))->chars,
+                               hk, hv, nh, NULL, 0, NULL, resp_hdrs, &sink, 0, false, &status_code);
+    vm->caps.io_timeout_ms = saved_timeout;
+    free(hk);
+    free(hv);
+    if (!ok) {
+        vm_temp_pop(vm, 2);
+        return false;
+    }
+
+    PbMap *res = vm_new_map(vm, 8);
+    vm_temp_push(vm, val_obj(res));
+    map_set(res, vm_const_str(vm, "ok"), val_bool(status_code >= 200 && status_code < 300));
+    map_set(res, vm_const_str(vm, "status"), val_num((double)status_code));
+    map_set(res, vm_const_str(vm, "headers"), val_obj(resp_hdrs));
+    map_set(res, vm_const_str(vm, "bytes_received"), val_num((double)sink.bytes_received));
+    map_set(res, vm_const_str(vm, "chunks"), val_num((double)sink.chunks_delivered));
+    map_set(res, vm_const_str(vm, "stopped"), val_bool(sink.stopped_by_cb));
+    vm_temp_pop(vm, 3);
+    *out = val_obj(res);
+    return true;
+}
+
+static bool bi_http_stream_request(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    bool has_cap = vm_effective_cap(vm, CAP_HTTP) || vm_effective_cap(vm, CAP_NET);
+    if (!vm_check_cap(vm, has_cap, "http_stream_request", "http")) return false;
+
+    const char *method_str = "GET";
+    PbValue url_val = val_nil();
+    PbValue hdrs_val = val_nil();
+    PbValue body_val = val_nil();
+    PbValue cb_val = val_nil();
+    uint32_t saved_timeout = vm->caps.io_timeout_ms;
+    uint32_t req_timeout = saved_timeout;
+
+    if ((argc == 1 || argc == 2) && val_is_obj(argv[0], OBJ_MAP)) {
+        PbMap *opts = (PbMap *)val_as_obj(argv[0]);
+        PbValue mv, tv;
+        if (pb_map_get_cstr(opts, "method", &mv) && val_is_obj(mv, OBJ_STR)) {
+            method_str = ((PbStr *)val_as_obj(mv))->chars;
+        }
+        pb_map_get_cstr(opts, "url", &url_val);
+        pb_map_get_cstr(opts, "headers", &hdrs_val);
+        pb_map_get_cstr(opts, "body", &body_val);
+        if (pb_map_get_cstr(opts, "timeout_ms", &tv) && tv.tag == VAL_NUM && tv.u.num > 0.0) {
+            req_timeout = (uint32_t)tv.u.num;
+        }
+        if (argc == 2) {
+            cb_val = argv[1];
+        } else {
+            if (!pb_map_get_cstr(opts, "on_chunk", &cb_val)) {
+                pb_map_get_cstr(opts, "callback", &cb_val);
+            }
+        }
+        if (!val_is_obj(url_val, OBJ_STR) || !zr_is_callable_val(cb_val)) {
+            vm_raise(vm, "http_stream_request(opts[, on_chunk]) requires opts.url string and callable callback");
+            return false;
+        }
+    } else if (argc == 2 && val_is_obj(argv[0], OBJ_STR) && zr_is_callable_val(argv[1])) {
+        url_val = argv[0];
+        cb_val = argv[1];
+    } else if ((argc == 5 || argc == 6) && val_is_obj(argv[0], OBJ_STR) && val_is_obj(argv[1], OBJ_STR) && zr_is_callable_val(argv[4])) {
+        method_str = ((PbStr *)val_as_obj(argv[0]))->chars;
+        url_val = argv[1];
+        hdrs_val = argv[2];
+        body_val = argv[3];
+        cb_val = argv[4];
+        if (argc == 6 && argv[5].tag == VAL_NUM && argv[5].u.num > 0.0) {
+            req_timeout = (uint32_t)argv[5].u.num;
+        }
+    } else {
+        vm_raise(vm, "http_stream_request expects (url_or_opts, on_chunk) or (method, url, headers_or_nil, body_or_nil, on_chunk[, timeout_ms])");
+        return false;
+    }
+
+    if (!zr_check_taint_sink(vm, url_val, "http_stream_request")) return false;
+    if (!zr_check_taint_sink(vm, hdrs_val, "http_stream_request")) return false;
+    if (!zr_check_taint_sink(vm, body_val, "http_stream_request")) return false;
+
+    const char **hk = NULL, **hv = NULL;
+    size_t nh = 0;
+    if (!zr_extract_headers_arg(vm, hdrs_val, "http_stream_request", &hk, &hv, &nh)) return false;
+
+    const uint8_t *bptr = NULL;
+    size_t blen = 0;
+    if (body_val.tag != VAL_NIL) {
+        if (val_is_obj(body_val, OBJ_STR)) {
+            PbStr *bs = (PbStr *)val_as_obj(body_val);
+            bptr = (const uint8_t *)bs->chars;
+            blen = bs->len;
+        } else if (val_is_obj(body_val, OBJ_BYTES)) {
+            PbBytes *bb = (PbBytes *)val_as_obj(body_val);
+            bptr = bb->data;
+            blen = bb->len;
+        } else {
+            free(hk); free(hv);
+            vm_raise(vm, "http_stream_request(): body must be string, bytes, or nil");
+            return false;
+        }
+    }
+
+    PbMap *resp_hdrs = vm_new_map(vm, 8);
+    vm_temp_push(vm, val_obj(resp_hdrs));
+    vm_temp_push(vm, cb_val);
+
+    ZrHttpStreamSink sink;
+    memset(&sink, 0, sizeof(sink));
+    sink.has_cb = true;
+    sink.on_chunk = cb_val;
+    sink.headers_map = resp_hdrs;
+
+    vm->caps.io_timeout_ms = req_timeout;
+    int status_code = 0;
+    bool ok = zr_http_exchange(vm, method_str,
+                               ((PbStr *)val_as_obj(url_val))->chars,
+                               hk, hv, nh, bptr, blen, NULL, resp_hdrs, &sink, 0, false, &status_code);
+    vm->caps.io_timeout_ms = saved_timeout;
+    free(hk);
+    free(hv);
+    if (!ok) {
+        vm_temp_pop(vm, 2);
+        return false;
+    }
+
+    PbMap *res = vm_new_map(vm, 8);
+    vm_temp_push(vm, val_obj(res));
+    map_set(res, vm_const_str(vm, "ok"), val_bool(status_code >= 200 && status_code < 300));
+    map_set(res, vm_const_str(vm, "status"), val_num((double)status_code));
+    map_set(res, vm_const_str(vm, "headers"), val_obj(resp_hdrs));
+    map_set(res, vm_const_str(vm, "bytes_received"), val_num((double)sink.bytes_received));
+    map_set(res, vm_const_str(vm, "chunks"), val_num((double)sink.chunks_delivered));
+    map_set(res, vm_const_str(vm, "stopped"), val_bool(sink.stopped_by_cb));
+    vm_temp_pop(vm, 3);
+    *out = val_obj(res);
+    return true;
+}
+
+typedef struct {
+    const char    *field_name;
+    const char    *file_path;
+    const char    *filename;
+    const char    *content_type;
+    const uint8_t *mem_data;
+    size_t         mem_len;
+    bool           is_mem;
+    FILE          *fp;
+    uint64_t       fsize;
+    ZrBuf          part_hdr;
+} ZrMpFileSpec;
+
+static const char *zr_mp_basename(const char *path) {
+    const char *s1 = strrchr(path, '/');
+    const char *s2 = strrchr(path, '\\');
+    const char *b = s1;
+    if (s2 && (!b || s2 > b)) b = s2;
+    return b ? (b + 1) : path;
+}
+
+static bool bi_http_upload_multipart(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    bool has_http = vm_effective_cap(vm, CAP_HTTP) || vm_effective_cap(vm, CAP_NET);
+    if (!vm_check_cap(vm, has_http, "http_upload_multipart", "http")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "http_upload_multipart", "fs")) return false;
+    if (argc < 3 || argc > 5 || !val_is_obj(argv[0], OBJ_STR)) {
+        vm_raise(vm, "http_upload_multipart(url, fields_map_or_nil, files_map_or_array[, headers_map[, timeout_ms]]) expects 3..5 arguments");
+        return false;
+    }
+    if (!zr_check_taint_sink(vm, argv[0], "http_upload_multipart")) return false;
+    if (!zr_check_taint_sink(vm, argv[1], "http_upload_multipart")) return false;
+    if (!zr_check_taint_sink(vm, argv[2], "http_upload_multipart")) return false;
+    if (argc >= 4 && !zr_check_taint_sink(vm, argv[3], "http_upload_multipart")) return false;
+
+    uint32_t eff_timeout_ms = vm->caps.io_timeout_ms;
+    if (argc >= 5 && argv[4].tag == VAL_NUM && argv[4].u.num > 0.0) {
+        eff_timeout_ms = (uint32_t)argv[4].u.num;
+    }
+
+    const char *url = ((PbStr *)val_as_obj(argv[0]))->chars;
+    bool is_https = false;
+    char host[512], path[2048];
+    uint16_t port = 80;
+    if (!zr_parse_url(url, &is_https, host, &port, path)) {
+        vm_raise(vm, "http_upload_multipart(): invalid URL '%s'", url);
+        return false;
+    }
+
+    uint8_t rnd[16];
+    zr_csprng_bytes(rnd, sizeof(rnd));
+    char boundary[64];
+    int boff = snprintf(boundary, sizeof(boundary), "----PBLangBoundary");
+    for (size_t i = 0; i < sizeof(rnd); i++) {
+        boff += snprintf(boundary + boff, sizeof(boundary) - (size_t)boff, "%02x", rnd[i]);
+    }
+
+    /* Build form fields preamble */
+    ZrBuf fields_buf;
+    zr_buf_init(&fields_buf);
+    if (argv[1].tag != VAL_NIL) {
+        if (!val_is_obj(argv[1], OBJ_MAP)) {
+            zr_buf_free(&fields_buf);
+            vm_raise(vm, "http_upload_multipart(): fields must be map or nil");
+            return false;
+        }
+        PbMap *fm = (PbMap *)val_as_obj(argv[1]);
+        for (size_t i = 0; i < fm->used; i++) {
+            if (!fm->entries[i].active || !fm->entries[i].key) continue;
+            char *vs = vm_value_to_cstr(vm, fm->entries[i].val, NULL);
+            zr_buf_append_cstr(&fields_buf, "--");
+            zr_buf_append_cstr(&fields_buf, boundary);
+            zr_buf_append_cstr(&fields_buf, "\r\nContent-Disposition: form-data; name=\"");
+            zr_buf_append_cstr(&fields_buf, fm->entries[i].key->chars);
+            zr_buf_append_cstr(&fields_buf, "\"\r\n\r\n");
+            zr_buf_append_cstr(&fields_buf, vs);
+            zr_buf_append_cstr(&fields_buf, "\r\n");
+            free(vs);
+        }
+    }
+
+    /* Collect and open file entries to compute exact Content-Length */
+    ZrMpFileSpec *fspecs = NULL;
+    size_t nf = 0;
+    if (val_is_obj(argv[2], OBJ_MAP)) {
+        PbMap *flm = (PbMap *)val_as_obj(argv[2]);
+        fspecs = (ZrMpFileSpec *)zr_xcalloc(flm->count + 1, sizeof(ZrMpFileSpec));
+        for (size_t i = 0; i < flm->used; i++) {
+            if (!flm->entries[i].active || !flm->entries[i].key) continue;
+            const char *fname_field = flm->entries[i].key->chars;
+            PbValue fv = flm->entries[i].val;
+            const char *fpath = NULL, *disp_name = NULL, *ctype = "application/octet-stream";
+            const uint8_t *mdata = NULL;
+            size_t mlen = 0;
+            bool is_mem = false;
+            if (val_is_obj(fv, OBJ_STR)) {
+                fpath = ((PbStr *)val_as_obj(fv))->chars;
+            } else if (val_is_obj(fv, OBJ_MAP)) {
+                PbMap *sm = (PbMap *)val_as_obj(fv);
+                PbValue pv, nv, cv, dv;
+                if (pb_map_get_cstr(sm, "path", &pv) && val_is_obj(pv, OBJ_STR)) fpath = ((PbStr *)val_as_obj(pv))->chars;
+                if (pb_map_get_cstr(sm, "filename", &nv) && val_is_obj(nv, OBJ_STR)) disp_name = ((PbStr *)val_as_obj(nv))->chars;
+                if (pb_map_get_cstr(sm, "content_type", &cv) && val_is_obj(cv, OBJ_STR)) ctype = ((PbStr *)val_as_obj(cv))->chars;
+                if (!fpath && pb_map_get_cstr(sm, "data", &dv)) {
+                    if (val_is_obj(dv, OBJ_STR)) {
+                        PbStr *ds = (PbStr *)val_as_obj(dv);
+                        mdata = (const uint8_t *)ds->chars;
+                        mlen = ds->len;
+                        is_mem = true;
+                    } else if (val_is_obj(dv, OBJ_BYTES)) {
+                        PbBytes *db = (PbBytes *)val_as_obj(dv);
+                        mdata = db->data;
+                        mlen = db->len;
+                        is_mem = true;
+                    }
+                }
+            }
+            if (!fpath && !is_mem) continue;
+            fspecs[nf].field_name = fname_field;
+            fspecs[nf].file_path = fpath;
+            fspecs[nf].filename = disp_name ? disp_name : (fpath ? zr_mp_basename(fpath) : fname_field);
+            fspecs[nf].content_type = ctype;
+            fspecs[nf].mem_data = mdata;
+            fspecs[nf].mem_len = mlen;
+            fspecs[nf].is_mem = is_mem;
+            nf++;
+        }
+    } else if (val_is_obj(argv[2], OBJ_ARRAY)) {
+        PbArray *fla = (PbArray *)val_as_obj(argv[2]);
+        fspecs = (ZrMpFileSpec *)zr_xcalloc(fla->len + 1, sizeof(ZrMpFileSpec));
+        for (size_t i = 0; i < fla->len; i++) {
+            if (!val_is_obj(fla->items[i], OBJ_MAP)) continue;
+            PbMap *sm = (PbMap *)val_as_obj(fla->items[i]);
+            PbValue nmv, pv, fnv, cv, dv;
+            const char *fld = "file", *fpath = NULL, *disp = NULL, *ctype = "application/octet-stream";
+            const uint8_t *mdata = NULL;
+            size_t mlen = 0;
+            bool is_mem = false;
+            if (pb_map_get_cstr(sm, "name", &nmv) && val_is_obj(nmv, OBJ_STR)) fld = ((PbStr *)val_as_obj(nmv))->chars;
+            else if (pb_map_get_cstr(sm, "field", &nmv) && val_is_obj(nmv, OBJ_STR)) fld = ((PbStr *)val_as_obj(nmv))->chars;
+            if (pb_map_get_cstr(sm, "path", &pv) && val_is_obj(pv, OBJ_STR)) fpath = ((PbStr *)val_as_obj(pv))->chars;
+            if (pb_map_get_cstr(sm, "filename", &fnv) && val_is_obj(fnv, OBJ_STR)) disp = ((PbStr *)val_as_obj(fnv))->chars;
+            if (pb_map_get_cstr(sm, "content_type", &cv) && val_is_obj(cv, OBJ_STR)) ctype = ((PbStr *)val_as_obj(cv))->chars;
+            if (!fpath && pb_map_get_cstr(sm, "data", &dv)) {
+                if (val_is_obj(dv, OBJ_STR)) {
+                    PbStr *ds = (PbStr *)val_as_obj(dv);
+                    mdata = (const uint8_t *)ds->chars;
+                    mlen = ds->len;
+                    is_mem = true;
+                } else if (val_is_obj(dv, OBJ_BYTES)) {
+                    PbBytes *db = (PbBytes *)val_as_obj(dv);
+                    mdata = db->data;
+                    mlen = db->len;
+                    is_mem = true;
+                }
+            }
+            if (!fpath && !is_mem) continue;
+            fspecs[nf].field_name = fld;
+            fspecs[nf].file_path = fpath;
+            fspecs[nf].filename = disp ? disp : (fpath ? zr_mp_basename(fpath) : fld);
+            fspecs[nf].content_type = ctype;
+            fspecs[nf].mem_data = mdata;
+            fspecs[nf].mem_len = mlen;
+            fspecs[nf].is_mem = is_mem;
+            nf++;
+        }
+    } else if (argv[2].tag != VAL_NIL) {
+        zr_buf_free(&fields_buf);
+        vm_raise(vm, "http_upload_multipart(): files must be map, array, or nil");
+        return false;
+    }
+
+    uint64_t total_len = (uint64_t)fields_buf.len;
+    for (size_t i = 0; i < nf; i++) {
+        if (fspecs[i].is_mem) {
+            fspecs[i].fp = NULL;
+            fspecs[i].fsize = (uint64_t)fspecs[i].mem_len;
+        } else {
+            FILE *fp = fopen(fspecs[i].file_path, "rb");
+            if (!fp) {
+                const char *bad_path = fspecs[i].file_path;
+                for (size_t k = 0; k < i; k++) {
+                    if (fspecs[k].fp) fclose(fspecs[k].fp);
+                    zr_buf_free(&fspecs[k].part_hdr);
+                }
+                free(fspecs);
+                zr_buf_free(&fields_buf);
+                vm_raise(vm, "http_upload_multipart(): cannot open '%s'", bad_path);
+                return false;
+            }
+#if defined(_WIN32)
+            _fseeki64(fp, 0, SEEK_END);
+            long long sz = _ftelli64(fp);
+            _fseeki64(fp, 0, SEEK_SET);
+#else
+            fseeko(fp, 0, SEEK_END);
+            off_t sz = ftello(fp);
+            fseeko(fp, 0, SEEK_SET);
+#endif
+            fspecs[i].fp = fp;
+            fspecs[i].fsize = (sz > 0) ? (uint64_t)sz : 0;
+        }
+        zr_buf_init(&fspecs[i].part_hdr);
+        zr_buf_append_cstr(&fspecs[i].part_hdr, "--");
+        zr_buf_append_cstr(&fspecs[i].part_hdr, boundary);
+        zr_buf_append_cstr(&fspecs[i].part_hdr, "\r\nContent-Disposition: form-data; name=\"");
+        zr_buf_append_cstr(&fspecs[i].part_hdr, fspecs[i].field_name);
+        zr_buf_append_cstr(&fspecs[i].part_hdr, "\"; filename=\"");
+        zr_buf_append_cstr(&fspecs[i].part_hdr, fspecs[i].filename);
+        zr_buf_append_cstr(&fspecs[i].part_hdr, "\"\r\nContent-Type: ");
+        zr_buf_append_cstr(&fspecs[i].part_hdr, fspecs[i].content_type);
+        zr_buf_append_cstr(&fspecs[i].part_hdr, "\r\n\r\n");
+        total_len += (uint64_t)fspecs[i].part_hdr.len + fspecs[i].fsize + 2ULL; /* +\r\n */
+    }
+    char closing_bnd[80];
+    int cblen = snprintf(closing_bnd, sizeof(closing_bnd), "--%s--\r\n", boundary);
+    total_len += (uint64_t)cblen;
+
+    const char **hk = NULL, **hv = NULL;
+    size_t nh = 0;
+    if (argc >= 4 && !zr_extract_headers_arg(vm, argv[3], "http_upload_multipart", &hk, &hv, &nh)) {
+        for (size_t k = 0; k < nf; k++) { if (fspecs[k].fp) fclose(fspecs[k].fp); zr_buf_free(&fspecs[k].part_hdr); }
+        free(fspecs);
+        zr_buf_free(&fields_buf);
+        return false;
+    }
+
+    /* Connect or reuse pooled connection and stream multipart body in 64 KiB chunks */
+    ZrNetEntry tmp_e;
+    memset(&tmp_e, 0, sizeof(tmp_e));
+    tmp_e.sock = ZR_INVALID_SOCK;
+    char port_s[16], err[256];
+    snprintf(port_s, sizeof(port_s), "%u", (unsigned)port);
+    err[0] = '\0';
+
+    bool reused = zr_http_pool_acquire(host, port, is_https, eff_timeout_ms, &tmp_e);
+    if (!reused) {
+        ZrSock s = zr_connect_tcp_raw(host, port_s, eff_timeout_ms, err);
+        if (s == ZR_INVALID_SOCK) {
+            for (size_t k = 0; k < nf; k++) { if (fspecs[k].fp) fclose(fspecs[k].fp); zr_buf_free(&fspecs[k].part_hdr); }
+            free(fspecs); free(hk); free(hv); zr_buf_free(&fields_buf);
+            vm_raise(vm, "http_upload_multipart(): %s", err);
+            return false;
+        }
+        tmp_e.kind = ZR_NET_STREAM;
+        tmp_e.sock = s;
+        if (is_https && !zr_tls_client_wrap(s, host, &tmp_e.ssl_ctx, &tmp_e.ssl, err)) {
+            zr_close_raw_sock(s);
+            for (size_t k = 0; k < nf; k++) { if (fspecs[k].fp) fclose(fspecs[k].fp); zr_buf_free(&fspecs[k].part_hdr); }
+            free(fspecs); free(hk); free(hv); zr_buf_free(&fields_buf);
+            vm_raise(vm, "http_upload_multipart(): %s", err);
+            return false;
+        }
+    }
+
+    ZrBuf req_hdr;
+    zr_buf_init(&req_hdr);
+    char head_top[3072];
+    if ((is_https && port == 443) || (!is_https && port == 80)) {
+        snprintf(head_top, sizeof(head_top),
+                 "POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: pblang/4.2\r\nConnection: keep-alive\r\n"
+                 "Content-Type: multipart/form-data; boundary=%s\r\nContent-Length: %llu\r\n",
+                 path, host, boundary, (unsigned long long)total_len);
+    } else {
+        snprintf(head_top, sizeof(head_top),
+                 "POST %s HTTP/1.1\r\nHost: %s:%u\r\nUser-Agent: pblang/4.2\r\nConnection: keep-alive\r\n"
+                 "Content-Type: multipart/form-data; boundary=%s\r\nContent-Length: %llu\r\n",
+                 path, host, (unsigned)port, boundary, (unsigned long long)total_len);
+    }
+    zr_buf_append_cstr(&req_hdr, head_top);
+    for (size_t i = 0; i < nh; i++) {
+        if (!hk[i] || !hv[i]) continue;
+        if (zr_ieq_str(hk[i], "Content-Type") || zr_ieq_str(hk[i], "Content-Length")) continue;
+        zr_buf_append_cstr(&req_hdr, hk[i]);
+        zr_buf_append_cstr(&req_hdr, ": ");
+        zr_buf_append_cstr(&req_hdr, hv[i]);
+        zr_buf_append_cstr(&req_hdr, "\r\n");
+    }
+    zr_buf_append_cstr(&req_hdr, "\r\n");
+    free(hk);
+    free(hv);
+
+    /* If pooled socket broke right on header write, reconnect once */
+    if (zr_stream_write_all(&tmp_e, (const uint8_t *)req_hdr.data, req_hdr.len, err) < 0 && reused) {
+        zr_net_destroy_entry(&tmp_e);
+        ZrSock s = zr_connect_tcp_raw(host, port_s, eff_timeout_ms, err);
+        if (s != ZR_INVALID_SOCK) {
+            tmp_e.kind = ZR_NET_STREAM;
+            tmp_e.sock = s;
+            if (!is_https || zr_tls_client_wrap(s, host, &tmp_e.ssl_ctx, &tmp_e.ssl, err)) {
+                err[0] = '\0';
+                zr_stream_write_all(&tmp_e, (const uint8_t *)req_hdr.data, req_hdr.len, err);
+            }
+        }
+    }
+    zr_buf_free(&req_hdr);
+
+    bool write_ok = (err[0] == '\0');
+    if (write_ok && fields_buf.len > 0) {
+        write_ok = (zr_stream_write_all(&tmp_e, (const uint8_t *)fields_buf.data, fields_buf.len, err) >= 0);
+    }
+    zr_buf_free(&fields_buf);
+
+    uint8_t *io_chunk = (uint8_t *)zr_xmalloc(65536);
+    for (size_t i = 0; i < nf && write_ok; i++) {
+        if (zr_stream_write_all(&tmp_e, (const uint8_t *)fspecs[i].part_hdr.data, fspecs[i].part_hdr.len, err) < 0) {
+            write_ok = false;
+            break;
+        }
+        if (fspecs[i].is_mem) {
+            if (fspecs[i].mem_len > 0 &&
+                zr_stream_write_all(&tmp_e, fspecs[i].mem_data, fspecs[i].mem_len, err) < 0) {
+                write_ok = false;
+                break;
+            }
+        } else {
+            uint64_t rem = fspecs[i].fsize;
+            while (rem > 0) {
+                size_t want = rem < 65536ULL ? (size_t)rem : 65536;
+                size_t got = fread(io_chunk, 1, want, fspecs[i].fp);
+                if (got == 0) {
+                    memset(io_chunk, 0, want);
+                    got = want;
+                }
+                if (zr_stream_write_all(&tmp_e, io_chunk, got, err) < 0) {
+                    write_ok = false;
+                    break;
+                }
+                rem -= (uint64_t)got;
+            }
+        }
+        if (write_ok && zr_stream_write_all(&tmp_e, (const uint8_t *)"\r\n", 2, err) < 0) write_ok = false;
+    }
+    free(io_chunk);
+    for (size_t i = 0; i < nf; i++) {
+        if (fspecs[i].fp) fclose(fspecs[i].fp);
+        zr_buf_free(&fspecs[i].part_hdr);
+    }
+    free(fspecs);
+
+    if (write_ok) {
+        write_ok = (zr_stream_write_all(&tmp_e, (const uint8_t *)closing_bnd, (size_t)cblen, err) >= 0);
+    }
+    if (!write_ok) {
+        zr_net_destroy_entry(&tmp_e);
+        vm_raise(vm, "http_upload_multipart() write failed: %s", err);
+        return false;
+    }
+
+    PbMap *resp_hdrs = vm_new_map(vm, 8);
+    vm_temp_push(vm, val_obj(resp_hdrs));
+    ZrBuf resp_body;
+    zr_buf_init(&resp_body);
+    ZrHttpStreamSink sink;
+    memset(&sink, 0, sizeof(sink));
+    sink.on_chunk = val_nil();
+    sink.headers_map = resp_hdrs;
+
+    int status_code = 0;
+    bool zero_eof = false;
+    if (!zr_http_read_response_on_entry(vm, &tmp_e, "POST", url, host, port, is_https, false,
+                                        &resp_body, &sink, resp_hdrs, &status_code, NULL, &zero_eof, err)) {
+        zr_net_destroy_entry(&tmp_e);
+        zr_buf_free(&resp_body);
+        vm_temp_pop(vm, 1);
+        vm_raise(vm, "http_upload_multipart() response failed: %s", err);
+        return false;
+    }
+
+    PbMap *res = vm_new_map(vm, 8);
+    vm_temp_push(vm, val_obj(res));
+    map_set(res, vm_const_str(vm, "ok"), val_bool(status_code >= 200 && status_code < 300));
+    map_set(res, vm_const_str(vm, "status"), val_num((double)status_code));
+    map_set(res, vm_const_str(vm, "headers"), val_obj(resp_hdrs));
+    map_set(res, vm_const_str(vm, "body"), val_obj(vm_new_str(vm, (const char *)(resp_body.data ? resp_body.data : ""), resp_body.len)));
+    map_set(res, vm_const_str(vm, "bytes_uploaded"), val_num((double)total_len));
+    vm_temp_pop(vm, 2);
+    zr_buf_free(&resp_body);
+    *out = val_obj(res);
+    return true;
+}
+
+/* ---- Native Non-Blocking / Timeout-Bounded UDP Socket Builtins ---- */
+static bool bi_udp_bind(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_NET), "udp_bind", "net")) return false;
+    if ((argc != 1 && argc != 2) || !val_is_obj(argv[0], OBJ_STR)) {
+        vm_raise(vm, "udp_bind(host, port) or udp_bind('host:port') expects 1 or 2 arguments");
+        return false;
+    }
+    if (!zr_check_taint_sink(vm, argv[0], "udp_bind")) return false;
+    if (argc == 2 && !zr_check_taint_sink(vm, argv[1], "udp_bind")) return false;
+#if defined(__wasi__)
+    (void)out;
+    vm_raise(vm, "udp_bind(): unavailable in WASI sandbox");
+    return false;
+#else
+    zr_net_ensure_init();
+    char host[512], port[32], desc[560];
+    if (argc == 2) {
+        const char *h = ((PbStr *)val_as_obj(argv[0]))->chars;
+        snprintf(host, sizeof(host), "%.500s", (h && h[0]) ? h : "0.0.0.0");
+        if (argv[1].tag == VAL_NUM) {
+            long p = (long)argv[1].u.num;
+            if (p < 0 || p > 65535) {
+                vm_raise(vm, "udp_bind(): port %ld out of range (0..65535)", p);
+                return false;
+            }
+            snprintf(port, sizeof(port), "%ld", p);
+        } else if (val_is_obj(argv[1], OBJ_STR)) {
+            snprintf(port, sizeof(port), "%.30s", ((PbStr *)val_as_obj(argv[1]))->chars);
+        } else {
+            vm_raise(vm, "udp_bind(host, port): port must be number or string");
+            return false;
+        }
+        snprintf(desc, sizeof(desc), "%s:%s", host, port);
+    } else {
+        const char *addr = ((PbStr *)val_as_obj(argv[0]))->chars;
+        snprintf(desc, sizeof(desc), "%.550s", addr);
+        if (addr[0] == ':' && addr[1] != '\0') {
+            snprintf(host, sizeof(host), "0.0.0.0");
+            snprintf(port, sizeof(port), "%.30s", addr + 1);
+        } else if (!zr_split_host_port(addr, host, port)) {
+            vm_raise(vm, "udp_bind(): invalid address '%s' (expected host:port)", addr);
+            return false;
+        }
+    }
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_PASSIVE;
+    if (getaddrinfo(host[0] ? host : NULL, port, &hints, &res) != 0 || !res) {
+        vm_raise(vm, "udp_bind(): getaddrinfo failed for '%s'", desc);
+        return false;
+    }
+    ZrSock s = ZR_INVALID_SOCK;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s == ZR_INVALID_SOCK) continue;
+        int opt = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
+        if (bind(s, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
+        zr_close_raw_sock(s);
+        s = ZR_INVALID_SOCK;
+    }
+    freeaddrinfo(res);
+    if (s == ZR_INVALID_SOCK) {
+        vm_raise(vm, "udp_bind(): bind failed for '%s'", desc);
+        return false;
+    }
+    zr_set_sock_timeouts(s, vm->caps.io_timeout_ms);
+    size_t id = zr_net_insert(ZR_NET_UDP, s, NULL, NULL);
+    if (!id) {
+        zr_close_raw_sock(s);
+        vm_raise(vm, "udp_bind(): handle table full");
+        return false;
+    }
+    *out = val_num((double)id);
+    return true;
+#endif
+}
+
+static bool bi_udp_local_addr(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_NET), "udp_local_addr", "net")) return false;
+    if (argc != 1) { vm_raise(vm, "udp_local_addr(handle) expects 1 argument"); return false; }
+    size_t id = 0;
+    if (!zr_net_arg_handle(vm, argv[0], "udp_local_addr", &id)) return false;
+    ZrNetEntry *e = zr_net_checkout(id);
+    if (!e || e->kind != ZR_NET_UDP) {
+        if (e) zr_net_checkin(e);
+        vm_raise(vm, "udp_local_addr(): invalid UDP handle");
+        return false;
+    }
+#if defined(__wasi__)
+    zr_net_checkin(e);
+    (void)out;
+    vm_raise(vm, "udp_local_addr(): unavailable in WASI sandbox");
+    return false;
+#else
+    struct sockaddr_storage ss;
+#if defined(_WIN32)
+    int slen = (int)sizeof(ss);
+#else
+    socklen_t slen = (socklen_t)sizeof(ss);
+#endif
+    if (getsockname(e->sock, (struct sockaddr *)&ss, &slen) != 0) {
+        zr_net_checkin(e);
+        vm_raise(vm, "udp_local_addr(): getsockname failed");
+        return false;
+    }
+    zr_net_checkin(e);
+    char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
+    hbuf[0] = '\0';
+    sbuf[0] = '\0';
+    if (getnameinfo((struct sockaddr *)&ss, slen, hbuf, sizeof(hbuf), sbuf, sizeof(sbuf),
+                    NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+        vm_raise(vm, "udp_local_addr(): getnameinfo failed");
+        return false;
+    }
+    char full_addr[NI_MAXHOST + NI_MAXSERV + 8];
+    if (strchr(hbuf, ':')) snprintf(full_addr, sizeof(full_addr), "[%s]:%s", hbuf, sbuf);
+    else snprintf(full_addr, sizeof(full_addr), "%s:%s", hbuf, sbuf);
+
+    PbMap *res = vm_new_map(vm, 4);
+    vm_temp_push(vm, val_obj(res));
+    map_set(res, vm_const_str(vm, "host"), val_obj(vm_new_cstr(vm, hbuf)));
+    map_set(res, vm_const_str(vm, "port"), val_num((double)strtol(sbuf, NULL, 10)));
+    map_set(res, vm_const_str(vm, "addr"), val_obj(vm_new_cstr(vm, full_addr)));
+    vm_temp_pop(vm, 1);
+    *out = val_obj(res);
+    return true;
+#endif
+}
+
+static bool bi_udp_set_timeout(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_NET), "udp_set_timeout", "net")) return false;
+    if (argc != 2 || argv[1].tag != VAL_NUM) {
+        vm_raise(vm, "udp_set_timeout(handle, timeout_ms) expects (handle, number)");
+        return false;
+    }
+    size_t id = 0;
+    if (!zr_net_arg_handle(vm, argv[0], "udp_set_timeout", &id)) return false;
+    ZrNetEntry *e = zr_net_checkout(id);
+    if (!e || e->kind != ZR_NET_UDP) {
+        if (e) zr_net_checkin(e);
+        vm_raise(vm, "udp_set_timeout(): invalid UDP handle");
+        return false;
+    }
+    double ms_d = argv[1].u.num;
+    uint64_t ms = (ms_d > 0.0) ? (uint64_t)ms_d : 0ULL;
+#if defined(_WIN32)
+    DWORD tv = (DWORD)ms;
+    setsockopt(e->sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    setsockopt(e->sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+#elif !defined(__wasi__)
+    struct timeval tv;
+    tv.tv_sec = (time_t)(ms / 1000ULL);
+    tv.tv_usec = (suseconds_t)((ms % 1000ULL) * 1000ULL);
+    setsockopt(e->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(e->sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+    zr_net_checkin(e);
+    *out = val_bool(true);
+    return true;
+}
+
+static bool bi_udp_sendto(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_NET), "udp_sendto", "net")) return false;
+    if ((argc != 3 && argc != 4) || !val_is_obj(argv[2], OBJ_STR)) {
+        vm_raise(vm, "udp_sendto(handle, data, dst_host, dst_port) or udp_sendto(handle, data, 'host:port') expects 3 or 4 arguments");
+        return false;
+    }
+    if (!zr_check_taint_sink(vm, argv[1], "udp_sendto")) return false;
+    if (!zr_check_taint_sink(vm, argv[2], "udp_sendto")) return false;
+    if (argc == 4 && !zr_check_taint_sink(vm, argv[3], "udp_sendto")) return false;
+#if defined(__wasi__)
+    (void)out;
+    vm_raise(vm, "udp_sendto(): unavailable in WASI sandbox");
+    return false;
+#else
+    const uint8_t *ptr = NULL;
+    uint8_t *owned_arr = NULL;
+    size_t len = 0;
+    if (val_is_obj(argv[1], OBJ_STR)) {
+        PbStr *s = (PbStr *)val_as_obj(argv[1]);
+        ptr = (const uint8_t *)s->chars;
+        len = s->len;
+    } else if (val_is_obj(argv[1], OBJ_BYTES)) {
+        PbBytes *b = (PbBytes *)val_as_obj(argv[1]);
+        ptr = b->data;
+        len = b->len;
+    } else if (val_is_obj(argv[1], OBJ_ARRAY)) {
+        PbArray *a = (PbArray *)val_as_obj(argv[1]);
+        owned_arr = (uint8_t *)zr_xmalloc(a->len ? a->len : 1);
+        for (size_t bi = 0; bi < a->len; bi++) {
+            if (a->items[bi].tag != VAL_NUM) {
+                free(owned_arr);
+                vm_raise(vm, "udp_sendto(): byte array elements must be numbers (0..255)");
+                return false;
+            }
+            owned_arr[bi] = (uint8_t)(((int)a->items[bi].u.num) & 0xFF);
+        }
+        ptr = owned_arr;
+        len = a->len;
+    } else {
+        vm_raise(vm, "udp_sendto(): payload must be string, bytes, or byte array");
+        return false;
+    }
+    size_t id = 0;
+    if (!zr_net_arg_handle(vm, argv[0], "udp_sendto", &id)) { free(owned_arr); return false; }
+    char host[512], port[32], desc[560];
+    if (argc == 4) {
+        snprintf(host, sizeof(host), "%.500s", ((PbStr *)val_as_obj(argv[2]))->chars);
+        if (argv[3].tag == VAL_NUM) {
+            long p = (long)argv[3].u.num;
+            if (p < 1 || p > 65535) {
+                free(owned_arr);
+                vm_raise(vm, "udp_sendto(): port %ld out of range (1..65535)", p);
+                return false;
+            }
+            snprintf(port, sizeof(port), "%ld", p);
+        } else if (val_is_obj(argv[3], OBJ_STR)) {
+            snprintf(port, sizeof(port), "%.30s", ((PbStr *)val_as_obj(argv[3]))->chars);
+        } else {
+            free(owned_arr);
+            vm_raise(vm, "udp_sendto(): dst_port must be number or string");
+            return false;
+        }
+        snprintf(desc, sizeof(desc), "%s:%s", host, port);
+    } else {
+        const char *target = ((PbStr *)val_as_obj(argv[2]))->chars;
+        snprintf(desc, sizeof(desc), "%.550s", target);
+        if (!zr_split_host_port(target, host, port)) {
+            free(owned_arr);
+            vm_raise(vm, "udp_sendto(): invalid target address '%s'", target);
+            return false;
+        }
+    }
+    ZrNetEntry *e = zr_net_checkout(id);
+    if (!e || e->kind != ZR_NET_UDP) {
+        if (e) zr_net_checkin(e);
+        free(owned_arr);
+        vm_raise(vm, "udp_sendto(): invalid UDP handle");
+        return false;
+    }
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host, port, &hints, &res) != 0 || !res) {
+        zr_net_checkin(e);
+        free(owned_arr);
+        vm_raise(vm, "udp_sendto(): DNS lookup failed for '%s'", desc);
+        return false;
+    }
+    ssize_t sent = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+#if defined(_WIN32)
+        sent = (ssize_t)sendto(e->sock, (const char *)ptr, (int)len, 0, ai->ai_addr, (int)ai->ai_addrlen);
+#else
+        do {
+            sent = sendto(e->sock, ptr, len, 0, ai->ai_addr, ai->ai_addrlen);
+        } while (sent < 0 && errno == EINTR);
+#endif
+        if (sent >= 0) break;
+    }
+    freeaddrinfo(res);
+    zr_net_checkin(e);
+    free(owned_arr);
+    if (sent < 0) {
+        vm_raise(vm, "udp_sendto(): sendto failed for '%s'", desc);
+        return false;
+    }
+    *out = val_num((double)sent);
+    return true;
+#endif
+}
+
+static bool bi_udp_recvfrom(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_NET), "udp_recvfrom", "net")) return false;
+    if (argc != 1 && argc != 2) {
+        vm_raise(vm, "udp_recvfrom(handle[, max_bytes]) expects 1 or 2 arguments");
+        return false;
+    }
+    size_t max_b = 65535;
+    if (argc == 2) {
+        if (argv[1].tag != VAL_NUM || argv[1].u.num < 1.0) {
+            vm_raise(vm, "udp_recvfrom(): max_bytes must be >= 1");
+            return false;
+        }
+        max_b = (size_t)argv[1].u.num;
+        if (max_b > 65536) max_b = 65536;
+    }
+#if defined(__wasi__)
+    (void)out;
+    vm_raise(vm, "udp_recvfrom(): unavailable in WASI sandbox");
+    return false;
+#else
+    size_t id = 0;
+    if (!zr_net_arg_handle(vm, argv[0], "udp_recvfrom", &id)) return false;
+    ZrNetEntry *e = zr_net_checkout(id);
+    if (!e || e->kind != ZR_NET_UDP) {
+        if (e) zr_net_checkin(e);
+        vm_raise(vm, "udp_recvfrom(): invalid UDP handle");
+        return false;
+    }
+    uint8_t *buf = (uint8_t *)zr_xmalloc(max_b);
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof(ss));
+#if defined(_WIN32)
+    int slen = (int)sizeof(ss);
+    int n = recvfrom(e->sock, (char *)buf, (int)max_b, 0, (struct sockaddr *)&ss, &slen);
+    if (n < 0) {
+        int werr = WSAGetLastError();
+        zr_net_checkin(e);
+        free(buf);
+        if (werr == WSAETIMEDOUT || werr == WSAEWOULDBLOCK) {
+            *out = val_nil();
+            return true;
+        }
+        vm_raise(vm, "udp_recvfrom(): recvfrom failed (%d)", werr);
+        return false;
+    }
+#else
+    socklen_t slen = (socklen_t)sizeof(ss);
+    ssize_t n;
+    do {
+        n = recvfrom(e->sock, buf, max_b, 0, (struct sockaddr *)&ss, &slen);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        int errn = errno;
+        zr_net_checkin(e);
+        free(buf);
+        if (errn == EAGAIN || errn == EWOULDBLOCK) {
+            *out = val_nil();
+            return true;
+        }
+        vm_raise(vm, "udp_recvfrom(): %s", strerror(errn));
+        return false;
+    }
+#endif
+    zr_net_checkin(e);
+
+    char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
+    hbuf[0] = '\0';
+    sbuf[0] = '\0';
+    getnameinfo((struct sockaddr *)&ss, slen, hbuf, sizeof(hbuf), sbuf, sizeof(sbuf),
+                NI_NUMERICHOST | NI_NUMERICSERV);
+    char full_addr[NI_MAXHOST + NI_MAXSERV + 8];
+    if (strchr(hbuf, ':')) snprintf(full_addr, sizeof(full_addr), "[%s]:%s", hbuf, sbuf);
+    else snprintf(full_addr, sizeof(full_addr), "%s:%s", hbuf, sbuf);
+
+    PbMap *res = vm_new_map(vm, 8);
+    vm_temp_push(vm, val_obj(res));
+    PbBytes *bobj = pb_bytes_new(vm, (size_t)n, false);
+    if (n > 0) memcpy(bobj->data, buf, (size_t)n);
+    PbValue bval = val_obj(bobj);
+    vm_temp_push(vm, bval);
+    map_set(res, vm_const_str(vm, "data"), bval);
+    map_set(res, vm_const_str(vm, "bytes"), bval);
+    map_set(res, vm_const_str(vm, "text"), val_obj(vm_new_str(vm, (const char *)buf, (size_t)n)));
+    map_set(res, vm_const_str(vm, "addr"), val_obj(vm_new_cstr(vm, full_addr)));
+    map_set(res, vm_const_str(vm, "host"), val_obj(vm_new_cstr(vm, hbuf)));
+    map_set(res, vm_const_str(vm, "port"), val_num((double)strtol(sbuf, NULL, 10)));
+    map_set(res, vm_const_str(vm, "len"), val_num((double)n));
+    map_set(res, vm_const_str(vm, "size"), val_num((double)n));
+    vm_temp_pop(vm, 2);
+    free(buf);
+    *out = val_obj(res);
+    return true;
+#endif
+}
+
+static bool bi_udp_close(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_NET), "udp_close", "net")) return false;
+    if (argc != 1) { vm_raise(vm, "udp_close(handle) expects 1 argument"); return false; }
+    size_t id = 0;
+    if (!zr_net_arg_handle(vm, argv[0], "udp_close", &id)) return false;
+    ZrNetEntry *e = zr_net_checkout(id);
+    if (e) {
+        zr_mutex_lock(&g_zr_net_mtx);
+        zr_net_destroy_entry(e);
+        zr_mutex_unlock(&g_zr_net_mtx);
+    }
+    *out = val_bool(true);
     return true;
 }
 

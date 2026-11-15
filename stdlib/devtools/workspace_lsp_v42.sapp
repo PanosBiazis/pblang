@@ -1,0 +1,2222 @@
+// stdlib/devtools/workspace_lsp_v42.sapp
+// PBLang v4.2.0 — Multi-File Workspace Language Server (LSP 3.17, JSON-RPC 2.0)
+//
+// Pure-PBLang multi-file workspace indexer and Language Server Protocol 3.17 engine:
+//   - Multi-file symbol & reference graph (`fn`, `export fn`, `let`, `const`,
+//     `struct`, `enum`+variants, `class`+methods, `interface`, `trait`, `import(...)`)
+//   - Cross-file Go-to-Definition (`MOD.symbol`, destructured imports, `import("...")`)
+//   - Workspace-wide Find References (`textDocument/references`)
+//   - Safe Multi-File Rename (`prepareRename` + `rename` -> `WorkspaceEdit`,
+//     refusing reserved PBLang keywords & runtime builtins)
+//   - Context-aware Completion & Signature Help (with `requires`/`ensures` contracts)
+//   - Rich Inlay Hints: 9D `: Unit[...]` & `: Currency[...]` on `let`, `param:` on
+//     multi-arg calls, `✓ SQL(...)` on verified SQL queries, and `✓ exhaustive` on `match`
+//   - Real-time `publishDiagnostics` combining syntax + Static Checker Passes 1–7
+
+const SC = import("stdlib/static_checker.sapp");
+const BL = import("stdlib/compiler/builtins_list.sapp");
+
+const WORKSPACE_LSP_VERSION = "4.2.0";
+
+// LSP SymbolKind constants (LSP 3.17)
+const SYM_FILE = 1;
+const SYM_MODULE = 2;
+const SYM_CLASS = 5;
+const SYM_METHOD = 6;
+const SYM_PROPERTY = 7;
+const SYM_FIELD = 8;
+const SYM_ENUM = 10;
+const SYM_INTERFACE = 11;
+const SYM_FUNCTION = 12;
+const SYM_VARIABLE = 13;
+const SYM_CONSTANT = 14;
+const SYM_ENUM_MEMBER = 22;
+const SYM_STRUCT = 23;
+
+// LSP CompletionItemKind constants
+const COMP_TEXT = 1;
+const COMP_METHOD = 2;
+const COMP_FUNCTION = 3;
+const COMP_FIELD = 5;
+const COMP_VARIABLE = 6;
+const COMP_CLASS = 7;
+const COMP_INTERFACE = 8;
+const COMP_MODULE = 9;
+const COMP_ENUM = 13;
+const COMP_KEYWORD = 14;
+const COMP_FILE = 17;
+const COMP_ENUM_MEMBER = 20;
+const COMP_CONSTANT = 21;
+const COMP_STRUCT = 22;
+
+let _RESERVED_KEYWORDS = [
+    "fn", "let", "const", "if", "elif", "else", "while", "for", "in", "to",
+    "loop", "match", "case", "switch", "default", "return", "break", "continue",
+    "try", "catch", "throw", "defer", "import", "export", "struct", "enum",
+    "class", "extends", "implements", "interface", "trait", "requires", "ensures",
+    "comptime", "true", "false", "nil", "and", "or", "not", "self", "print", "println"
+];
+
+let _EXTRA_BUILTINS = [
+    "len", "str", "type", "push", "pop", "range", "map_keys", "map_has", "map_remove",
+    "str_slice", "str_split", "str_join", "str_trim", "str_upper", "str_lower",
+    "str_contains", "str_starts_with", "str_ends_with", "str_index_of", "str_replace_all",
+    "parse_number", "json_parse", "json_stringify", "fs_read", "fs_write", "fs_append",
+    "fs_exists", "fs_listdir", "fs_remove", "fs_mkdirs", "path_join", "path_dirname",
+    "path_basename", "now_ms", "now_iso", "os_args", "os_exit", "sha256", "sqrt", "abs",
+    "sin", "cos", "tan", "exp", "ln", "log", "pow", "min", "max", "clamp", "Some", "Ok", "Err",
+    "sqlite_open", "sqlite_close", "sqlite_query", "sqlite_exec", "pg_query", "pg_exec",
+    "tds_query", "tds_exec", "mysql_query", "mysql_exec", "coverage_snapshot"
+];
+
+fn _arr_contains(arr, item) {
+    let i = 0;
+    while i < len(arr) {
+        if arr[i] == item { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _is_ident_char(ch) {
+    if ch == "" { return false; }
+    return (ch >= "A" and ch <= "Z") or (ch >= "a" and ch <= "z") or (ch >= "0" and ch <= "9") or ch == "_";
+}
+
+fn _is_valid_new_ident(nm) {
+    if nm == nil or len(nm) == 0 { return false; }
+    let first = str_slice(nm, 0, 1);
+    if not ((first >= "A" and first <= "Z") or (first >= "a" and first <= "z") or first == "_") {
+        return false;
+    }
+    let i = 1;
+    while i < len(nm) {
+        if not _is_ident_char(str_slice(nm, i, i + 1)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _is_keyword(nm) {
+    return _arr_contains(_RESERVED_KEYWORDS, nm);
+}
+
+fn _is_builtin(nm) {
+    if BL.is_builtin_name(nm) { return true; }
+    return _arr_contains(_EXTRA_BUILTINS, nm);
+}
+
+// ── Path & URI Canonicalization ───────────────────────────────────────────────
+
+fn _normalize_slashes(p) {
+    if p == nil { return ""; }
+    return str_replace_all(str(p), "\\", "/");
+}
+
+fn _normalize_fs_path(raw_path) {
+    let p = _normalize_slashes(raw_path);
+    if p == "" { return ""; }
+    let is_abs = str_starts_with(p, "/");
+    let parts = str_split(p, "/");
+    let stack = [];
+    let i = 0;
+    while i < len(parts) {
+        let seg = parts[i];
+        if seg == "" or seg == "." {
+            i = i + 1;
+            continue;
+        }
+        if seg == ".." {
+            if len(stack) > 0 and stack[len(stack) - 1] != ".." {
+                pop(stack);
+            } elif not is_abs {
+                push(stack, "..");
+            }
+        } else {
+            push(stack, seg);
+        }
+        i = i + 1;
+    }
+    let joined = str_join(stack, "/");
+    if is_abs { return "/" + joined; }
+    return if joined == "" { "." } else { joined };
+}
+
+fn _uri_to_path(uri) {
+    if uri == nil { return ""; }
+    let s = str(uri);
+    if str_starts_with(s, "file://") {
+        let rest = str_slice(s, 7, len(s));
+        let dec = try url_decode(rest) catch rest;
+        return _normalize_fs_path(dec);
+    }
+    return _normalize_fs_path(s);
+}
+
+fn _path_to_uri(path) {
+    if path == nil or path == "" { return "file:///untitled.sapp"; }
+    let s = str(path);
+    if str_starts_with(s, "file://") {
+        let p = _uri_to_path(s);
+        if str_starts_with(p, "/") { return "file://" + p; }
+        return "file:///" + p;
+    }
+    let norm = _normalize_fs_path(s);
+    if str_starts_with(norm, "/") { return "file://" + norm; }
+    return "file:///" + norm;
+}
+
+fn _lsp_pos(line0, char0) {
+    let l = if line0 < 0 { 0 } else { line0 };
+    let c = if char0 < 0 { 0 } else { char0 };
+    return map{ line: l, character: c };
+}
+
+fn _lsp_range(sl0, sc0, el0, ec0) {
+    return map{
+        start: _lsp_pos(sl0, sc0),
+        end: _lsp_pos(el0, if ec0 < sc0 and el0 == sl0 { sc0 } else { ec0 })
+    };
+}
+
+fn _tok_to_lsp_range(line1, col1, end_col1) {
+    let l0 = if line1 > 0 { line1 - 1 } else { 0 };
+    let c0 = if col1 > 0 { col1 - 1 } else { 0 };
+    let ec0 = if end_col1 > 0 { end_col1 - 1 } else { c0 + 1 };
+    return _lsp_range(l0, c0, l0, ec0);
+}
+
+fn _pos_in_range(line0, char0, rng) {
+    let s = rng["start"];
+    let e = rng["end"];
+    if line0 < s["line"] or line0 > e["line"] { return false; }
+    if line0 == s["line"] and char0 < s["character"] { return false; }
+    if line0 == e["line"] and char0 > e["character"] { return false; }
+    return true;
+}
+
+// ── AST Formatting & Extraction Helpers ───────────────────────────────────────
+
+fn _annot_to_display(ann) {
+    if ann == nil { return "any"; }
+    let base = ann["raw"];
+    if ann["unit_raw"] != "" {
+        return base + "[" + ann["unit_raw"] + "]";
+    }
+    if ann["args"] != nil and len(ann["args"]) > 0 {
+        let parts = [];
+        let i = 0;
+        while i < len(ann["args"]) {
+            push(parts, _annot_to_display(ann["args"][i]));
+            i = i + 1;
+        }
+        return base + "<" + str_join(parts, ", ") + ">";
+    }
+    return base;
+}
+
+fn _expr_to_short_str(e) {
+    if e == nil { return ""; }
+    let k = e["kind"];
+    if k == "num" or k == "bool" { return str(e["val"]); }
+    if k == "nil" { return "nil"; }
+    if k == "str" { return "\"" + str(e["val"]) + "\""; }
+    if k == "ident" { return e["name"]; }
+    if k == "unary" { return e["op"] + _expr_to_short_str(e["arg"]); }
+    if k == "binary" {
+        return _expr_to_short_str(e["left"]) + " " + e["op"] + " " + _expr_to_short_str(e["right"]);
+    }
+    if k == "member" {
+        return _expr_to_short_str(e["obj"]) + e["op"] + e["field"];
+    }
+    if k == "call" {
+        let as_str = [];
+        let i = 0;
+        while i < len(e["args"]) {
+            push(as_str, _expr_to_short_str(e["args"][i]));
+            i = i + 1;
+        }
+        return _expr_to_short_str(e["callee"]) + "(" + str_join(as_str, ", ") + ")";
+    }
+    return "...";
+}
+
+fn _format_params_list(params) {
+    let out = [];
+    let pnames = [];
+    if params != nil {
+        let i = 0;
+        while i < len(params) {
+            let p = params[i];
+            let pstr = (if p["is_rest"] { "..." } else { "" }) + p["name"];
+            if p["annot"] != nil {
+                pstr = pstr + ": " + _annot_to_display(p["annot"]);
+            }
+            if p["default_expr"] != nil {
+                pstr = pstr + " = " + _expr_to_short_str(p["default_expr"]);
+            }
+            push(out, pstr);
+            push(pnames, p["name"]);
+            i = i + 1;
+        }
+    }
+    return map{ formatted: out, names: pnames };
+}
+
+fn _classify_9d_inlay_label(uinfo) {
+    if uinfo == nil { return ""; }
+    let cmap = if map_has(uinfo, "currency_map") { uinfo["currency_map"] } else { nil };
+    let dim = if map_has(uinfo, "dim") { uinfo["dim"] } else { nil };
+    let dim_is_one = true;
+    if dim != nil {
+        let di = 0;
+        while di < len(dim) {
+            if di != 7 and dim[di][0] != 0 { dim_is_one = false; }
+            di = di + 1;
+        }
+    }
+    if cmap != nil {
+        let cks = map_keys(cmap);
+        if len(cks) == 1 and dim_is_one {
+            let code = cks[0];
+            let exp_r = cmap[code];
+            if exp_r[0] == 1 and exp_r[1] == 1 {
+                return ": Currency[" + code + "]";
+            }
+        }
+    }
+    let ustr = if map_has(uinfo, "unit_str") and uinfo["unit_str"] != "" {
+        uinfo["unit_str"]
+    } elif map_has(uinfo, "canonical_si") and uinfo["canonical_si"] != "" {
+        uinfo["canonical_si"]
+    } else {
+        ""
+    };
+    if ustr == "" or ustr == "1" { return ""; }
+    return ": Unit[" + ustr + "]";
+}
+
+fn _collect_calls_and_lets_in_expr(expr, call_sites) {
+    if expr == nil { return; }
+    let k = expr["kind"];
+    if k == "call" {
+        let callee = expr["callee"];
+        let cname = "";
+        let qual = "";
+        if callee != nil {
+            if callee["kind"] == "ident" {
+                cname = callee["name"];
+            } elif callee["kind"] == "member" {
+                cname = callee["field"];
+                if callee["obj"] != nil and callee["obj"]["kind"] == "ident" {
+                    qual = callee["obj"]["name"];
+                }
+                _collect_calls_and_lets_in_expr(callee["obj"], call_sites);
+            } else {
+                _collect_calls_and_lets_in_expr(callee, call_sites);
+            }
+        }
+        let arg_infos = [];
+        let i = 0;
+        while i < len(expr["args"]) {
+            let a = expr["args"][i];
+            let rname = if a["kind"] == "ident" { a["name"] } else { "" };
+            push(arg_infos, map{
+                line: a["line"],
+                col: a["col"],
+                kind: a["kind"],
+                raw_name: rname
+            });
+            _collect_calls_and_lets_in_expr(a, call_sites);
+            i = i + 1;
+        }
+        if cname != "" {
+            push(call_sites, map{
+                callee_name: cname,
+                qualifier: qual,
+                line: expr["line"],
+                col: expr["col"],
+                args: arg_infos
+            });
+        }
+        return;
+    }
+    if k == "method_call" {
+        let qual2 = if expr["obj"] != nil and expr["obj"]["kind"] == "ident" { expr["obj"]["name"] } else { "" };
+        _collect_calls_and_lets_in_expr(expr["obj"], call_sites);
+        let arg_infos2 = [];
+        let i2 = 0;
+        while i2 < len(expr["args"]) {
+            let a2 = expr["args"][i2];
+            push(arg_infos2, map{
+                line: a2["line"],
+                col: a2["col"],
+                kind: a2["kind"],
+                raw_name: if a2["kind"] == "ident" { a2["name"] } else { "" }
+            });
+            _collect_calls_and_lets_in_expr(a2, call_sites);
+            i2 = i2 + 1;
+        }
+        push(call_sites, map{
+            callee_name: expr["method"],
+            qualifier: qual2,
+            line: expr["line"],
+            col: expr["col"],
+            args: arg_infos2
+        });
+        return;
+    }
+    if k == "binary" {
+        _collect_calls_and_lets_in_expr(expr["left"], call_sites);
+        _collect_calls_and_lets_in_expr(expr["right"], call_sites);
+    } elif k == "unary" or k == "try_prop" {
+        _collect_calls_and_lets_in_expr(expr["arg"], call_sites);
+    } elif k == "member" {
+        _collect_calls_and_lets_in_expr(expr["obj"], call_sites);
+    } elif k == "index" {
+        _collect_calls_and_lets_in_expr(expr["obj"], call_sites);
+        _collect_calls_and_lets_in_expr(expr["index"], call_sites);
+    } elif k == "array_lit" {
+        let ai = 0;
+        while ai < len(expr["items"]) {
+            let it = expr["items"][ai];
+            if it["kind"] == "spread" { _collect_calls_and_lets_in_expr(it["arg"], call_sites); }
+            else { _collect_calls_and_lets_in_expr(it, call_sites); }
+            ai = ai + 1;
+        }
+    } elif k == "map_lit" {
+        let mi = 0;
+        while mi < len(expr["entries"]) {
+            _collect_calls_and_lets_in_expr(expr["entries"][mi]["key"], call_sites);
+            _collect_calls_and_lets_in_expr(expr["entries"][mi]["val"], call_sites);
+            mi = mi + 1;
+        }
+    } elif k == "struct_lit" {
+        let sfi = 0;
+        while sfi < len(expr["fields"]) {
+            _collect_calls_and_lets_in_expr(expr["fields"][sfi]["val"], call_sites);
+            sfi = sfi + 1;
+        }
+    } elif k == "if_expr" {
+        _collect_calls_and_lets_in_expr(expr["cond"], call_sites);
+        _collect_calls_and_lets_in_expr(expr["then_expr"], call_sites);
+        _collect_calls_and_lets_in_expr(expr["else_expr"], call_sites);
+    } elif k == "try_expr" {
+        _collect_calls_and_lets_in_expr(expr["expr"], call_sites);
+        _collect_calls_and_lets_in_expr(expr["fallback"], call_sites);
+    }
+}
+
+fn _index_ast_stmts(uri, stmts, container, scope_sl, scope_el, units_inferred, contracts_by_fn, exported_set, out_symbols, out_imports, out_let_bindings, call_sites) {
+    if stmts == nil { return; }
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        let sk = s["kind"];
+        let is_top = container == "" and scope_sl == 1;
+        let is_exp = (map_has(s, "exported") and s["exported"] == true) or (is_top and map_has(s, "name") and map_has(exported_set, s["name"]));
+
+        if sk == "fn_decl" {
+            let pinfo = _format_params_list(s["params"]);
+            let ret_s = if s["ret_annot"] != nil { _annot_to_display(s["ret_annot"]) } else { "any" };
+            let req_strs = [];
+            let ri = 0;
+            while ri < len(s["requires_list"]) {
+                push(req_strs, _expr_to_short_str(s["requires_list"][ri]["expr"]));
+                _collect_calls_and_lets_in_expr(s["requires_list"][ri]["expr"], call_sites);
+                ri = ri + 1;
+            }
+            let ens_strs = [];
+            let ei = 0;
+            while ei < len(s["ensures_list"]) {
+                push(ens_strs, _expr_to_short_str(s["ensures_list"][ei]["expr"]));
+                _collect_calls_and_lets_in_expr(s["ensures_list"][ei]["expr"], call_sites);
+                ei = ei + 1;
+            }
+            let u9d = if map_has(units_inferred, s["name"]) { units_inferred[s["name"]]["unit_str"] } else { "" };
+            let c_recs = if map_has(contracts_by_fn, s["name"]) { contracts_by_fn[s["name"]] } else { [] };
+            let sel_rng = _tok_to_lsp_range(s["line"], s["col"], s["end_col"]);
+            let full_el = if map_has(s, "end_line") and s["end_line"] >= s["line"] { s["end_line"] } else { s["line"] };
+            let full_rng = _lsp_range(s["line"] - 1, 0, full_el - 1, 120);
+
+            push(out_symbols, map{
+                uri: uri,
+                name: s["name"],
+                kind: if container != "" { "method" } elif is_exp { "export fn" } else { "fn" },
+                lsp_kind: if container != "" { SYM_METHOD } else { SYM_FUNCTION },
+                exported: is_exp,
+                is_local: not is_top and container == "",
+                container_name: container,
+                scope_start_line: scope_sl,
+                scope_end_line: scope_el,
+                range: sel_rng,
+                full_range: full_rng,
+                params: pinfo["formatted"],
+                param_names: pinfo["names"],
+                return_type: ret_s,
+                unit_9d: u9d,
+                contracts: c_recs,
+                requires_strs: req_strs,
+                ensures_strs: ens_strs,
+                doc_comment: if map_has(s, "doc") { s["doc"] } else { "" }
+            });
+
+            // Index function parameters as local symbols scoped to function lines
+            let body_sl = s["line"];
+            let body_el = if s["body"] != nil and map_has(s["body"], "end_line") and s["body"]["end_line"] >= body_sl { s["body"]["end_line"] } else { full_el };
+            let pi = 0;
+            while pi < len(s["params"]) {
+                let p = s["params"][pi];
+                let pu_key = s["name"] + "." + p["name"];
+                let pu9d = if map_has(units_inferred, pu_key) { units_inferred[pu_key]["unit_str"] } else { "" };
+                push(out_symbols, map{
+                    uri: uri,
+                    name: p["name"],
+                    kind: "param",
+                    lsp_kind: SYM_VARIABLE,
+                    exported: false,
+                    is_local: true,
+                    container_name: s["name"],
+                    scope_start_line: body_sl,
+                    scope_end_line: body_el,
+                    range: _tok_to_lsp_range(p["line"], p["col"], p["end_col"]),
+                    full_range: _tok_to_lsp_range(p["line"], p["col"], p["end_col"]),
+                    params: [],
+                    param_names: [],
+                    return_type: if p["annot"] != nil { _annot_to_display(p["annot"]) } else { "any" },
+                    unit_9d: pu9d,
+                    contracts: [],
+                    requires_strs: [],
+                    ensures_strs: [],
+                    doc_comment: ""
+                });
+                if p["default_expr"] != nil {
+                    _collect_calls_and_lets_in_expr(p["default_expr"], call_sites);
+                }
+                pi = pi + 1;
+            }
+            if s["body"] != nil {
+                _index_ast_stmts(uri, s["body"]["stmts"], "", body_sl, body_el, units_inferred, contracts_by_fn, exported_set, out_symbols, out_imports, out_let_bindings, call_sites);
+                if s["body"]["tail_expr"] != nil {
+                    _collect_calls_and_lets_in_expr(s["body"]["tail_expr"], call_sites);
+                }
+            }
+        } elif sk == "var_decl" {
+            let sel_rng2 = _tok_to_lsp_range(s["line"], s["col"], s["end_col"]);
+            let uinfo = if map_has(units_inferred, s["name"]) { units_inferred[s["name"]] } else { nil };
+            let u9d2 = if uinfo != nil { uinfo["unit_str"] } else { "" };
+            if s["init"] != nil and s["init"]["kind"] == "import_expr" and s["init"]["arg"] != nil and s["init"]["arg"]["kind"] == "str" {
+                let imp_arg = s["init"]["arg"];
+                let raw_mod = imp_arg["val"];
+                let str_end_col = imp_arg["col"] + len(raw_mod) + 2;
+                out_imports[s["name"]] = map{
+                    alias: s["name"],
+                    raw_path: raw_mod,
+                    alias_range: sel_rng2,
+                    str_range: _tok_to_lsp_range(imp_arg["line"], imp_arg["col"], str_end_col),
+                    line: s["line"]
+                };
+            }
+            let init_qual = "";
+            let init_cname = "";
+            if s["init"] != nil {
+                _collect_calls_and_lets_in_expr(s["init"], call_sites);
+                if s["init"]["kind"] == "call" and s["init"]["callee"] != nil {
+                    let ic = s["init"]["callee"];
+                    if ic["kind"] == "member" and ic["obj"] != nil and ic["obj"]["kind"] == "ident" {
+                        init_qual = ic["obj"]["name"];
+                        init_cname = ic["field"];
+                    } elif ic["kind"] == "ident" {
+                        init_cname = ic["name"];
+                    }
+                }
+            }
+            push(out_let_bindings, map{
+                name: s["name"],
+                is_const: s["is_const"],
+                has_explicit_annot: s["annot"] != nil,
+                line: s["line"],
+                col: s["col"],
+                end_col: s["end_col"],
+                unit_info: uinfo,
+                init_call_qual: init_qual,
+                init_call_name: init_cname
+            });
+            push(out_symbols, map{
+                uri: uri,
+                name: s["name"],
+                kind: if s["is_const"] { "const" } else { "let" },
+                lsp_kind: if s["is_const"] { SYM_CONSTANT } else { SYM_VARIABLE },
+                exported: is_exp,
+                is_local: not is_top and container == "",
+                container_name: container,
+                scope_start_line: scope_sl,
+                scope_end_line: scope_el,
+                range: sel_rng2,
+                full_range: sel_rng2,
+                params: [],
+                param_names: [],
+                return_type: if s["annot"] != nil { _annot_to_display(s["annot"]) } elif uinfo != nil { uinfo["type_str"] } else { "any" },
+                unit_9d: u9d2,
+                contracts: [],
+                requires_strs: [],
+                ensures_strs: [],
+                doc_comment: if map_has(s, "doc") { s["doc"] } else { "" }
+            });
+        } elif sk == "destruct_decl" {
+            let is_imp_destruct = s["init"] != nil and s["init"]["kind"] == "import_expr" and s["init"]["arg"] != nil and s["init"]["arg"]["kind"] == "str";
+            let imp_raw = if is_imp_destruct { s["init"]["arg"]["val"] } else { "" };
+            if s["init"] != nil {
+                _collect_calls_and_lets_in_expr(s["init"], call_sites);
+            }
+            let di = 0;
+            while di < len(s["names"]) {
+                let dtok = s["names"][di];
+                let drng = _tok_to_lsp_range(dtok["line"], dtok["col"], dtok["end_col"]);
+                if is_imp_destruct {
+                    out_imports["__destruct__" + dtok["val"]] = map{
+                        alias: "",
+                        imported_symbol: dtok["val"],
+                        raw_path: imp_raw,
+                        alias_range: drng,
+                        str_range: _tok_to_lsp_range(s["init"]["arg"]["line"], s["init"]["arg"]["col"], s["init"]["arg"]["col"] + len(imp_raw) + 2),
+                        line: dtok["line"]
+                    };
+                }
+                push(out_symbols, map{
+                    uri: uri,
+                    name: dtok["val"],
+                    kind: if s["is_const"] { "const" } else { "let" },
+                    lsp_kind: if s["is_const"] { SYM_CONSTANT } else { SYM_VARIABLE },
+                    exported: false,
+                    is_local: not is_top,
+                    container_name: container,
+                    scope_start_line: scope_sl,
+                    scope_end_line: scope_el,
+                    range: drng,
+                    full_range: drng,
+                    params: [],
+                    param_names: [],
+                    return_type: "any",
+                    unit_9d: "",
+                    contracts: [],
+                    requires_strs: [],
+                    ensures_strs: [],
+                    doc_comment: ""
+                });
+                di = di + 1;
+            }
+        } elif sk == "struct_decl" {
+            let srng = _tok_to_lsp_range(s["line"], s["col"], s["end_col"]);
+            let fnames = [];
+            let ffmt = [];
+            let fi = 0;
+            while fi < len(s["fields"]) {
+                let f = s["fields"][fi];
+                push(fnames, f["name"]);
+                push(ffmt, f["name"] + (if f["annot"] != nil { ": " + _annot_to_display(f["annot"]) } else { "" }));
+                push(out_symbols, map{
+                    uri: uri,
+                    name: f["name"],
+                    kind: "field",
+                    lsp_kind: SYM_FIELD,
+                    exported: is_exp,
+                    is_local: false,
+                    container_name: s["name"],
+                    scope_start_line: s["line"],
+                    scope_end_line: s["end_line"],
+                    range: _tok_to_lsp_range(f["line"], f["col"], f["col"] + len(f["name"])),
+                    full_range: _tok_to_lsp_range(f["line"], f["col"], f["col"] + len(f["name"])),
+                    params: [],
+                    param_names: [],
+                    return_type: if f["annot"] != nil { _annot_to_display(f["annot"]) } else { "any" },
+                    unit_9d: "",
+                    contracts: [],
+                    requires_strs: [],
+                    ensures_strs: [],
+                    doc_comment: ""
+                });
+                fi = fi + 1;
+            }
+            push(out_symbols, map{
+                uri: uri,
+                name: s["name"],
+                kind: "struct",
+                lsp_kind: SYM_STRUCT,
+                exported: is_exp,
+                is_local: false,
+                container_name: "",
+                scope_start_line: scope_sl,
+                scope_end_line: scope_el,
+                range: srng,
+                full_range: _lsp_range(s["line"] - 1, 0, s["end_line"] - 1, 120),
+                params: ffmt,
+                param_names: fnames,
+                return_type: s["name"],
+                unit_9d: "",
+                contracts: [],
+                requires_strs: [],
+                ensures_strs: [],
+                doc_comment: if map_has(s, "doc") { s["doc"] } else { "" }
+            });
+        } elif sk == "enum_decl" {
+            let erng = _tok_to_lsp_range(s["line"], s["col"], s["end_col"]);
+            push(out_symbols, map{
+                uri: uri,
+                name: s["name"],
+                kind: "enum",
+                lsp_kind: SYM_ENUM,
+                exported: is_exp,
+                is_local: false,
+                container_name: "",
+                scope_start_line: scope_sl,
+                scope_end_line: scope_el,
+                range: erng,
+                full_range: _lsp_range(s["line"] - 1, 0, s["end_line"] - 1, 120),
+                params: s["variants"],
+                param_names: s["variants"],
+                return_type: s["name"],
+                unit_9d: "",
+                contracts: [],
+                requires_strs: [],
+                ensures_strs: [],
+                doc_comment: if map_has(s, "doc") { s["doc"] } else { "" }
+            });
+            if map_has(s, "variant_defs") and s["variant_defs"] != nil {
+                let vi = 0;
+                while vi < len(s["variant_defs"]) {
+                    let vd = s["variant_defs"][vi];
+                    let vp_fmt = [];
+                    let vpi = 0;
+                    while vpi < len(vd["param_annots"]) {
+                        push(vp_fmt, _annot_to_display(vd["param_annots"][vpi]));
+                        vpi = vpi + 1;
+                    }
+                    push(out_symbols, map{
+                        uri: uri,
+                        name: vd["name"],
+                        kind: "enum_variant",
+                        lsp_kind: SYM_ENUM_MEMBER,
+                        exported: is_exp,
+                        is_local: false,
+                        container_name: s["name"],
+                        scope_start_line: s["line"],
+                        scope_end_line: s["end_line"],
+                        range: _tok_to_lsp_range(vd["line"], vd["col"], vd["end_col"]),
+                        full_range: _tok_to_lsp_range(vd["line"], vd["col"], vd["end_col"]),
+                        params: vp_fmt,
+                        param_names: vp_fmt,
+                        return_type: s["name"],
+                        unit_9d: "",
+                        contracts: [],
+                        requires_strs: [],
+                        ensures_strs: [],
+                        doc_comment: ""
+                    });
+                    vi = vi + 1;
+                }
+            }
+        } elif sk == "class_decl" {
+            let crng = _tok_to_lsp_range(s["line"], s["col"], s["end_col"]);
+            push(out_symbols, map{
+                uri: uri,
+                name: s["name"],
+                kind: "class",
+                lsp_kind: SYM_CLASS,
+                exported: is_exp,
+                is_local: false,
+                container_name: "",
+                scope_start_line: scope_sl,
+                scope_end_line: scope_el,
+                range: crng,
+                full_range: _lsp_range(s["line"] - 1, 0, s["end_line"] - 1, 120),
+                params: [],
+                param_names: [],
+                return_type: s["name"],
+                unit_9d: "",
+                contracts: [],
+                requires_strs: [],
+                ensures_strs: [],
+                doc_comment: if map_has(s, "doc") { s["doc"] } else { "" }
+            });
+            _index_ast_stmts(uri, s["members"], s["name"], s["line"], s["end_line"], units_inferred, contracts_by_fn, exported_set, out_symbols, out_imports, out_let_bindings, call_sites);
+        } elif sk == "trait_decl" {
+            let trng = _tok_to_lsp_range(s["line"], s["col"], s["end_col"]);
+            push(out_symbols, map{
+                uri: uri,
+                name: s["name"],
+                kind: s["decl_kw"],
+                lsp_kind: SYM_INTERFACE,
+                exported: is_exp,
+                is_local: false,
+                container_name: "",
+                scope_start_line: scope_sl,
+                scope_end_line: scope_el,
+                range: trng,
+                full_range: _lsp_range(s["line"] - 1, 0, s["end_line"] - 1, 120),
+                params: [],
+                param_names: [],
+                return_type: s["name"],
+                unit_9d: "",
+                contracts: [],
+                requires_strs: [],
+                ensures_strs: [],
+                doc_comment: if map_has(s, "doc") { s["doc"] } else { "" }
+            });
+            let tmi = 0;
+            while tmi < len(s["methods"]) {
+                let tm = s["methods"][tmi];
+                let tpinfo = _format_params_list(tm["params"]);
+                push(out_symbols, map{
+                    uri: uri,
+                    name: tm["name"],
+                    kind: "method",
+                    lsp_kind: SYM_METHOD,
+                    exported: is_exp,
+                    is_local: false,
+                    container_name: s["name"],
+                    scope_start_line: s["line"],
+                    scope_end_line: s["end_line"],
+                    range: _tok_to_lsp_range(tm["line"], tm["col"], tm["end_col"]),
+                    full_range: _tok_to_lsp_range(tm["line"], tm["col"], tm["end_col"]),
+                    params: tpinfo["formatted"],
+                    param_names: tpinfo["names"],
+                    return_type: if tm["ret_annot"] != nil { _annot_to_display(tm["ret_annot"]) } else { "any" },
+                    unit_9d: "",
+                    contracts: [],
+                    requires_strs: [],
+                    ensures_strs: [],
+                    doc_comment: ""
+                });
+                tmi = tmi + 1;
+            }
+        } elif sk == "if_stmt" {
+            _collect_calls_and_lets_in_expr(s["cond"], call_sites);
+            if s["then_block"] != nil {
+                _index_ast_stmts(uri, s["then_block"]["stmts"], container, s["line"], s["then_block"]["end_line"], units_inferred, contracts_by_fn, exported_set, out_symbols, out_imports, out_let_bindings, call_sites);
+                _collect_calls_and_lets_in_expr(s["then_block"]["tail_expr"], call_sites);
+            }
+            if s["else_block"] != nil {
+                if s["else_block"]["kind"] == "block" {
+                    _index_ast_stmts(uri, s["else_block"]["stmts"], container, s["line"], s["else_block"]["end_line"], units_inferred, contracts_by_fn, exported_set, out_symbols, out_imports, out_let_bindings, call_sites);
+                    _collect_calls_and_lets_in_expr(s["else_block"]["tail_expr"], call_sites);
+                } else {
+                    _index_ast_stmts(uri, [s["else_block"]], container, scope_sl, scope_el, units_inferred, contracts_by_fn, exported_set, out_symbols, out_imports, out_let_bindings, call_sites);
+                }
+            }
+        } elif sk == "while_stmt" {
+            _collect_calls_and_lets_in_expr(s["cond"], call_sites);
+            if s["body"] != nil {
+                _index_ast_stmts(uri, s["body"]["stmts"], container, s["line"], s["body"]["end_line"], units_inferred, contracts_by_fn, exported_set, out_symbols, out_imports, out_let_bindings, call_sites);
+            }
+        } elif sk == "for_stmt" {
+            _collect_calls_and_lets_in_expr(s["iter"], call_sites);
+            _collect_calls_and_lets_in_expr(s["range_end"], call_sites);
+            if s["body"] != nil {
+                _index_ast_stmts(uri, s["body"]["stmts"], container, s["line"], s["body"]["end_line"], units_inferred, contracts_by_fn, exported_set, out_symbols, out_imports, out_let_bindings, call_sites);
+            }
+        } elif sk == "match_stmt" {
+            _collect_calls_and_lets_in_expr(s["target"], call_sites);
+            let mai = 0;
+            while mai < len(s["arms"]) {
+                let arm = s["arms"][mai];
+                _collect_calls_and_lets_in_expr(arm["guard"], call_sites);
+                if arm["body"] != nil {
+                    if arm["body"]["kind"] == "block" {
+                        _index_ast_stmts(uri, arm["body"]["stmts"], container, arm["body"]["line"], arm["body"]["end_line"], units_inferred, contracts_by_fn, exported_set, out_symbols, out_imports, out_let_bindings, call_sites);
+                        _collect_calls_and_lets_in_expr(arm["body"]["tail_expr"], call_sites);
+                    } else {
+                        _collect_calls_and_lets_in_expr(arm["body"], call_sites);
+                    }
+                }
+                mai = mai + 1;
+            }
+        } elif sk == "assign" {
+            _collect_calls_and_lets_in_expr(s["target"], call_sites);
+            _collect_calls_and_lets_in_expr(s["val"], call_sites);
+        } elif sk == "return_stmt" or sk == "throw_stmt" {
+            _collect_calls_and_lets_in_expr(s["val"], call_sites);
+        } elif sk == "print_stmt" {
+            let pai = 0;
+            while pai < len(s["args"]) {
+                _collect_calls_and_lets_in_expr(s["args"][pai], call_sites);
+                pai = pai + 1;
+            }
+        } elif sk == "expr_stmt" {
+            _collect_calls_and_lets_in_expr(s["expr"], call_sites);
+        }
+        i = i + 1;
+    }
+}
+
+fn _extract_token_occurrences(tokens) {
+    let occs = [];
+    let imp_strings = [];
+    let n = len(tokens);
+    let i = 0;
+    while i < n {
+        let t = tokens[i];
+        let tk = t["kind"];
+        if tk == "KW" and t["val"] == "import" and i + 2 < n and tokens[i + 1]["val"] == "(" and tokens[i + 2]["kind"] == "STR" {
+            let st = tokens[i + 2];
+            push(imp_strings, map{
+                raw_path: st["val"],
+                range: _tok_to_lsp_range(st["line"], st["col"], st["end_col"])
+            });
+        }
+        if tk == "ID" {
+            let is_mem = false;
+            let qual = "";
+            if i >= 1 {
+                let prev = tokens[i - 1];
+                if (prev["kind"] == "PUNC" and prev["val"] == ".") or (prev["kind"] == "OP" and (prev["val"] == "::" or prev["val"] == "?.")) {
+                    is_mem = true;
+                    if i >= 2 and tokens[i - 2]["kind"] == "ID" {
+                        qual = tokens[i - 2]["val"];
+                    }
+                }
+            }
+            // Skip type unit brackets like `num[m/s]` where `[` precedes `m` after `:` type
+            let in_unit_bracket = false;
+            if i >= 2 and tokens[i - 1]["val"] == "[" and (tokens[i - 2]["val"] == "num" or tokens[i - 2]["val"] == "int" or tokens[i - 2]["val"] == "float" or tokens[i - 2]["val"] == "f64") {
+                in_unit_bracket = true;
+            }
+            if not in_unit_bracket {
+                push(occs, map{
+                    name: t["val"],
+                    line1: t["line"],
+                    col1: t["col"],
+                    end_col1: t["end_col"],
+                    range: _tok_to_lsp_range(t["line"], t["col"], t["end_col"]),
+                    is_member: is_mem,
+                    qualifier: qual
+                });
+            }
+        }
+        i = i + 1;
+    }
+    return map{ occurrences: occs, import_strings: imp_strings };
+}
+
+// ── File Indexing & Workspace Creation ────────────────────────────────────────
+
+fn lsp_index_file(state, uri, text) {
+    let canon_uri = _path_to_uri(uri);
+    let fpath = _uri_to_path(canon_uri);
+    let base_d = path_dirname(fpath);
+    let src = if text != nil { str(text) } else { "" };
+
+    let tok_res = SC.tokenize_sapp(src);
+    let tokens = tok_res["tokens"];
+    let check_rep = SC.check_source(src, map{ file: fpath, base_dir: base_d });
+
+    let exported_set = map{};
+    let ei = 0;
+    while ei < len(check_rep["exports"]) {
+        exported_set[check_rep["exports"][ei]] = true;
+        ei = ei + 1;
+    }
+
+    let contracts_by_fn = map{};
+    let ci = 0;
+    while ci < len(check_rep["contracts"]) {
+        let cr = check_rep["contracts"][ci];
+        let fnm = cr["fn_name"];
+        if not map_has(contracts_by_fn, fnm) { contracts_by_fn[fnm] = []; }
+        push(contracts_by_fn[fnm], cr);
+        ci = ci + 1;
+    }
+
+    let lines = str_split(src, "\n");
+    let total_lines = if len(lines) > 0 { len(lines) } else { 1 };
+    let symbols = [];
+    let imports = map{};
+    let let_bindings = [];
+    let call_sites = [];
+
+    if check_rep["ast"] != nil {
+        _index_ast_stmts(
+            canon_uri,
+            check_rep["ast"]["stmts"],
+            "",
+            1,
+            total_lines,
+            check_rep["units_inferred"],
+            contracts_by_fn,
+            exported_set,
+            symbols,
+            imports,
+            let_bindings,
+            call_sites
+        );
+    }
+
+    let occ_res = _extract_token_occurrences(tokens);
+    let prev_ver = if map_has(state["files"], canon_uri) { state["files"][canon_uri]["version"] } else { 0 };
+    let prev_open = if map_has(state["files"], canon_uri) { state["files"][canon_uri]["is_open"] } else { false };
+
+    let entry = map{
+        uri: canon_uri,
+        path: fpath,
+        text: src,
+        lines: lines,
+        is_open: prev_open,
+        version: prev_ver + 1,
+        tokens: tokens,
+        check_report: check_rep,
+        symbols: symbols,
+        imports: imports,
+        import_strings: occ_res["import_strings"],
+        let_bindings: let_bindings,
+        call_sites: call_sites,
+        occurrences: occ_res["occurrences"]
+    };
+    state["files"][canon_uri] = entry;
+    return entry;
+}
+
+fn _is_skipped_scan_root(dir_path) {
+    if dir_path == nil or dir_path == "" { return true; }
+    let p = _normalize_fs_path(dir_path);
+    if p == "/" or p == "/tmp" or p == "/var/tmp" {
+        return true;
+    }
+    return false;
+}
+
+fn _scan_workspace_dir(state, dir_path, max_files, count_box) {
+    if count_box[0] >= max_files or _is_skipped_scan_root(dir_path) { return; }
+    let items = try fs_listdir(dir_path) catch nil;
+    if items == nil { return; }
+    let i = 0;
+    while i < len(items) {
+        if count_box[0] >= max_files { return; }
+        let nm = items[i];
+        if nm == "" or str_starts_with(nm, ".") or nm == ".git" or nm == "target" or nm == "node_modules" or nm == ".pblang_cache" or nm == "dist" or nm == "build" {
+            i = i + 1;
+            continue;
+        }
+        let full = _normalize_fs_path(path_join(dir_path, nm));
+        if str_ends_with(nm, ".sapp") {
+            let furi = _path_to_uri(full);
+            if not map_has(state["files"], furi) {
+                let content = try fs_read(full) catch nil;
+                if content != nil {
+                    lsp_index_file(state, furi, content);
+                    count_box[0] = count_box[0] + 1;
+                }
+            }
+        } else {
+            let sub = try fs_listdir(full) catch nil;
+            if sub != nil {
+                _scan_workspace_dir(state, full, max_files, count_box);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn create_workspace_lsp(root_dir = nil) {
+    let norm_root = if root_dir != nil and str(root_dir) != "" { _normalize_fs_path(str(root_dir)) } else { nil };
+    let state = map{
+        version: WORKSPACE_LSP_VERSION,
+        root_dir: norm_root,
+        root_uri: if norm_root != nil { _path_to_uri(norm_root) } else { "" },
+        initialized: false,
+        shutdown: false,
+        files: map{},
+        outgoing_notifications: []
+    };
+    if norm_root != nil and not _is_skipped_scan_root(norm_root) and (try fs_exists(norm_root) catch false) {
+        _scan_workspace_dir(state, norm_root, 128, [0]);
+    }
+    return state;
+}
+
+// ── Cross-File Import & Symbol Resolution ─────────────────────────────────────
+
+fn _resolve_import_target_uri(state, from_uri, raw_spec) {
+    if raw_spec == nil or raw_spec == "" { return ""; }
+    let from_dir = path_dirname(_uri_to_path(from_uri));
+    let candidates = [];
+
+    let rel1 = _normalize_fs_path(path_join(from_dir, raw_spec));
+    push(candidates, _path_to_uri(rel1));
+    if not str_ends_with(rel1, ".sapp") {
+        push(candidates, _path_to_uri(rel1 + ".sapp"));
+    }
+
+    if state["root_dir"] != nil and state["root_dir"] != "" {
+        let r1 = _normalize_fs_path(path_join(state["root_dir"], raw_spec));
+        push(candidates, _path_to_uri(r1));
+        if not str_ends_with(r1, ".sapp") {
+            push(candidates, _path_to_uri(r1 + ".sapp"));
+        }
+    }
+
+    let ci = 0;
+    while ci < len(candidates) {
+        let cand_uri = candidates[ci];
+        if map_has(state["files"], cand_uri) {
+            return cand_uri;
+        }
+        ci = ci + 1;
+    }
+
+    // Check on-disk file not yet indexed (lazy index!)
+    ci = 0;
+    while ci < len(candidates) {
+        let cand_p = _uri_to_path(candidates[ci]);
+        if try fs_exists(cand_p) catch false {
+            let disk_src = try fs_read(cand_p) catch nil;
+            if disk_src != nil {
+                lsp_index_file(state, candidates[ci], disk_src);
+                return candidates[ci];
+            }
+        }
+        ci = ci + 1;
+    }
+
+    // Fallback suffix match on basename for virtual in-memory workspaces
+    let base_want = path_basename(_normalize_slashes(raw_spec));
+    let base_sapp = if str_ends_with(base_want, ".sapp") { base_want } else { base_want + ".sapp" };
+    let all_uris = map_keys(state["files"]);
+    let ui = 0;
+    while ui < len(all_uris) {
+        if str_ends_with(all_uris[ui], "/" + base_sapp) {
+            return all_uris[ui];
+        }
+        ui = ui + 1;
+    }
+    return "";
+}
+
+fn _find_file_top_symbol(fentry, sym_name, container_filter = "") {
+    if fentry == nil { return nil; }
+    let syms = fentry["symbols"];
+    // Prefer exported / top-level non-local declaration
+    let i = 0;
+    while i < len(syms) {
+        let s = syms[i];
+        if s["name"] == sym_name and s["container_name"] == container_filter and not s["is_local"] {
+            return s;
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _find_scoped_symbol(fentry, sym_name, line1) {
+    if fentry == nil { return nil; }
+    let syms = fentry["symbols"];
+    // 1. Check innermost local/param symbol enclosing `line1`
+    let best_local = nil;
+    let best_span = 9999999;
+    let i = 0;
+    while i < len(syms) {
+        let s = syms[i];
+        if s["name"] == sym_name and s["is_local"] {
+            if line1 >= s["scope_start_line"] and line1 <= s["scope_end_line"] {
+                let sp = s["scope_end_line"] - s["scope_start_line"];
+                if sp <= best_span {
+                    best_span = sp;
+                    best_local = s;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if best_local != nil { return best_local; }
+    // 2. Top-level file symbol
+    return _find_file_top_symbol(fentry, sym_name, "");
+}
+
+fn _occurrence_at_cursor(fentry, line0, char0) {
+    let occs = fentry["occurrences"];
+    let i = 0;
+    while i < len(occs) {
+        if _pos_in_range(line0, char0, occs[i]["range"]) {
+            return occs[i];
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _resolve_cursor_target(state, uri, line0, char0) {
+    let canon_uri = _path_to_uri(uri);
+    if not map_has(state["files"], canon_uri) { return nil; }
+    let fentry = state["files"][canon_uri];
+
+    // 1. Check `import("...")` path literal click
+    let is_list = fentry["import_strings"];
+    let ii = 0;
+    while ii < len(is_list) {
+        let is_item = is_list[ii];
+        if _pos_in_range(line0, char0, is_item["range"]) {
+            let tgt_uri = _resolve_import_target_uri(state, canon_uri, is_item["raw_path"]);
+            if tgt_uri != "" {
+                return map{
+                    kind: "module_file",
+                    uri: tgt_uri,
+                    range: _lsp_range(0, 0, 0, 0),
+                    cursor_range: is_item["range"],
+                    name: is_item["raw_path"],
+                    symbol: nil
+                };
+            }
+        }
+        ii = ii + 1;
+    }
+
+    let occ = _occurrence_at_cursor(fentry, line0, char0);
+    if occ == nil { return nil; }
+    let nm = occ["name"];
+
+    // 2. Qualified member `QUAL.name` or `QUAL::name`
+    if occ["is_member"] and occ["qualifier"] != "" {
+        let qual = occ["qualifier"];
+        if map_has(fentry["imports"], qual) {
+            let imp = fentry["imports"][qual];
+            let mod_uri = _resolve_import_target_uri(state, canon_uri, imp["raw_path"]);
+            if mod_uri != "" and map_has(state["files"], mod_uri) {
+                let target_sym = _find_file_top_symbol(state["files"][mod_uri], nm, "");
+                if target_sym != nil {
+                    return map{
+                        kind: "symbol",
+                        uri: mod_uri,
+                        range: target_sym["range"],
+                        cursor_range: occ["range"],
+                        name: nm,
+                        symbol: target_sym
+                    };
+                }
+            }
+        }
+        // Container member in same file (e.g. `EnumName.Variant` or `ClassName.method`)
+        let csym = _find_file_top_symbol(fentry, nm, qual);
+        if csym != nil {
+            return map{
+                kind: "symbol",
+                uri: canon_uri,
+                range: csym["range"],
+                cursor_range: occ["range"],
+                name: nm,
+                symbol: csym
+            };
+        }
+    }
+
+    // 3. Destructured import `const { foo } = import("./lib.sapp")`
+    let dkey = "__destruct__" + nm;
+    if not occ["is_member"] and map_has(fentry["imports"], dkey) {
+        let dimp = fentry["imports"][dkey];
+        let dmod_uri = _resolve_import_target_uri(state, canon_uri, dimp["raw_path"]);
+        if dmod_uri != "" and map_has(state["files"], dmod_uri) {
+            let dsym = _find_file_top_symbol(state["files"][dmod_uri], nm, "");
+            if dsym != nil {
+                return map{
+                    kind: "symbol",
+                    uri: dmod_uri,
+                    range: dsym["range"],
+                    cursor_range: occ["range"],
+                    name: nm,
+                    symbol: dsym
+                };
+            }
+        }
+    }
+
+    // 4. Local or file-level symbol in current file
+    if not occ["is_member"] {
+        let sym = _find_scoped_symbol(fentry, nm, occ["line1"]);
+        if sym != nil {
+            return map{
+                kind: "symbol",
+                uri: canon_uri,
+                range: sym["range"],
+                cursor_range: occ["range"],
+                name: nm,
+                symbol: sym
+            };
+        }
+    }
+
+    return map{
+        kind: "unresolved",
+        uri: canon_uri,
+        range: occ["range"],
+        cursor_range: occ["range"],
+        name: nm,
+        symbol: nil
+    };
+}
+
+fn _push_unique_location(locs, uri, rng) {
+    let i = 0;
+    while i < len(locs) {
+        let ex = locs[i];
+        if ex["uri"] == uri and ex["range"]["start"]["line"] == rng["start"]["line"] and ex["range"]["start"]["character"] == rng["start"]["character"] {
+            return;
+        }
+        i = i + 1;
+    }
+    push(locs, map{ uri: uri, range: rng });
+}
+
+fn _collect_workspace_symbol_locations(state, resolved, include_declaration) {
+    let locs = [];
+    if resolved == nil or resolved["symbol"] == nil { return locs; }
+    let sym = resolved["symbol"];
+    let def_uri = sym["uri"];
+    let target_name = sym["name"];
+    let decl_rng = sym["range"];
+
+    if not map_has(state["files"], def_uri) { return locs; }
+    let def_file = state["files"][def_uri];
+
+    // 1. Occurrences inside defining file
+    let occs = def_file["occurrences"];
+    let i = 0;
+    while i < len(occs) {
+        let oc = occs[i];
+        if oc["name"] == target_name {
+            let is_decl_pos = oc["range"]["start"]["line"] == decl_rng["start"]["line"] and oc["range"]["start"]["character"] == decl_rng["start"]["character"];
+            if sym["is_local"] {
+                if not oc["is_member"] and oc["line1"] >= sym["scope_start_line"] and oc["line1"] <= sym["scope_end_line"] {
+                    if include_declaration or not is_decl_pos {
+                        _push_unique_location(locs, def_uri, oc["range"]);
+                    }
+                }
+            } elif sym["container_name"] != "" {
+                if (oc["is_member"] and oc["qualifier"] == sym["container_name"]) or is_decl_pos {
+                    if include_declaration or not is_decl_pos {
+                        _push_unique_location(locs, def_uri, oc["range"]);
+                    }
+                }
+            } else {
+                // Top-level symbol in `def_uri`: ignore shadowed locals or unrelated `other.name`
+                if not oc["is_member"] {
+                    let bound = _find_scoped_symbol(def_file, target_name, oc["line1"]);
+                    if bound == nil or not bound["is_local"] {
+                        if include_declaration or not is_decl_pos {
+                            _push_unique_location(locs, def_uri, oc["range"]);
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    // 2. Cross-file occurrences across all indexed workspace files importing `def_uri`
+    if not sym["is_local"] and sym["container_name"] == "" {
+        let uris = map_keys(state["files"]);
+        let ui = 0;
+        while ui < len(uris) {
+            let cur_uri = uris[ui];
+            if cur_uri != def_uri {
+                let cf = state["files"][cur_uri];
+                let matching_aliases = [];
+                let has_destruct = false;
+                let imp_keys = map_keys(cf["imports"]);
+                let ik = 0;
+                while ik < len(imp_keys) {
+                    let k = imp_keys[ik];
+                    let imp_rec = cf["imports"][k];
+                    let resolved_imp_uri = _resolve_import_target_uri(state, cur_uri, imp_rec["raw_path"]);
+                    if resolved_imp_uri == def_uri {
+                        if str_starts_with(k, "__destruct__") {
+                            if imp_rec["imported_symbol"] == target_name {
+                                has_destruct = true;
+                            }
+                        } elif imp_rec["alias"] != "" {
+                            push(matching_aliases, imp_rec["alias"]);
+                        }
+                    }
+                    ik = ik + 1;
+                }
+
+                if len(matching_aliases) > 0 or has_destruct {
+                    let coccs = cf["occurrences"];
+                    let ci = 0;
+                    while ci < len(coccs) {
+                        let coc = coccs[ci];
+                        if coc["name"] == target_name {
+                            if coc["is_member"] and _arr_contains(matching_aliases, coc["qualifier"]) {
+                                _push_unique_location(locs, cur_uri, coc["range"]);
+                            } elif not coc["is_member"] and has_destruct {
+                                _push_unique_location(locs, cur_uri, coc["range"]);
+                            }
+                        }
+                        ci = ci + 1;
+                    }
+                }
+            }
+            ui = ui + 1;
+        }
+    }
+
+    return locs;
+}
+
+// ── Diagnostics, Hover, Completion, SignatureHelp, DocumentSymbol, InlayHint ──
+
+fn _build_lsp_diagnostics(fentry) {
+    let diags = [];
+    let raw = fentry["check_report"]["diagnostics"];
+    let i = 0;
+    while i < len(raw) {
+        let d = raw[i];
+        let sev = if d["severity"] == "error" { 1 } elif d["severity"] == "warning" { 2 } else { 3 };
+        let l0 = if d["line"] > 0 { d["line"] - 1 } else { 0 };
+        let c0 = if d["col"] > 0 { d["col"] - 1 } else { 0 };
+        let el0 = if map_has(d, "end_line") and d["end_line"] > 0 { d["end_line"] - 1 } else { l0 };
+        let ec0 = if map_has(d, "end_col") and d["end_col"] > 0 { d["end_col"] - 1 } else { c0 + 1 };
+        push(diags, map{
+            range: _lsp_range(l0, c0, el0, ec0),
+            severity: sev,
+            code: d["code"],
+            source: "pblang-v4.2",
+            message: d["message"]
+        });
+        i = i + 1;
+    }
+    return diags;
+}
+
+fn _format_symbol_signature(sym) {
+    let k = sym["kind"];
+    if k == "fn" or k == "export fn" or k == "method" {
+        let pfx = if sym["exported"] and k != "method" { "export fn " } else { "fn " };
+        let sig = pfx + sym["name"] + "(" + str_join(sym["params"], ", ") + ")";
+        if sym["return_type"] != "" and sym["return_type"] != "any" {
+            sig = sig + " -> " + sym["return_type"];
+        }
+        return sig;
+    }
+    if k == "struct" {
+        return "struct " + sym["name"] + " { " + str_join(sym["params"], ", ") + " }";
+    }
+    if k == "enum" {
+        return "enum " + sym["name"] + " { " + str_join(sym["params"], ", ") + " }";
+    }
+    if k == "enum_variant" {
+        let args_s = if len(sym["params"]) > 0 { "(" + str_join(sym["params"], ", ") + ")" } else { "" };
+        return sym["container_name"] + "." + sym["name"] + args_s;
+    }
+    if k == "class" { return "class " + sym["name"]; }
+    if k == "interface" or k == "trait" { return k + " " + sym["name"]; }
+    let bind_kw = if k == "const" { "const " } else { "let " };
+    let u_part = if sym["unit_9d"] != "" { " [" + sym["unit_9d"] + "]" } else { "" };
+    return bind_kw + sym["name"] + ": " + sym["return_type"] + u_part;
+}
+
+fn _format_symbol_markdown(sym) {
+    let lines = ["```pblang", _format_symbol_signature(sym), "```"];
+    if sym["unit_9d"] != "" {
+        push(lines, "**9D Unit:** `" + sym["unit_9d"] + "`");
+    }
+    if len(sym["requires_strs"]) > 0 {
+        push(lines, "**Requires:** `" + str_join(sym["requires_strs"], "`, `") + "`");
+    }
+    if len(sym["ensures_strs"]) > 0 {
+        push(lines, "**Ensures:** `" + str_join(sym["ensures_strs"], "`, `") + "`");
+    }
+    if len(sym["contracts"]) > 0 {
+        let ci = 0;
+        while ci < len(sym["contracts"]) {
+            let cr = sym["contracts"][ci];
+            let badge = if cr["proved"] { "✓ PROVED" } else { "✗ " + cr["status"] };
+            push(lines, "- Contract `" + cr["kind"] + "` (" + cr["engine"] + "): **" + badge + "**");
+            ci = ci + 1;
+        }
+    }
+    if sym["doc_comment"] != "" {
+        push(lines, "");
+        push(lines, sym["doc_comment"]);
+    }
+    return str_join(lines, "\n");
+}
+
+fn _handle_hover(state, uri, line0, char0) {
+    let resolved = _resolve_cursor_target(state, uri, line0, char0);
+    if resolved == nil { return nil; }
+    if resolved["symbol"] != nil {
+        return map{
+            contents: map{
+                kind: "markdown",
+                value: _format_symbol_markdown(resolved["symbol"])
+            },
+            range: resolved["cursor_range"]
+        };
+    }
+    if resolved["kind"] == "module_file" {
+        return map{
+            contents: map{
+                kind: "markdown",
+                value: "**Module:** `" + resolved["uri"] + "`"
+            },
+            range: resolved["cursor_range"]
+        };
+    }
+    return nil;
+}
+
+fn _sym_to_completion_kind(sym) {
+    let k = sym["kind"];
+    if k == "fn" or k == "export fn" { return COMP_FUNCTION; }
+    if k == "method" { return COMP_METHOD; }
+    if k == "struct" { return COMP_STRUCT; }
+    if k == "enum" { return COMP_ENUM; }
+    if k == "enum_variant" { return COMP_ENUM_MEMBER; }
+    if k == "class" { return COMP_CLASS; }
+    if k == "interface" or k == "trait" { return COMP_INTERFACE; }
+    if k == "field" { return COMP_FIELD; }
+    if k == "const" { return COMP_CONSTANT; }
+    return COMP_VARIABLE;
+}
+
+fn _handle_completion(state, uri, line0, char0) {
+    let canon_uri = _path_to_uri(uri);
+    if not map_has(state["files"], canon_uri) { return []; }
+    let fentry = state["files"][canon_uri];
+    let lines = fentry["lines"];
+    let line_txt = if line0 >= 0 and line0 < len(lines) { lines[line0] } else { "" };
+    let prefix = if char0 <= len(line_txt) { str_slice(line_txt, 0, char0) } else { line_txt };
+    let items = [];
+    let seen = map{};
+
+    // 1. Decorator trigger `@`
+    if str_ends_with(str_trim(prefix), "@") {
+        return [
+            map{ label: "nogc", kind: COMP_KEYWORD, detail: "Zero-heap / interrupt-safe verification (@nogc)" },
+            map{ label: "inline", kind: COMP_KEYWORD, detail: "Inline optimization hint (@inline)" },
+            map{ label: "test", kind: COMP_KEYWORD, detail: "Unit test entrypoint (@test)" },
+            map{ label: "fuzz", kind: COMP_KEYWORD, detail: "Property fuzzer entrypoint (@fuzz)" }
+        ];
+    }
+
+    // 2. Import string path completion `import("...`
+    if str_contains(prefix, "import(\"") {
+        let uris = map_keys(state["files"]);
+        let ui = 0;
+        while ui < len(uris) {
+            if uris[ui] != canon_uri {
+                let bname = path_basename(_uri_to_path(uris[ui]));
+                push(items, map{ label: "./" + bname, kind: COMP_FILE, detail: uris[ui] });
+            }
+            ui = ui + 1;
+        }
+        return items;
+    }
+
+    // 3. Member completion `QUAL.` or `QUAL::`
+    let trimmed = str_trim(prefix);
+    let dot_qual = "";
+    if str_ends_with(trimmed, ".") or str_ends_with(trimmed, "::") {
+        let cut = if str_ends_with(trimmed, "::") { len(trimmed) - 2 } else { len(trimmed) - 1 };
+        let j = cut - 1;
+        while j >= 0 and _is_ident_char(str_slice(trimmed, j, j + 1)) {
+            j = j - 1;
+        }
+        dot_qual = str_slice(trimmed, j + 1, cut);
+    }
+
+    if dot_qual != "" {
+        // Check imported module alias
+        if map_has(fentry["imports"], dot_qual) {
+            let imp = fentry["imports"][dot_qual];
+            let mod_uri = _resolve_import_target_uri(state, canon_uri, imp["raw_path"]);
+            if mod_uri != "" and map_has(state["files"], mod_uri) {
+                let msyms = state["files"][mod_uri]["symbols"];
+                let mi = 0;
+                while mi < len(msyms) {
+                    let ms = msyms[mi];
+                    if not ms["is_local"] and ms["container_name"] == "" {
+                        push(items, map{
+                            label: ms["name"],
+                            kind: _sym_to_completion_kind(ms),
+                            detail: _format_symbol_signature(ms),
+                            documentation: map{ kind: "markdown", value: _format_symbol_markdown(ms) }
+                        });
+                    }
+                    mi = mi + 1;
+                }
+                return items;
+            }
+        }
+        // Check enum / struct / class / trait container members in current file
+        let csyms = fentry["symbols"];
+        let ci = 0;
+        while ci < len(csyms) {
+            let cs = csyms[ci];
+            if cs["container_name"] == dot_qual {
+                push(items, map{
+                    label: cs["name"],
+                    kind: _sym_to_completion_kind(cs),
+                    detail: _format_symbol_signature(cs)
+                });
+            }
+            ci = ci + 1;
+        }
+        return items;
+    }
+
+    // 4. General completion: file symbols + keywords + builtins
+    let syms = fentry["symbols"];
+    let si = 0;
+    while si < len(syms) {
+        let s = syms[si];
+        if s["container_name"] == "" and not map_has(seen, s["name"]) {
+            if not s["is_local"] or ((line0 + 1) >= s["scope_start_line"] and (line0 + 1) <= s["scope_end_line"]) {
+                seen[s["name"]] = true;
+                push(items, map{
+                    label: s["name"],
+                    kind: _sym_to_completion_kind(s),
+                    detail: _format_symbol_signature(s),
+                    documentation: map{ kind: "markdown", value: _format_symbol_markdown(s) }
+                });
+            }
+        }
+        si = si + 1;
+    }
+    let ki = 0;
+    while ki < len(_RESERVED_KEYWORDS) {
+        let kw = _RESERVED_KEYWORDS[ki];
+        if not map_has(seen, kw) {
+            seen[kw] = true;
+            push(items, map{ label: kw, kind: COMP_KEYWORD, detail: "PBLang keyword" });
+        }
+        ki = ki + 1;
+    }
+    let bi = 0;
+    while bi < len(_EXTRA_BUILTINS) {
+        let bn = _EXTRA_BUILTINS[bi];
+        if not map_has(seen, bn) {
+            seen[bn] = true;
+            push(items, map{ label: bn, kind: COMP_FUNCTION, detail: "PBLang builtin" });
+        }
+        bi = bi + 1;
+    }
+    return items;
+}
+
+fn _resolve_callable_symbol(state, fentry, qual, cname, line1) {
+    if qual != "" and map_has(fentry["imports"], qual) {
+        let imp = fentry["imports"][qual];
+        let mod_uri = _resolve_import_target_uri(state, fentry["uri"], imp["raw_path"]);
+        if mod_uri != "" and map_has(state["files"], mod_uri) {
+            return _find_file_top_symbol(state["files"][mod_uri], cname, "");
+        }
+    }
+    if qual != "" {
+        let msym = _find_file_top_symbol(fentry, cname, qual);
+        if msym != nil { return msym; }
+    }
+    let dkey = "__destruct__" + cname;
+    if qual == "" and map_has(fentry["imports"], dkey) {
+        let dimp = fentry["imports"][dkey];
+        let dmod_uri = _resolve_import_target_uri(state, fentry["uri"], dimp["raw_path"]);
+        if dmod_uri != "" and map_has(state["files"], dmod_uri) {
+            return _find_file_top_symbol(state["files"][dmod_uri], cname, "");
+        }
+    }
+    return _find_scoped_symbol(fentry, cname, line1);
+}
+
+fn _handle_signature_help(state, uri, line0, char0) {
+    let canon_uri = _path_to_uri(uri);
+    if not map_has(state["files"], canon_uri) { return nil; }
+    let fentry = state["files"][canon_uri];
+    let lines = fentry["lines"];
+    if line0 < 0 or line0 >= len(lines) { return nil; }
+
+    // Gather text from up to 3 lines ending at `(line0, char0)`
+    let start_l = if line0 >= 2 { line0 - 2 } else { 0 };
+    let buf_parts = [];
+    let li = start_l;
+    while li <= line0 {
+        let ln_str = lines[li];
+        if li == line0 {
+            push(buf_parts, if char0 <= len(ln_str) { str_slice(ln_str, 0, char0) } else { ln_str });
+        } else {
+            push(buf_parts, ln_str);
+        }
+        li = li + 1;
+    }
+    let prefix = str_join(buf_parts, "\n");
+
+    // Scan backward to find innermost unmatched `(` and count active commas
+    let depth = 0;
+    let comma_cnt = 0;
+    let open_idx = -1;
+    let idx = len(prefix) - 1;
+    while idx >= 0 {
+        let ch = str_slice(prefix, idx, idx + 1);
+        if ch == ")" or ch == "]" or ch == "}" {
+            depth = depth + 1;
+        } elif ch == "(" {
+            if depth == 0 {
+                open_idx = idx;
+                break;
+            }
+            depth = depth - 1;
+        } elif (ch == "[" or ch == "{") and depth > 0 {
+            depth = depth - 1;
+        } elif ch == "," and depth == 0 {
+            comma_cnt = comma_cnt + 1;
+        }
+        idx = idx - 1;
+    }
+    if open_idx < 0 { return nil; }
+
+    // Extract callee (`foo` or `MOD.foo` or `MOD::foo`) before `(`
+    let p = open_idx - 1;
+    while p >= 0 and (str_slice(prefix, p, p + 1) == " " or str_slice(prefix, p, p + 1) == "\t") {
+        p = p - 1;
+    }
+    let name_end = p + 1;
+    while p >= 0 and _is_ident_char(str_slice(prefix, p, p + 1)) {
+        p = p - 1;
+    }
+    let cname = str_slice(prefix, p + 1, name_end);
+    if cname == "" { return nil; }
+
+    let qual = "";
+    if p >= 1 and str_slice(prefix, p, p + 1) == "." {
+        let qp = p - 1;
+        let qend = qp + 1;
+        while qp >= 0 and _is_ident_char(str_slice(prefix, qp, qp + 1)) { qp = qp - 1; }
+        qual = str_slice(prefix, qp + 1, qend);
+    } elif p >= 2 and str_slice(prefix, p - 1, p + 1) == "::" {
+        let qp2 = p - 2;
+        let qend2 = qp2 + 1;
+        while qp2 >= 0 and _is_ident_char(str_slice(prefix, qp2, qp2 + 1)) { qp2 = qp2 - 1; }
+        qual = str_slice(prefix, qp2 + 1, qend2);
+    }
+
+    let sym = _resolve_callable_symbol(state, fentry, qual, cname, line0 + 1);
+    if sym == nil { return nil; }
+
+    let param_infos = [];
+    let pi = 0;
+    while pi < len(sym["params"]) {
+        push(param_infos, map{ label: sym["params"][pi] });
+        pi = pi + 1;
+    }
+
+    let active_p = if len(param_infos) > 0 and comma_cnt >= len(param_infos) { len(param_infos) - 1 } else { comma_cnt };
+    return map{
+        signatures: [map{
+            label: _format_symbol_signature(sym),
+            documentation: map{
+                kind: "markdown",
+                value: _format_symbol_markdown(sym)
+            },
+            parameters: param_infos
+        }],
+        activeSignature: 0,
+        activeParameter: if active_p < 0 { 0 } else { active_p }
+    };
+}
+
+fn _handle_document_symbols(state, uri) {
+    let canon_uri = _path_to_uri(uri);
+    if not map_has(state["files"], canon_uri) { return []; }
+    let fentry = state["files"][canon_uri];
+    let out = [];
+    let syms = fentry["symbols"];
+    let i = 0;
+    while i < len(syms) {
+        let s = syms[i];
+        if not s["is_local"] and s["container_name"] == "" {
+            let children = [];
+            let ci = 0;
+            while ci < len(syms) {
+                let ch = syms[ci];
+                if ch["container_name"] == s["name"] and not ch["is_local"] {
+                    push(children, map{
+                        name: ch["name"],
+                        detail: _format_symbol_signature(ch),
+                        kind: ch["lsp_kind"],
+                        range: ch["full_range"],
+                        selectionRange: ch["range"]
+                    });
+                }
+                ci = ci + 1;
+            }
+            push(out, map{
+                name: s["name"],
+                detail: _format_symbol_signature(s),
+                kind: s["lsp_kind"],
+                range: s["full_range"],
+                selectionRange: s["range"],
+                children: children
+            });
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _handle_inlay_hints(state, uri, req_range) {
+    let canon_uri = _path_to_uri(uri);
+    if not map_has(state["files"], canon_uri) { return []; }
+    let fentry = state["files"][canon_uri];
+    let hints = [];
+
+    let min_l0 = if req_range != nil and map_has(req_range, "start") { req_range["start"]["line"] } else { 0 };
+    let max_l0 = if req_range != nil and map_has(req_range, "end") { req_range["end"]["line"] } else { 999999 };
+
+    // 1. Inferred 9D physical/currency units on unannotated `let` / `const` bindings
+    let lbs = fentry["let_bindings"];
+    let li = 0;
+    while li < len(lbs) {
+        let lb = lbs[li];
+        let l0 = lb["line"] - 1;
+        if l0 >= min_l0 and l0 <= max_l0 and not lb["has_explicit_annot"] {
+            let uinf = lb["unit_info"];
+            if uinf == nil and lb["init_call_name"] != "" {
+                let csym_u = _resolve_callable_symbol(state, fentry, lb["init_call_qual"], lb["init_call_name"], lb["line"]);
+                if csym_u != nil and csym_u["unit_9d"] != "" {
+                    let probe = SC.infer_expr_unit("__x", map{ "__x": csym_u["unit_9d"] });
+                    if probe["unit_info"] != nil {
+                        uinf = probe["unit_info"];
+                    }
+                }
+            }
+            if uinf != nil {
+                let lbl = _classify_9d_inlay_label(uinf);
+                if lbl != "" {
+                    push(hints, map{
+                        position: _lsp_pos(l0, lb["end_col"] - 1),
+                        label: lbl,
+                        kind: 1,
+                        paddingLeft: false,
+                        paddingRight: true
+                    });
+                }
+            }
+        }
+        li = li + 1;
+    }
+
+    // 2. Parameter names on multi-argument calls (`param:`)
+    let csites = fentry["call_sites"];
+    let ci = 0;
+    while ci < len(csites) {
+        let cs = csites[ci];
+        let cl0 = cs["line"] - 1;
+        if cl0 >= min_l0 and cl0 <= max_l0 and len(cs["args"]) >= 2 {
+            let csym = _resolve_callable_symbol(state, fentry, cs["qualifier"], cs["callee_name"], cs["line"]);
+            if csym != nil and len(csym["param_names"]) > 0 {
+                let pnames = csym["param_names"];
+                let start_off = if len(pnames) > 0 and pnames[0] == "self" and cs["qualifier"] != "" { 1 } else { 0 };
+                let ai = 0;
+                while ai < len(cs["args"]) and (ai + start_off) < len(pnames) {
+                    let arg = cs["args"][ai];
+                    let pname = pnames[ai + start_off];
+                    if pname != "" and pname != "self" and arg["raw_name"] != pname {
+                        push(hints, map{
+                            position: _lsp_pos(arg["line"] - 1, arg["col"] - 1),
+                            label: pname + ":",
+                            kind: 2,
+                            paddingLeft: false,
+                            paddingRight: true
+                        });
+                    }
+                    ai = ai + 1;
+                }
+            }
+        }
+        ci = ci + 1;
+    }
+
+    // 3. Verified SQL placeholder counts (`✓ SQL($1..$N safe)`)
+    let sqls = fentry["check_report"]["sql_checks"];
+    let si = 0;
+    while si < len(sqls) {
+        let sq = sqls[si];
+        let sl0 = sq["sql_line"] - 1;
+        if sl0 >= min_l0 and sl0 <= max_l0 and sq["safe"] == true {
+            push(hints, map{
+                position: _lsp_pos(sl0, sq["sql_col"] - 1),
+                label: "✓ SQL(" + sq["label"] + " safe)",
+                kind: 1,
+                paddingLeft: true,
+                paddingRight: true
+            });
+        }
+        si = si + 1;
+    }
+
+    // 4. Exhaustive `enum` `match` badges (`✓ exhaustive`)
+    let ems = fentry["check_report"]["exhaustive_matches"];
+    let mi = 0;
+    while mi < len(ems) {
+        let em = ems[mi];
+        let ml0 = em["line"] - 1;
+        if ml0 >= min_l0 and ml0 <= max_l0 {
+            push(hints, map{
+                position: _lsp_pos(ml0, em["col"] + 4),
+                label: "✓ exhaustive",
+                kind: 1,
+                paddingLeft: true,
+                paddingRight: false
+            });
+        }
+        mi = mi + 1;
+    }
+
+    return hints;
+}
+
+// ── JSON-RPC 2.0 Message Handler & Framing ────────────────────────────────────
+
+fn _rpc_ok(id, result) {
+    return map{
+        jsonrpc: "2.0",
+        id: id,
+        result: result
+    };
+}
+
+fn _rpc_err(id, code, message) {
+    return map{
+        jsonrpc: "2.0",
+        id: id,
+        error: map{
+            code: code,
+            message: message
+        }
+    };
+}
+
+fn lsp_handle_message(state, raw_msg) {
+    let msg = if type(raw_msg) == "string" { json_parse(raw_msg) } else { raw_msg };
+    if msg == nil or type(msg) != "map" {
+        return _rpc_err(nil, -32700, "Parse error: invalid JSON-RPC message");
+    }
+
+    let has_id = map_has(msg, "id") and msg["id"] != nil;
+    let req_id = if has_id { msg["id"] } else { nil };
+    let method = if map_has(msg, "method") { str(msg["method"]) } else { "" };
+    let params = if map_has(msg, "params") and msg["params"] != nil { msg["params"] } else { map{} };
+
+    if method == "initialize" {
+        state["initialized"] = true;
+        let prev_root = if state["root_dir"] != nil { str(state["root_dir"]) } else { "" };
+        let already_count = len(map_keys(state["files"]));
+        if map_has(params, "rootUri") and params["rootUri"] != nil and str(params["rootUri"]) != "" {
+            let rpath = _uri_to_path(params["rootUri"]);
+            state["root_dir"] = rpath;
+            state["root_uri"] = _path_to_uri(rpath);
+            if not _is_skipped_scan_root(rpath) and (rpath != prev_root or already_count == 0) and (try fs_exists(rpath) catch false) {
+                _scan_workspace_dir(state, rpath, 128, [already_count]);
+            }
+        } elif map_has(params, "rootPath") and params["rootPath"] != nil and str(params["rootPath"]) != "" {
+            let rpath2 = _normalize_fs_path(params["rootPath"]);
+            state["root_dir"] = rpath2;
+            state["root_uri"] = _path_to_uri(rpath2);
+            if not _is_skipped_scan_root(rpath2) and (rpath2 != prev_root or already_count == 0) and (try fs_exists(rpath2) catch false) {
+                _scan_workspace_dir(state, rpath2, 128, [already_count]);
+            }
+        }
+        return _rpc_ok(req_id, map{
+            serverInfo: map{
+                name: "pblang-workspace-lsp",
+                version: WORKSPACE_LSP_VERSION
+            },
+            capabilities: map{
+                textDocumentSync: 1,
+                definitionProvider: true,
+                referencesProvider: true,
+                renameProvider: map{ prepareProvider: true },
+                completionProvider: map{ triggerCharacters: [".", ":", "@", "\""] },
+                signatureHelpProvider: map{ triggerCharacters: ["(", ","] },
+                hoverProvider: true,
+                documentSymbolProvider: true,
+                inlayHintProvider: true
+            }
+        });
+    }
+
+    if method == "initialized" {
+        return nil;
+    }
+
+    if method == "shutdown" {
+        state["shutdown"] = true;
+        return _rpc_ok(req_id, nil);
+    }
+
+    if method == "exit" {
+        return nil;
+    }
+
+    if method == "textDocument/didOpen" {
+        let td = params["textDocument"];
+        let uri = _path_to_uri(td["uri"]);
+        let txt = if map_has(td, "text") { td["text"] } else { "" };
+        let fentry = lsp_index_file(state, uri, txt);
+        fentry["is_open"] = true;
+        let notif = map{
+            jsonrpc: "2.0",
+            method: "textDocument/publishDiagnostics",
+            params: map{
+                uri: uri,
+                diagnostics: _build_lsp_diagnostics(fentry)
+            }
+        };
+        push(state["outgoing_notifications"], notif);
+        return notif;
+    }
+
+    if method == "textDocument/didChange" {
+        let td2 = params["textDocument"];
+        let uri2 = _path_to_uri(td2["uri"]);
+        let changes = if map_has(params, "contentChanges") { params["contentChanges"] } else { [] };
+        let new_txt = if len(changes) > 0 { changes[len(changes) - 1]["text"] } elif map_has(state["files"], uri2) { state["files"][uri2]["text"] } else { "" };
+        let fentry2 = lsp_index_file(state, uri2, new_txt);
+        fentry2["is_open"] = true;
+        let notif2 = map{
+            jsonrpc: "2.0",
+            method: "textDocument/publishDiagnostics",
+            params: map{
+                uri: uri2,
+                diagnostics: _build_lsp_diagnostics(fentry2)
+            }
+        };
+        push(state["outgoing_notifications"], notif2);
+        return notif2;
+    }
+
+    if method == "textDocument/didSave" {
+        let td3 = params["textDocument"];
+        let uri3 = _path_to_uri(td3["uri"]);
+        let txt3 = if map_has(params, "text") and params["text"] != nil {
+            params["text"]
+        } elif map_has(state["files"], uri3) {
+            state["files"][uri3]["text"]
+        } else {
+            try fs_read(_uri_to_path(uri3)) catch ""
+        };
+        let fentry3 = lsp_index_file(state, uri3, txt3);
+        let notif3 = map{
+            jsonrpc: "2.0",
+            method: "textDocument/publishDiagnostics",
+            params: map{
+                uri: uri3,
+                diagnostics: _build_lsp_diagnostics(fentry3)
+            }
+        };
+        push(state["outgoing_notifications"], notif3);
+        return notif3;
+    }
+
+    if method == "textDocument/didClose" {
+        let td4 = params["textDocument"];
+        let uri4 = _path_to_uri(td4["uri"]);
+        if map_has(state["files"], uri4) {
+            state["files"][uri4]["is_open"] = false;
+        }
+        return nil;
+    }
+
+    if method == "textDocument/definition" {
+        let uri5 = params["textDocument"]["uri"];
+        let pos5 = params["position"];
+        let resolved5 = _resolve_cursor_target(state, uri5, pos5["line"], pos5["character"]);
+        if resolved5 == nil or resolved5["kind"] == "unresolved" {
+            return _rpc_ok(req_id, nil);
+        }
+        return _rpc_ok(req_id, map{
+            uri: resolved5["uri"],
+            range: resolved5["range"]
+        });
+    }
+
+    if method == "textDocument/references" {
+        let uri6 = params["textDocument"]["uri"];
+        let pos6 = params["position"];
+        let inc_decl = if map_has(params, "context") and params["context"] != nil and map_has(params["context"], "includeDeclaration") {
+            params["context"]["includeDeclaration"] == true
+        } else {
+            true
+        };
+        let resolved6 = _resolve_cursor_target(state, uri6, pos6["line"], pos6["character"]);
+        if resolved6 == nil or resolved6["symbol"] == nil {
+            return _rpc_ok(req_id, []);
+        }
+        let locs6 = _collect_workspace_symbol_locations(state, resolved6, inc_decl);
+        return _rpc_ok(req_id, locs6);
+    }
+
+    if method == "textDocument/prepareRename" {
+        let uri7 = _path_to_uri(params["textDocument"]["uri"]);
+        let pos7 = params["position"];
+        if not map_has(state["files"], uri7) {
+            return _rpc_err(req_id, -32602, "Document not indexed");
+        }
+        let occ7 = _occurrence_at_cursor(state["files"][uri7], pos7["line"], pos7["character"]);
+        if occ7 == nil {
+            return _rpc_err(req_id, -32602, "Cannot rename: cursor is not on an identifier");
+        }
+        let nm7 = occ7["name"];
+        if _is_keyword(nm7) {
+            return _rpc_err(req_id, -32602, "Cannot rename reserved PBLang keyword '" + nm7 + "'");
+        }
+        let resolved7 = _resolve_cursor_target(state, uri7, pos7["line"], pos7["character"]);
+        if (resolved7 == nil or resolved7["symbol"] == nil) and _is_builtin(nm7) {
+            return _rpc_err(req_id, -32602, "Cannot rename PBLang builtin '" + nm7 + "'");
+        }
+        if resolved7 == nil or resolved7["symbol"] == nil {
+            return _rpc_err(req_id, -32602, "Cannot rename unresolved symbol '" + nm7 + "'");
+        }
+        return _rpc_ok(req_id, map{
+            range: occ7["range"],
+            placeholder: nm7
+        });
+    }
+
+    if method == "textDocument/rename" {
+        let uri8 = _path_to_uri(params["textDocument"]["uri"]);
+        let pos8 = params["position"];
+        let new_name = if map_has(params, "newName") { str(params["newName"]) } else { "" };
+        if not _is_valid_new_ident(new_name) or _is_keyword(new_name) {
+            return _rpc_err(req_id, -32602, "Invalid new identifier name '" + new_name + "'");
+        }
+        if not map_has(state["files"], uri8) {
+            return _rpc_err(req_id, -32602, "Document not indexed");
+        }
+        let occ8 = _occurrence_at_cursor(state["files"][uri8], pos8["line"], pos8["character"]);
+        if occ8 == nil {
+            return _rpc_err(req_id, -32602, "Cannot rename: cursor is not on an identifier");
+        }
+        let nm8 = occ8["name"];
+        if _is_keyword(nm8) {
+            return _rpc_err(req_id, -32602, "Cannot rename reserved PBLang keyword '" + nm8 + "'");
+        }
+        let resolved8 = _resolve_cursor_target(state, uri8, pos8["line"], pos8["character"]);
+        if (resolved8 == nil or resolved8["symbol"] == nil) and _is_builtin(nm8) {
+            return _rpc_err(req_id, -32602, "Cannot rename PBLang builtin '" + nm8 + "'");
+        }
+        if resolved8 == nil or resolved8["symbol"] == nil {
+            return _rpc_err(req_id, -32602, "Cannot rename unresolved symbol '" + nm8 + "'");
+        }
+
+        let locs8 = _collect_workspace_symbol_locations(state, resolved8, true);
+        let changes_map = map{};
+        let li = 0;
+        while li < len(locs8) {
+            let loc = locs8[li];
+            let luri = loc["uri"];
+            if not map_has(changes_map, luri) {
+                changes_map[luri] = [];
+            }
+            push(changes_map[luri], map{
+                range: loc["range"],
+                newText: new_name
+            });
+            li = li + 1;
+        }
+        return _rpc_ok(req_id, map{ changes: changes_map });
+    }
+
+    if method == "textDocument/hover" {
+        let uri9 = params["textDocument"]["uri"];
+        let pos9 = params["position"];
+        return _rpc_ok(req_id, _handle_hover(state, uri9, pos9["line"], pos9["character"]));
+    }
+
+    if method == "textDocument/completion" {
+        let uri10 = params["textDocument"]["uri"];
+        let pos10 = params["position"];
+        let items10 = _handle_completion(state, uri10, pos10["line"], pos10["character"]);
+        return _rpc_ok(req_id, map{
+            isIncomplete: false,
+            items: items10
+        });
+    }
+
+    if method == "textDocument/signatureHelp" {
+        let uri11 = params["textDocument"]["uri"];
+        let pos11 = params["position"];
+        return _rpc_ok(req_id, _handle_signature_help(state, uri11, pos11["line"], pos11["character"]));
+    }
+
+    if method == "textDocument/documentSymbol" {
+        let uri12 = params["textDocument"]["uri"];
+        return _rpc_ok(req_id, _handle_document_symbols(state, uri12));
+    }
+
+    if method == "textDocument/inlayHint" {
+        let uri13 = params["textDocument"]["uri"];
+        let rng13 = if map_has(params, "range") { params["range"] } else { nil };
+        return _rpc_ok(req_id, _handle_inlay_hints(state, uri13, rng13));
+    }
+
+    if has_id {
+        return _rpc_err(req_id, -32601, "Method not found: " + method);
+    }
+    return nil;
+}
+
+// ── Optional Content-Length LSP Framing & Stdio Loop ──────────────────────────
+
+fn encode_lsp_frame(payload_map) {
+    let body = json_stringify(payload_map);
+    let blen = len(str_to_bytes(body));
+    return "Content-Length: " + str(blen) + "\r\n\r\n" + body;
+}
+
+fn run_stdio_lsp_v42(root_dir = nil) {
+    let state = create_workspace_lsp(root_dir);
+    loop {
+        let header_line = try read_line() catch nil;
+        if header_line == nil { break; }
+        let trimmed = str_trim(header_line);
+        if trimmed == "" { continue; }
+        if str_starts_with(str_lower(trimmed), "content-length:") {
+            let blank = try read_line() catch "";
+            let body_line = try read_line() catch nil;
+            if body_line == nil { break; }
+            let resp = lsp_handle_message(state, body_line);
+            if resp != nil {
+                print(encode_lsp_frame(resp));
+            }
+            let parsed_m = try json_parse(body_line) catch nil;
+            if parsed_m != nil and map_has(parsed_m, "method") and parsed_m["method"] == "exit" {
+                break;
+            }
+        } elif str_starts_with(trimmed, "{") {
+            let resp2 = lsp_handle_message(state, trimmed);
+            if resp2 != nil {
+                println(json_stringify(resp2));
+            }
+            let parsed_m2 = try json_parse(trimmed) catch nil;
+            if parsed_m2 != nil and map_has(parsed_m2, "method") and parsed_m2["method"] == "exit" {
+                break;
+            }
+        }
+    }
+    return state;
+}
+
+let _wlsp_boot_args = try os_args() catch [];
+let _wlsp_bi = 0;
+while _wlsp_bi < len(_wlsp_boot_args) {
+    if _wlsp_boot_args[_wlsp_bi] == "--lsp-v42-stdio" {
+        run_stdio_lsp_v42(".");
+        break;
+    }
+    _wlsp_bi = _wlsp_bi + 1;
+}
+
+export WORKSPACE_LSP_VERSION,
+       create_workspace_lsp,
+       lsp_index_file,
+       lsp_handle_message,
+       encode_lsp_frame,
+       run_stdio_lsp_v42;

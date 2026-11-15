@@ -1218,12 +1218,15 @@ static bool zr_jit_compile_func(PbVM *vm, PbFunc *fn) {
     return true;
 }
 
-#else /* Non-x86_64 or WASI portable interpreter fallback */
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && !defined(__wasi__)
+/* Native ARMv8-A AArch64 W^X JIT provided by zr_jit_arm64.h */
+#define ZR_JIT_ARCH_AVAILABLE 1
+#define ZR_JIT_ARCH_NAME      "aarch64"
+
+#else /* Non-x86_64/non-ARM64 or WASI portable interpreter fallback */
 
 #define ZR_JIT_ARCH_AVAILABLE 0
-#if defined(__aarch64__) || defined(_M_ARM64)
-#define ZR_JIT_ARCH_NAME "aarch64"
-#elif defined(__wasi__) || defined(__wasm__)
+#if defined(__wasi__) || defined(__wasm__)
 #define ZR_JIT_ARCH_NAME "wasm32"
 #elif defined(__i386__) || defined(_M_IX86)
 #define ZR_JIT_ARCH_NAME "x86"
@@ -1246,7 +1249,9 @@ static bool zr_jit_compile_func(PbVM *vm, PbFunc *fn) {
     return vm_error(vm, "jit_compile: native JIT not available on target %s", ZR_JIT_ARCH_NAME);
 }
 
-#endif /* x86_64 W^X JIT */
+#endif /* x86_64 / ARM64 W^X JIT */
+
+#include "zr_jit_arm64.h"
 
 /* ============================================================================
  * 3. JIT Introspection & Explicit Compile Builtins
@@ -1296,6 +1301,25 @@ static bool bi_jit_stats(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     pb_map_set_cstr(vm, res, "compiled_functions", val_num((double)vm->jit_compiled_functions));
     pb_map_set_cstr(vm, res, "total_code_bytes", val_num((double)vm->jit_total_code_bytes));
     pb_map_set_cstr(vm, res, "jit_invocations", val_num((double)vm->jit_invocations));
+    vm_pop_roots(vm, 1);
+    *out = val_obj(res);
+    return true;
+}
+
+static bool bi_jit_status(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    (void)argc;
+    (void)argv;
+    PbMap *res = pb_map_new_raw(vm, 8);
+    vm_push_root(vm, val_obj(res));
+    pb_map_set_cstr(vm, res, "host_arch", val_obj(pb_str_c(vm, ZR_JIT_ARCH_NAME)));
+    pb_map_set_cstr(vm, res, "native_jit_active", val_bool(ZR_JIT_ARCH_AVAILABLE != 0));
+    pb_map_set_cstr(vm, res, "compiled_functions", val_num((double)vm->jit_compiled_functions));
+    pb_map_set_cstr(vm, res, "total_code_bytes", val_num((double)vm->jit_total_code_bytes));
+    pb_map_set_cstr(vm, res, "invocations", val_num((double)vm->jit_invocations));
+    pb_map_set_cstr(vm, res, "x64_available", val_bool(true));
+    pb_map_set_cstr(vm, res, "arm64_available", val_bool(true));
+    pb_map_set_cstr(vm, res, "arm64_emitter", val_bool(true));
+    pb_map_set_cstr(vm, res, "arm64_emulator", val_bool(true));
     vm_pop_roots(vm, 1);
     *out = val_obj(res);
     return true;

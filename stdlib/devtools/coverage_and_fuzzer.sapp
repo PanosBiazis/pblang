@@ -1,0 +1,2067 @@
+// stdlib/devtools/coverage_and_fuzzer.sapp
+// PBLang v4.2.0 — Line/Branch Coverage HTML+JSON Engine & Coverage-Guided Shrinking Fuzzer
+//
+// 100% Pure PBLang implementation:
+//   1. Line & Branch Coverage Engine:
+//      - `analyze_coverage_data(snapshot_or_traces, sources_map = nil)`
+//      - `generate_coverage_json(report)` (`"schema": "pblang.coverage.v4.2"`)
+//      - `generate_coverage_html(report, title = "PBLang Coverage Report")`
+//        (dark-mode self-contained HTML5 report with strict XSS escaping, `12x` green
+//        hit badges, red uncovered highlights, yellow partial-branch badges, progress
+//        bars, and live search filter)
+//      - `instrument_and_measure_sapp(path_or_src, opts = nil)`
+//        (supports native `coverage_snapshot()` or pure-PBLang AST/token line+branch
+//        in-process instrumentation)
+//   2. Coverage-Guided Shrinking Property Fuzzer:
+//      - `fuzz_function(target_fn, opts = nil)`
+//      - `fuzz_sapp_file(path, opts = nil)`
+//      - `cli_fuzz_entry(args = nil)`
+
+const SC = import("stdlib/static_checker.sapp");
+
+const COVERAGE_SCHEMA = "pblang.coverage.v4.2";
+const DEVTOOLS_VERSION = "4.2.0";
+
+let _TMP_SEQ = [0];
+
+fn _next_tmp_id() {
+    _TMP_SEQ[0] = _TMP_SEQ[0] + 1;
+    return str(now_ms()) + "_" + str(_TMP_SEQ[0]);
+}
+
+fn _arr_contains_int(arr, v) {
+    let i = 0;
+    while i < len(arr) {
+        if arr[i] == v { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _push_unique_int(arr, v) {
+    if not _arr_contains_int(arr, v) {
+        push(arr, v);
+    }
+}
+
+fn _sort_ints(arr) {
+    let out = [];
+    let i = 0;
+    while i < len(arr) { push(out, arr[i]); i = i + 1; }
+    let n = len(out);
+    let a = 0;
+    while a < n {
+        let b = a + 1;
+        while b < n {
+            if out[b] < out[a] {
+                let tmp = out[a];
+                out[a] = out[b];
+                out[b] = tmp;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    return out;
+}
+
+fn _round2(x) {
+    return num_floor(x * 100.0 + 0.5) / 100.0;
+}
+
+// ── Strict HTML Escaping (XSS Prevention) ─────────────────────────────────────
+
+fn _html_escape(raw) {
+    if raw == nil { return ""; }
+    let s = str(raw);
+    s = str_replace_all(s, "&", "&amp;");
+    s = str_replace_all(s, "<", "&lt;");
+    s = str_replace_all(s, ">", "&gt;");
+    s = str_replace_all(s, "\"", "&quot;");
+    s = str_replace_all(s, "'", "&#39;");
+    return s;
+}
+
+// ── AST Executable Line & Branch Discovery ────────────────────────────────────
+
+fn _leftmost_expr_loc(e) {
+    if e == nil { return map{ line: 1, col: 1 }; }
+    let cur = e;
+    loop {
+        let k = cur["kind"];
+        if k == "binary" and cur["left"] != nil { cur = cur["left"]; continue; }
+        if k == "call" and cur["callee"] != nil { cur = cur["callee"]; continue; }
+        if (k == "member" or k == "index" or k == "slice_expr" or k == "method_call") and cur["obj"] != nil {
+            cur = cur["obj"];
+            continue;
+        }
+        if k == "try_prop" and cur["arg"] != nil { cur = cur["arg"]; continue; }
+        break;
+    }
+    return map{ line: cur["line"], col: cur["col"] };
+}
+
+fn _collect_exec_meta_block(blk, exec_lines, branch_defs) {
+    if blk == nil { return; }
+    _collect_exec_meta_stmts(blk["stmts"], exec_lines, branch_defs);
+    if blk["tail_expr"] != nil {
+        let te = blk["tail_expr"];
+        let tk = te["kind"];
+        if tk == "if_stmt" or tk == "match_stmt" or tk == "block" or tk == "while_stmt" or tk == "for_stmt" or tk == "loop_stmt" {
+            _collect_exec_meta_stmts([te], exec_lines, branch_defs);
+        } else {
+            let tloc = _leftmost_expr_loc(te);
+            _push_unique_int(exec_lines, tloc["line"]);
+        }
+    }
+}
+
+fn _collect_exec_meta_stmts(stmts, exec_lines, branch_defs) {
+    if stmts == nil { return; }
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        let sk = s["kind"];
+        if sk == "fn_decl" {
+            _collect_exec_meta_block(s["body"], exec_lines, branch_defs);
+        } elif sk == "class_decl" {
+            _collect_exec_meta_stmts(s["members"], exec_lines, branch_defs);
+        } elif sk == "trait_decl" {
+            let tmi = 0;
+            while tmi < len(s["methods"]) {
+                let tm = s["methods"][tmi];
+                if map_has(tm, "has_default") and tm["has_default"] == true and map_has(tm, "body") and tm["body"] != nil {
+                    _collect_exec_meta_block(tm["body"], exec_lines, branch_defs);
+                }
+                tmi = tmi + 1;
+            }
+        } elif sk == "enum_decl" or sk == "struct_decl" or sk == "export_stmt" or sk == "empty" {
+            // Declarative only
+        } elif sk == "if_stmt" {
+            _push_unique_int(exec_lines, s["line"]);
+            let bid = "B" + str(s["line"]) + "_" + str(s["col"]);
+            push(branch_defs, map{ id: bid, line: s["line"], col: s["col"], kind: "if" });
+            _collect_exec_meta_block(s["then_block"], exec_lines, branch_defs);
+            if s["else_block"] != nil {
+                if s["else_block"]["kind"] == "block" {
+                    _collect_exec_meta_block(s["else_block"], exec_lines, branch_defs);
+                } else {
+                    _collect_exec_meta_stmts([s["else_block"]], exec_lines, branch_defs);
+                }
+            }
+        } elif sk == "while_stmt" {
+            _push_unique_int(exec_lines, s["line"]);
+            let wbid = "B" + str(s["line"]) + "_" + str(s["col"]);
+            push(branch_defs, map{ id: wbid, line: s["line"], col: s["col"], kind: "while" });
+            _collect_exec_meta_block(s["body"], exec_lines, branch_defs);
+        } elif sk == "for_stmt" or sk == "loop_stmt" {
+            _push_unique_int(exec_lines, s["line"]);
+            _collect_exec_meta_block(s["body"], exec_lines, branch_defs);
+        } elif sk == "match_stmt" {
+            _push_unique_int(exec_lines, s["line"]);
+            let mai = 0;
+            while mai < len(s["arms"]) {
+                let arm = s["arms"][mai];
+                if arm["body"] != nil {
+                    if arm["body"]["kind"] == "block" {
+                        _collect_exec_meta_block(arm["body"], exec_lines, branch_defs);
+                    } else {
+                        let aloc = _leftmost_expr_loc(arm["body"]);
+                        _push_unique_int(exec_lines, aloc["line"]);
+                    }
+                }
+                mai = mai + 1;
+            }
+        } elif sk == "block" {
+            _collect_exec_meta_block(s, exec_lines, branch_defs);
+        } elif sk == "assign" {
+            let loc = _leftmost_expr_loc(s["target"]);
+            _push_unique_int(exec_lines, loc["line"]);
+        } elif sk == "expr_stmt" {
+            let eloc = _leftmost_expr_loc(s["expr"]);
+            _push_unique_int(exec_lines, eloc["line"]);
+        } else {
+            _push_unique_int(exec_lines, s["line"]);
+        }
+        i = i + 1;
+    }
+}
+
+fn _extract_source_exec_meta(src) {
+    let parsed = SC.parse_sapp_ast(src);
+    let exec_lines = [];
+    let branch_defs = [];
+    if parsed["ast"] != nil {
+        _collect_exec_meta_stmts(parsed["ast"]["stmts"], exec_lines, branch_defs);
+    }
+    return map{
+        executable_lines: _sort_ints(exec_lines),
+        branch_defs: branch_defs,
+        ast: parsed["ast"]
+    };
+}
+
+// ── Coverage Data Analyzer (`analyze_coverage_data`) ──────────────────────────
+
+fn _normalize_file_cov_entry(file_path, raw_entry, src_text) {
+    let src = if src_text != nil { str(src_text) } elif (try fs_exists(file_path) catch false) { try fs_read(file_path) catch "" } else { "" };
+    let src_lines = if src != "" { str_split(src, "\n") } else { [] };
+    let meta = if src != "" { _extract_source_exec_meta(src) } else { map{ executable_lines: [], branch_defs: [] } };
+
+    let raw_lines = if map_has(raw_entry, "lines") and raw_entry["lines"] != nil {
+        raw_entry["lines"]
+    } elif map_has(raw_entry, "line_hits") and raw_entry["line_hits"] != nil {
+        raw_entry["line_hits"]
+    } else {
+        map{}
+    };
+
+    let exec_lines = [];
+    if map_has(raw_entry, "executable_lines") and raw_entry["executable_lines"] != nil and len(raw_entry["executable_lines"]) > 0 {
+        let ei = 0;
+        while ei < len(raw_entry["executable_lines"]) {
+            _push_unique_int(exec_lines, raw_entry["executable_lines"][ei]);
+            ei = ei + 1;
+        }
+    } else {
+        let mi = 0;
+        while mi < len(meta["executable_lines"]) {
+            _push_unique_int(exec_lines, meta["executable_lines"][mi]);
+            mi = mi + 1;
+        }
+        let lks = map_keys(raw_lines);
+        let li = 0;
+        while li < len(lks) {
+            let ln_n = parse_number(lks[li]);
+            if ln_n != nil and ln_n > 0 {
+                _push_unique_int(exec_lines, ln_n);
+            }
+            li = li + 1;
+        }
+    }
+    exec_lines = _sort_ints(exec_lines);
+
+    // Normalize branches: support either array of `{ id, line, true_hits, false_hits }`
+    // or map `{ "B2_5:T": 3, "B2_5:F": 0 }` / `{ "5:true": 2, "5:false": 0 }`
+    let branch_records = [];
+    let raw_br = if map_has(raw_entry, "branches") and raw_entry["branches"] != nil {
+        raw_entry["branches"]
+    } elif map_has(raw_entry, "branch_hits") and raw_entry["branch_hits"] != nil {
+        raw_entry["branch_hits"]
+    } else {
+        nil
+    };
+
+    if raw_br != nil and type(raw_br) == "array" {
+        let bi = 0;
+        while bi < len(raw_br) {
+            let b = raw_br[bi];
+            push(branch_records, map{
+                id: if map_has(b, "id") { str(b["id"]) } else { "B" + str(b["line"]) },
+                line: b["line"],
+                true_hits: if map_has(b, "true_hits") { b["true_hits"] } else { 0 },
+                false_hits: if map_has(b, "false_hits") { b["false_hits"] } else { 0 }
+            });
+            bi = bi + 1;
+        }
+    } else {
+        let br_map = if raw_br != nil and type(raw_br) == "map" { raw_br } else { map{} };
+        if len(meta["branch_defs"]) > 0 {
+            let bdi = 0;
+            while bdi < len(meta["branch_defs"]) {
+                let bd = meta["branch_defs"][bdi];
+                let bid = bd["id"];
+                let lstr = str(bd["line"]);
+                let th = if map_has(br_map, bid + ":T") { br_map[bid + ":T"] }
+                    elif map_has(br_map, lstr + ":true") { br_map[lstr + ":true"] }
+                    elif map_has(br_map, lstr + ":T") { br_map[lstr + ":T"] }
+                    else { 0 };
+                let fh = if map_has(br_map, bid + ":F") { br_map[bid + ":F"] }
+                    elif map_has(br_map, lstr + ":false") { br_map[lstr + ":false"] }
+                    elif map_has(br_map, lstr + ":F") { br_map[lstr + ":F"] }
+                    else { 0 };
+                push(branch_records, map{
+                    id: bid,
+                    line: bd["line"],
+                    true_hits: th,
+                    false_hits: fh
+                });
+                bdi = bdi + 1;
+            }
+        } else {
+            // Reconstruct branch pairs directly from `br_map` keys (`<id>:T` / `<id>:true`)
+            let bkeys = map_keys(br_map);
+            let seen_bids = map{};
+            let bki = 0;
+            while bki < len(bkeys) {
+                let bk = bkeys[bki];
+                let colon = str_index_of(bk, ":");
+                if colon > 0 {
+                    let prefix_id = str_slice(bk, 0, colon);
+                    if not map_has(seen_bids, prefix_id) {
+                        seen_bids[prefix_id] = true;
+                        let ln_guess = parse_number(if str_starts_with(prefix_id, "B") {
+                            let us = str_index_of(prefix_id, "_");
+                            if us > 1 { str_slice(prefix_id, 1, us) } else { str_slice(prefix_id, 1, len(prefix_id)) }
+                        } else { prefix_id });
+                        let th2 = (if map_has(br_map, prefix_id + ":T") { br_map[prefix_id + ":T"] } else { 0 })
+                            + (if map_has(br_map, prefix_id + ":true") { br_map[prefix_id + ":true"] } else { 0 });
+                        let fh2 = (if map_has(br_map, prefix_id + ":F") { br_map[prefix_id + ":F"] } else { 0 })
+                            + (if map_has(br_map, prefix_id + ":false") { br_map[prefix_id + ":false"] } else { 0 });
+                        push(branch_records, map{
+                            id: prefix_id,
+                            line: if ln_guess != nil { ln_guess } else { 1 },
+                            true_hits: th2,
+                            false_hits: fh2
+                        });
+                    }
+                }
+                bki = bki + 1;
+            }
+        }
+    }
+
+    let lines_total = len(exec_lines);
+    let lines_covered = 0;
+    let uncovered_lines = [];
+    let line_hits_norm = map{};
+    let ei2 = 0;
+    while ei2 < len(exec_lines) {
+        let ln = exec_lines[ei2];
+        let lk = str(ln);
+        let h = if map_has(raw_lines, lk) { raw_lines[lk] } elif map_has(raw_lines, ln) { raw_lines[ln] } else { 0 };
+        line_hits_norm[lk] = h;
+        if h > 0 {
+            lines_covered = lines_covered + 1;
+        } else {
+            push(uncovered_lines, ln);
+        }
+        ei2 = ei2 + 1;
+    }
+
+    let branches_total = len(branch_records) * 2;
+    let branches_covered = 0;
+    let branch_by_line = map{};
+    let bri = 0;
+    while bri < len(branch_records) {
+        let br = branch_records[bri];
+        if br["true_hits"] > 0 { branches_covered = branches_covered + 1; }
+        if br["false_hits"] > 0 { branches_covered = branches_covered + 1; }
+        let blk = str(br["line"]);
+        let bstate = if br["true_hits"] > 0 and br["false_hits"] > 0 {
+            "full"
+        } elif br["true_hits"] > 0 or br["false_hits"] > 0 {
+            "partial"
+        } else {
+            "unhit"
+        };
+        branch_by_line[blk] = map{
+            state: bstate,
+            true_hits: br["true_hits"],
+            false_hits: br["false_hits"]
+        };
+        bri = bri + 1;
+    }
+
+    let max_ln = len(src_lines);
+    if len(exec_lines) > 0 and exec_lines[len(exec_lines) - 1] > max_ln {
+        max_ln = exec_lines[len(exec_lines) - 1];
+    }
+    let annotated_lines = [];
+    let lnum = 1;
+    while lnum <= max_ln {
+        let lk2 = str(lnum);
+        let is_exec = _arr_contains_int(exec_lines, lnum);
+        let hits = if map_has(line_hits_norm, lk2) { line_hits_norm[lk2] } else { 0 };
+        let bmeta = if map_has(branch_by_line, lk2) { branch_by_line[lk2] } else { nil };
+        push(annotated_lines, map{
+            line: lnum,
+            source: if lnum - 1 < len(src_lines) { src_lines[lnum - 1] } else { "" },
+            executable: is_exec,
+            hits: hits,
+            branch_state: if bmeta != nil { bmeta["state"] } else { "none" },
+            true_hits: if bmeta != nil { bmeta["true_hits"] } else { 0 },
+            false_hits: if bmeta != nil { bmeta["false_hits"] } else { 0 }
+        });
+        lnum = lnum + 1;
+    }
+
+    let line_pct = if lines_total > 0 { _round2((lines_covered * 100.0) / lines_total) } else { 100.0 };
+    let branch_pct = if branches_total > 0 { _round2((branches_covered * 100.0) / branches_total) } else { 100.0 };
+
+    return map{
+        file: file_path,
+        lines_total: lines_total,
+        lines_covered: lines_covered,
+        lines_uncovered: uncovered_lines,
+        line_pct: line_pct,
+        branches_total: branches_total,
+        branches_covered: branches_covered,
+        branch_pct: branch_pct,
+        line_hits: line_hits_norm,
+        branches: branch_records,
+        annotated_lines: annotated_lines
+    };
+}
+
+fn analyze_coverage_data(snapshot_or_traces, sources_map = nil) {
+    let srcs = if sources_map != nil and type(sources_map) == "map" { sources_map } else { map{} };
+    let raw_files = map{};
+
+    if snapshot_or_traces != nil and type(snapshot_or_traces) == "array" {
+        // Array of trace events: `{ file, line, branch_id, outcome }`
+        let ti = 0;
+        while ti < len(snapshot_or_traces) {
+            let ev = snapshot_or_traces[ti];
+            let fp = if map_has(ev, "file") { str(ev["file"]) } else { "<memory>" };
+            if not map_has(raw_files, fp) {
+                raw_files[fp] = map{ lines: map{}, branches: map{} };
+            }
+            if map_has(ev, "line") and ev["line"] != nil {
+                let lk = str(ev["line"]);
+                raw_files[fp]["lines"][lk] = (if map_has(raw_files[fp]["lines"], lk) { raw_files[fp]["lines"][lk] } else { 0 }) + 1;
+            }
+            if map_has(ev, "branch_id") and ev["branch_id"] != nil {
+                let arm = if map_has(ev, "outcome") and ev["outcome"] == true { ":T" } else { ":F" };
+                let bk = str(ev["branch_id"]) + arm;
+                raw_files[fp]["branches"][bk] = (if map_has(raw_files[fp]["branches"], bk) { raw_files[fp]["branches"][bk] } else { 0 }) + 1;
+            }
+            ti = ti + 1;
+        }
+    } elif snapshot_or_traces != nil and type(snapshot_or_traces) == "map" {
+        if map_has(snapshot_or_traces, "files") and type(snapshot_or_traces["files"]) == "map" {
+            raw_files = snapshot_or_traces["files"];
+        } elif map_has(snapshot_or_traces, "lines") or map_has(snapshot_or_traces, "line_hits") {
+            let single_f = if map_has(snapshot_or_traces, "file") { str(snapshot_or_traces["file"]) } else { "<memory>" };
+            raw_files[single_f] = snapshot_or_traces;
+        } else {
+            raw_files = snapshot_or_traces;
+        }
+    }
+
+    // Ensure any files in `sources_map` are also included even if 0 hits
+    let skeys = map_keys(srcs);
+    let ski = 0;
+    while ski < len(skeys) {
+        if not map_has(raw_files, skeys[ski]) {
+            raw_files[skeys[ski]] = map{ lines: map{}, branches: map{} };
+        }
+        ski = ski + 1;
+    }
+
+    let fkeys = map_keys(raw_files);
+    let file_reports = [];
+    let tot_lines = 0;
+    let cov_lines = 0;
+    let tot_branches = 0;
+    let cov_branches = 0;
+
+    let fi = 0;
+    while fi < len(fkeys) {
+        let fp = fkeys[fi];
+        let stxt = if map_has(srcs, fp) { srcs[fp] } else { nil };
+        let frep = _normalize_file_cov_entry(fp, raw_files[fp], stxt);
+        push(file_reports, frep);
+        tot_lines = tot_lines + frep["lines_total"];
+        cov_lines = cov_lines + frep["lines_covered"];
+        tot_branches = tot_branches + frep["branches_total"];
+        cov_branches = cov_branches + frep["branches_covered"];
+        fi = fi + 1;
+    }
+
+    let agg_line_pct = if tot_lines > 0 { _round2((cov_lines * 100.0) / tot_lines) } else { 100.0 };
+    let agg_branch_pct = if tot_branches > 0 { _round2((cov_branches * 100.0) / tot_branches) } else { 100.0 };
+
+    return map{
+        schema: COVERAGE_SCHEMA,
+        version: DEVTOOLS_VERSION,
+        summary: map{
+            file_count: len(file_reports),
+            lines_total: tot_lines,
+            lines_covered: cov_lines,
+            lines_uncovered: tot_lines - cov_lines,
+            line_pct: agg_line_pct,
+            branches_total: tot_branches,
+            branches_covered: cov_branches,
+            branch_pct: agg_branch_pct
+        },
+        files: file_reports
+    };
+}
+
+// ── Coverage JSON & Dark-Mode Interactive HTML Exporters ─────────────────────
+
+fn generate_coverage_json(report) {
+    let files_out = [];
+    let i = 0;
+    while i < len(report["files"]) {
+        let f = report["files"][i];
+        push(files_out, map{
+            file: f["file"],
+            lines_total: f["lines_total"],
+            lines_covered: f["lines_covered"],
+            lines_uncovered: f["lines_uncovered"],
+            line_pct: f["line_pct"],
+            branches_total: f["branches_total"],
+            branches_covered: f["branches_covered"],
+            branch_pct: f["branch_pct"],
+            line_hits: f["line_hits"],
+            branches: f["branches"]
+        });
+        i = i + 1;
+    }
+    return json_stringify(map{
+        schema: COVERAGE_SCHEMA,
+        version: DEVTOOLS_VERSION,
+        summary: report["summary"],
+        files: files_out
+    });
+}
+
+fn generate_coverage_html(report, title = "PBLang Coverage Report") {
+    let sum_m = report["summary"];
+    let safe_title = _html_escape(title);
+    let parts = [];
+
+    push(parts, "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">");
+    push(parts, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">");
+    push(parts, "<title>" + safe_title + "</title>");
+    push(parts, "<style>");
+    push(parts, ":root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--green:#2ea043;--green-bg:rgba(46,160,67,0.16);--red:#f85149;--red-bg:rgba(248,81,73,0.18);--yellow:#d29922;--yellow-bg:rgba(210,153,34,0.20);--accent:#58a6ff;}");
+    push(parts, "*{box-sizing:border-box;}body{margin:0;padding:24px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,monospace;}");
+    push(parts, ".header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:16px;padding:20px;background:var(--panel);border:1px solid var(--border);border-radius:10px;margin-bottom:20px;}");
+    push(parts, ".kpi-grid{display:flex;gap:16px;flex-wrap:wrap;}.kpi{padding:12px 18px;border-radius:8px;background:#0d1117;border:1px solid var(--border);}");
+    push(parts, ".kpi-val{font-size:22px;font-weight:700;}.kpi-lbl{font-size:12px;color:var(--muted);}");
+    push(parts, ".search-box{padding:8px 12px;border-radius:6px;border:1px solid var(--border);background:#0d1117;color:var(--text);min-width:260px;}");
+    push(parts, ".progress-track{width:140px;height:10px;background:#21262d;border-radius:5px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:8px;}");
+    push(parts, ".progress-fill{height:100%;background:var(--green);}");
+    push(parts, "table.summary-table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:24px;}");
+    push(parts, ".summary-table th,.summary-table td{padding:10px 14px;border-bottom:1px solid var(--border);text-align:left;font-size:13px;}");
+    push(parts, ".file-card{background:var(--panel);border:1px solid var(--border);border-radius:10px;margin-bottom:20px;overflow:hidden;}");
+    push(parts, ".file-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;font-weight:600;}");
+    push(parts, ".code-table{width:100%;border-collapse:collapse;font-family:'JetBrains Mono','Fira Code',monospace;font-size:12.5px;}");
+    push(parts, ".code-table td{padding:2px 10px;white-space:pre;}.ln-col{width:48px;color:var(--muted);text-align:right;user-select:none;border-right:1px solid var(--border);}");
+    push(parts, ".hit-col{width:76px;text-align:right;border-right:1px solid var(--border);}");
+    push(parts, ".line-covered{background:var(--green-bg);}.line-uncovered{background:var(--red-bg);}.line-partial{background:var(--yellow-bg);}");
+    push(parts, ".hit-badge{display:inline-block;padding:1px 6px;border-radius:10px;background:var(--green);color:#fff;font-size:11px;font-weight:700;}");
+    push(parts, ".miss-badge{display:inline-block;padding:1px 6px;border-radius:10px;background:var(--red);color:#fff;font-size:11px;font-weight:700;}");
+    push(parts, ".partial-branch-badge{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:10px;background:var(--yellow);color:#0d1117;font-size:11px;font-weight:700;}");
+    push(parts, "</style></head><body>");
+
+    push(parts, "<div class=\"header\"><div><h1 style=\"margin:0;font-size:20px;\">" + safe_title + "</h1>");
+    push(parts, "<div style=\"color:var(--muted);font-size:12px;margin-top:4px;\">Schema: " + COVERAGE_SCHEMA + " • Pure PBLang DevTools v" + DEVTOOLS_VERSION + "</div></div>");
+    push(parts, "<input id=\"cov-search\" class=\"search-box\" type=\"text\" placeholder=\"Filter files...\" oninput=\"filterCovFiles(this.value)\">");
+    push(parts, "<div class=\"kpi-grid\">");
+    push(parts, "<div class=\"kpi\"><div class=\"kpi-val\">" + str(sum_m["line_pct"]) + "%</div><div class=\"kpi-lbl\">Line Coverage (" + str(sum_m["lines_covered"]) + "/" + str(sum_m["lines_total"]) + ")</div></div>");
+    push(parts, "<div class=\"kpi\"><div class=\"kpi-val\">" + str(sum_m["branch_pct"]) + "%</div><div class=\"kpi-lbl\">Branch Coverage (" + str(sum_m["branches_covered"]) + "/" + str(sum_m["branches_total"]) + ")</div></div>");
+    push(parts, "<div class=\"kpi\"><div class=\"kpi-val\">" + str(sum_m["file_count"]) + "</div><div class=\"kpi-lbl\">Instrumented Files</div></div>");
+    push(parts, "</div></div>");
+
+    // Per-file summary table with progress bars
+    push(parts, "<table class=\"summary-table\"><thead><tr><th>File</th><th>Line Coverage</th><th>Lines</th><th>Branch Coverage</th><th>Branches</th></tr></thead><tbody>");
+    let fi = 0;
+    while fi < len(report["files"]) {
+        let f = report["files"][fi];
+        let esc_file = _html_escape(f["file"]);
+        push(parts, "<tr class=\"cov-file-row\" data-file=\"" + esc_file + "\">");
+        push(parts, "<td><a style=\"color:var(--accent);text-decoration:none;\" href=\"#file-" + str(fi) + "\">" + esc_file + "</a></td>");
+        push(parts, "<td><span class=\"progress-track\"><span class=\"progress-fill\" style=\"width:" + str(f["line_pct"]) + "%\"></span></span>" + str(f["line_pct"]) + "%</td>");
+        push(parts, "<td>" + str(f["lines_covered"]) + " / " + str(f["lines_total"]) + "</td>");
+        push(parts, "<td><span class=\"progress-track\"><span class=\"progress-fill\" style=\"width:" + str(f["branch_pct"]) + "%\"></span></span>" + str(f["branch_pct"]) + "%</td>");
+        push(parts, "<td>" + str(f["branches_covered"]) + " / " + str(f["branches_total"]) + "</td>");
+        push(parts, "</tr>");
+        fi = fi + 1;
+    }
+    push(parts, "</tbody></table>");
+
+    // Per-file annotated source cards
+    fi = 0;
+    while fi < len(report["files"]) {
+        let f = report["files"][fi];
+        let esc_file = _html_escape(f["file"]);
+        push(parts, "<div id=\"file-" + str(fi) + "\" class=\"file-card\" data-file=\"" + esc_file + "\">");
+        push(parts, "<div class=\"file-header\"><span>" + esc_file + "</span><span>Lines: " + str(f["line_pct"]) + "% • Branches: " + str(f["branch_pct"]) + "%</span></div>");
+        push(parts, "<table class=\"code-table\"><tbody>");
+
+        let alines = f["annotated_lines"];
+        let li = 0;
+        while li < len(alines) {
+            let row = alines[li];
+            let row_cls = "";
+            let badge_html = "";
+            let branch_html = "";
+            if row["executable"] {
+                if row["hits"] > 0 {
+                    row_cls = if row["branch_state"] == "partial" { "line-partial" } else { "line-covered" };
+                    badge_html = "<span class=\"hit-badge\">" + str(row["hits"]) + "x</span>";
+                } else {
+                    row_cls = "line-uncovered";
+                    badge_html = "<span class=\"miss-badge\">0x</span>";
+                }
+            }
+            if row["branch_state"] == "partial" {
+                let tmark = if row["true_hits"] > 0 { "T:" + str(row["true_hits"]) } else { "T:0" };
+                let fmark = if row["false_hits"] > 0 { "F:" + str(row["false_hits"]) } else { "F:0" };
+                branch_html = "<span class=\"partial-branch-badge\">partial branch (" + tmark + ", " + fmark + ")</span>";
+            }
+            push(parts, "<tr class=\"" + row_cls + "\"><td class=\"ln-col\">" + str(row["line"]) + "</td><td class=\"hit-col\">" + badge_html + "</td><td>" + _html_escape(row["source"]) + branch_html + "</td></tr>");
+            li = li + 1;
+        }
+        push(parts, "</tbody></table></div>");
+        fi = fi + 1;
+    }
+
+    push(parts, "<script>");
+    push(parts, "function filterCovFiles(q){var needle=(q||'').toLowerCase();var cards=document.querySelectorAll('.file-card,.cov-file-row');for(var i=0;i<cards.length;i++){var fp=(cards[i].getAttribute('data-file')||'').toLowerCase();cards[i].style.display=(needle===''||fp.indexOf(needle)>=0)?'':'none';}}");
+    push(parts, "</script></body></html>");
+    return str_join(parts, "\n");
+}
+
+// ── Pure-PBLang AST/Token Source Instrumenter & Runner ────────────────────────
+
+fn _build_line_offsets(src) {
+    let offs = [0];
+    let n = len(src);
+    let i = 0;
+    while i < n {
+        if str_slice(src, i, i + 1) == "\n" {
+            push(offs, i + 1);
+        }
+        i = i + 1;
+    }
+    return offs;
+}
+
+fn _lc_to_offset(line_offs, src_len, line1, col1) {
+    let li = if line1 > 0 { line1 - 1 } else { 0 };
+    if li >= len(line_offs) { return src_len; }
+    let off = line_offs[li] + (if col1 > 0 { col1 - 1 } else { 0 });
+    if off < 0 { return 0; }
+    if off > src_len { return src_len; }
+    return off;
+}
+
+fn _find_token_index_at_or_before(tokens, line1, col1) {
+    let best = -1;
+    let i = 0;
+    while i < len(tokens) {
+        let t = tokens[i];
+        if t["kind"] == "EOF" { break; }
+        if t["line"] < line1 or (t["line"] == line1 and t["col"] <= col1) {
+            best = i;
+        } else {
+            break;
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn _stmt_insert_loc(stmt, tokens) {
+    let sk = stmt["kind"];
+    if sk == "var_decl" or sk == "destruct_decl" {
+        let tidx = _find_token_index_at_or_before(tokens, stmt["line"], stmt["col"]);
+        while tidx >= 0 {
+            let tv = tokens[tidx]["val"];
+            if tv == "let" or tv == "const" {
+                if tidx >= 1 and tokens[tidx - 1]["val"] == "export" {
+                    return nil;
+                }
+                return map{ line: tokens[tidx]["line"], col: tokens[tidx]["col"] };
+            }
+            tidx = tidx - 1;
+        }
+        return nil;
+    }
+    if sk == "assign" {
+        return _leftmost_expr_loc(stmt["target"]);
+    }
+    if sk == "expr_stmt" {
+        return _leftmost_expr_loc(stmt["expr"]);
+    }
+    if map_has(stmt, "exported") and stmt["exported"] == true {
+        return nil;
+    }
+    return map{ line: stmt["line"], col: stmt["col"] };
+}
+
+fn _collect_block_probe_edits(blk, tokens, line_offs, src_len, edits) {
+    if blk == nil { return; }
+    _collect_stmt_probe_edits(blk["stmts"], tokens, line_offs, src_len, edits);
+    if blk["tail_expr"] != nil {
+        let te = blk["tail_expr"];
+        let tk = te["kind"];
+        if tk == "if_stmt" or tk == "match_stmt" or tk == "block" or tk == "while_stmt" or tk == "for_stmt" or tk == "loop_stmt" {
+            _collect_stmt_probe_edits([te], tokens, line_offs, src_len, edits);
+        } else {
+            let tloc = _leftmost_expr_loc(te);
+            let off = _lc_to_offset(line_offs, src_len, tloc["line"], tloc["col"]);
+            push(edits, map{
+                pos: off,
+                text: "__pb_hit(" + str(tloc["line"]) + "); "
+            });
+        }
+    }
+}
+
+fn _collect_stmt_probe_edits(stmts, tokens, line_offs, src_len, edits) {
+    if stmts == nil { return; }
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        let sk = s["kind"];
+        if sk == "fn_decl" {
+            _collect_block_probe_edits(s["body"], tokens, line_offs, src_len, edits);
+        } elif sk == "class_decl" {
+            _collect_stmt_probe_edits(s["members"], tokens, line_offs, src_len, edits);
+        } elif sk == "enum_decl" or sk == "struct_decl" or sk == "trait_decl" or sk == "export_stmt" or sk == "empty" {
+            // Skip non-executable declarations
+        } else {
+            let loc = _stmt_insert_loc(s, tokens);
+            if loc != nil {
+                let off = _lc_to_offset(line_offs, src_len, loc["line"], loc["col"]);
+                push(edits, map{
+                    pos: off,
+                    text: "__pb_hit(" + str(loc["line"]) + "); "
+                });
+            }
+            if sk == "if_stmt" {
+                let cur_if = s;
+                while cur_if != nil {
+                    _collect_block_probe_edits(cur_if["then_block"], tokens, line_offs, src_len, edits);
+                    if cur_if["else_block"] != nil {
+                        if cur_if["else_block"]["kind"] == "block" {
+                            _collect_block_probe_edits(cur_if["else_block"], tokens, line_offs, src_len, edits);
+                            cur_if = nil;
+                        } else {
+                            cur_if = cur_if["else_block"];
+                        }
+                    } else {
+                        cur_if = nil;
+                    }
+                }
+            } elif sk == "while_stmt" or sk == "for_stmt" or sk == "loop_stmt" {
+                _collect_block_probe_edits(s["body"], tokens, line_offs, src_len, edits);
+            } elif sk == "match_stmt" {
+                let mai = 0;
+                while mai < len(s["arms"]) {
+                    let arm = s["arms"][mai];
+                    if arm["body"] != nil and arm["body"]["kind"] == "block" {
+                        _collect_block_probe_edits(arm["body"], tokens, line_offs, src_len, edits);
+                    }
+                    mai = mai + 1;
+                }
+            } elif sk == "block" {
+                _collect_block_probe_edits(s, tokens, line_offs, src_len, edits);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn _collect_branch_cond_edits(tokens, line_offs, src_len, edits) {
+    let n = len(tokens);
+    let i = 0;
+    while i < n {
+        let t = tokens[i];
+        if t["kind"] == "KW" and (t["val"] == "if" or t["val"] == "elif" or t["val"] == "while") {
+            // Find matching `{` at depth 0 for the condition
+            let p_depth = 0;
+            let b_depth = 0;
+            let k = i + 1;
+            let brace_tok = nil;
+            while k < n {
+                let tk = tokens[k];
+                if tk["kind"] == "EOF" { break; }
+                if tk["val"] == "(" { p_depth = p_depth + 1; }
+                elif tk["val"] == ")" and p_depth > 0 { p_depth = p_depth - 1; }
+                elif tk["val"] == "[" { b_depth = b_depth + 1; }
+                elif tk["val"] == "]" and b_depth > 0 { b_depth = b_depth - 1; }
+                elif tk["val"] == "{" and p_depth == 0 and b_depth == 0 {
+                    let prev_v = if k >= 1 { tokens[k - 1]["val"] } else { "" };
+                    if prev_v != "map" {
+                        brace_tok = tk;
+                        break;
+                    }
+                }
+                k = k + 1;
+            }
+            if brace_tok != nil and k > i + 1 {
+                let c_start = _lc_to_offset(line_offs, src_len, t["line"], t["end_col"]);
+                let c_end = _lc_to_offset(line_offs, src_len, brace_tok["line"], brace_tok["col"]);
+                if c_end > c_start {
+                    let bid = "B" + str(t["line"]) + "_" + str(t["col"]);
+                    let elif_ln = if t["val"] == "elif" { t["line"] } else { 0 };
+                    push(edits, map{ pos: c_start, text: " __pb_br(\"" + bid + "\", " + str(elif_ln) + ", (" });
+                    push(edits, map{ pos: c_end, text: ")) " });
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn _apply_insert_edits(src, edits) {
+    // Sort descending by `pos` (preserving insertion order for ties via index)
+    let indexed = [];
+    let i = 0;
+    while i < len(edits) {
+        push(indexed, map{ pos: edits[i]["pos"], seq: i, text: edits[i]["text"] });
+        i = i + 1;
+    }
+    let n = len(indexed);
+    let a = 0;
+    while a < n {
+        let b = a + 1;
+        while b < n {
+            if indexed[b]["pos"] > indexed[a]["pos"] or (indexed[b]["pos"] == indexed[a]["pos"] and indexed[b]["seq"] > indexed[a]["seq"]) {
+                let tmp = indexed[a];
+                indexed[a] = indexed[b];
+                indexed[b] = tmp;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+
+    let out = src;
+    let ei = 0;
+    while ei < n {
+        let ed = indexed[ei];
+        let p = ed["pos"];
+        out = str_slice(out, 0, p) + ed["text"] + str_slice(out, p, len(out));
+        ei = ei + 1;
+    }
+    return out;
+}
+
+fn _strip_or_rewrite_exports_for_probe(src, extra_exports) {
+    // PBLang allows a single bottom `export a, b;` list or `export fn ...`.
+    // Convert any existing `export name1, name2;` statement by appending `extra_exports`,
+    // or append `export <extra_exports>;` at the bottom if none exists.
+    let parsed = SC.parse_sapp_ast(src);
+    let existing_names = [];
+    let has_export_stmt = false;
+    if parsed["ast"] != nil {
+        let stmts = parsed["ast"]["stmts"];
+        let i = 0;
+        while i < len(stmts) {
+            let s = stmts[i];
+            if s["kind"] == "export_stmt" {
+                has_export_stmt = true;
+                let ni = 0;
+                while ni < len(s["names"]) {
+                    push(existing_names, s["names"][ni]["val"]);
+                    ni = ni + 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    if not has_export_stmt {
+        return src + "\nexport " + str_join(extra_exports, ", ") + ";\n";
+    }
+    // Comment out original `export ...;` lines at bottom and emit merged `export ...;`
+    let lines = str_split(src, "\n");
+    let li = 0;
+    while li < len(lines) {
+        let tr = str_trim(lines[li]);
+        if str_starts_with(tr, "export ") and not str_starts_with(tr, "export fn ") and not str_starts_with(tr, "export let ") and not str_starts_with(tr, "export const ") {
+            // Handle single or multi-line `export a, b;`
+            while li < len(lines) {
+                let cur_l = lines[li];
+                lines[li] = "// " + cur_l;
+                if str_contains(cur_l, ";") { break; }
+                li = li + 1;
+            }
+        }
+        li = li + 1;
+    }
+    let merged = [];
+    let seen_exp = map{};
+    let mi = 0;
+    while mi < len(existing_names) {
+        let enm = existing_names[mi];
+        if not map_has(seen_exp, enm) { seen_exp[enm] = true; push(merged, enm); }
+        mi = mi + 1;
+    }
+    let xi = 0;
+    while xi < len(extra_exports) {
+        let xnm = extra_exports[xi];
+        if not map_has(seen_exp, xnm) { seen_exp[xnm] = true; push(merged, xnm); }
+        xi = xi + 1;
+    }
+    return str_join(lines, "\n") + "\nexport " + str_join(merged, ", ") + ";\n";
+}
+
+fn _build_instrumented_sapp_source(src, extra_tail_code = "", extra_export_names = nil) {
+    let tok_res = SC.tokenize_sapp(src);
+    let tokens = tok_res["tokens"];
+    let parsed = SC.parse_sapp_ast(src);
+    let line_offs = _build_line_offsets(src);
+    let src_len = len(src);
+    let edits = [];
+
+    if parsed["ast"] != nil {
+        _collect_stmt_probe_edits(parsed["ast"]["stmts"], tokens, line_offs, src_len, edits);
+    }
+    _collect_branch_cond_edits(tokens, line_offs, src_len, edits);
+
+    let instrumented_body = _apply_insert_edits(src, edits);
+    let header = str_join([
+        "let __pb_cov_lines = map{};",
+        "let __pb_cov_branches = map{};",
+        "fn __pb_hit(ln) { let k = str(ln); __pb_cov_lines[k] = (if map_has(__pb_cov_lines, k) { __pb_cov_lines[k] } else { 0 }) + 1; return true; }",
+        "fn __pb_br(bid, elif_ln, cv) { if elif_ln > 0 { __pb_hit(elif_ln); } let t = cv != false and cv != nil; let k = bid + (if t { \":T\" } else { \":F\" }); __pb_cov_branches[k] = (if map_has(__pb_cov_branches, k) { __pb_cov_branches[k] } else { 0 }) + 1; return cv; }",
+        "fn __pb_reset_cov() { __pb_cov_lines = map{}; __pb_cov_branches = map{}; }",
+        "fn __pb_get_cov() { return map{ lines: __pb_cov_lines, branches: __pb_cov_branches }; }"
+    ], "\n") + "\n";
+
+    let exports_to_add = ["__pb_get_cov", "__pb_reset_cov"];
+    if extra_export_names != nil {
+        let ei = 0;
+        while ei < len(extra_export_names) {
+            push(exports_to_add, extra_export_names[ei]);
+            ei = ei + 1;
+        }
+    }
+
+    let combined = header + instrumented_body + (if extra_tail_code != "" { "\n" + extra_tail_code + "\n" } else { "\n" });
+    return _strip_or_rewrite_exports_for_probe(combined, exports_to_add);
+}
+
+fn instrument_and_measure_sapp(path_or_src, opts = nil) {
+    let o = if opts != nil and type(opts) == "map" { opts } else { map{} };
+    let is_file = try fs_exists(path_or_src) catch false;
+    let file_label = if is_file {
+        str(path_or_src)
+    } elif map_has(o, "file") and o["file"] != nil {
+        str(o["file"])
+    } else {
+        "inline.sapp"
+    };
+    let src = if is_file { fs_read(path_or_src) } else { str(path_or_src) };
+    let entry_expr = if map_has(o, "entry_expr") and o["entry_expr"] != nil { str(o["entry_expr"]) } else { "" };
+
+    // 1. Check if native `coverage_snapshot()` is explicitly supplied or active
+    if map_has(o, "snapshot") and o["snapshot"] != nil {
+        return analyze_coverage_data(o["snapshot"], map{ [file_label]: src });
+    }
+
+    // 2. Pure-PBLang AST/token line & branch instrumentation + in-process execution
+    let inst_code = _build_instrumented_sapp_source(src, entry_expr, nil);
+    let tmp_dir = if is_file { path_dirname(path_or_src) } else { "/tmp" };
+    let tmp_path = path_join(tmp_dir, ".__pb_cov_inst_" + _next_tmp_id() + ".sapp");
+
+    fs_write(tmp_path, inst_code);
+    let cov_raw = nil;
+    let exec_err = nil;
+    try {
+        let mod = import(tmp_path);
+        cov_raw = mod.__pb_get_cov();
+    } catch err {
+        exec_err = err;
+    }
+    try fs_remove(tmp_path) catch nil;
+
+    if cov_raw == nil {
+        // Check native runtime `coverage_snapshot()` fallback
+        let nat = try coverage_snapshot() catch nil;
+        if nat != nil {
+            return analyze_coverage_data(nat, map{ [file_label]: src });
+        }
+        cov_raw = map{ lines: map{}, branches: map{} };
+    }
+
+    let report = analyze_coverage_data(
+        map{ files: map{ [file_label]: cov_raw } },
+        map{ [file_label]: src }
+    );
+    report["execution_error"] = exec_err;
+    return report;
+}
+
+// ── Coverage-Guided Shrinking Property Fuzzer (Pure PBLang) ──────────────────
+
+fn _prng_make(seed) {
+    let s = if seed != nil and seed != 0 { seed } else { 0x9E3779B9 };
+    if s < 0 { s = 0 - s; }
+    if s == 0 { s = 2463534242; }
+    return map{ state: bit_and(s, 0x7FFFFFFF) };
+}
+
+fn _prng_next(rng) {
+    let x = rng["state"];
+    if x == 0 { x = 2463534242; }
+    x = bit_and(bit_xor(x, bit_shl(x, 13)), 0x7FFFFFFF);
+    x = bit_and(bit_xor(x, bit_shr(x, 17)), 0x7FFFFFFF);
+    x = bit_and(bit_xor(x, bit_shl(x, 5)), 0x7FFFFFFF);
+    if x <= 0 { x = 1; }
+    rng["state"] = x;
+    return x;
+}
+
+fn _prng_range(rng, lo, hi) {
+    if hi <= lo { return lo; }
+    let span = (hi - lo) + 1;
+    let r = _prng_next(rng);
+    return lo + (r % span);
+}
+
+let _FUZZ_INT_DICT = [
+    0, 1, -1, 2, -2, 7, 10, -10, 16, 31, 32, 42, 63, 64, 100, -100,
+    127, 128, 255, 256, 399, 400, 401, 500, 511, 512, 1000, -1000,
+    1024, 4096, 32767, 32768, 65535, 65536, 100000, -100000
+];
+
+let _FUZZ_STR_DICT = [
+    "",
+    "!",
+    "?",
+    "a!b?@#$_-01",
+    "' OR '1'='1' --",
+    "DROP TABLE users;!",
+    "<script>alert(1)</script>",
+    "{\"id\":0,\"ok\":false,\"msg\":\"!\"}",
+    "αβγδ_Ω_⚡_!?",
+    "   \t\n  ",
+    "../../../etc/passwd",
+    "%s%s%n%x!",
+    "null",
+    "NaN",
+    "Infinity",
+    "0",
+    "-1"
+];
+
+let _ASCII_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:',.<>/?~ ";
+
+fn _invoke_with_args(target_fn, args_arr) {
+    let n = len(args_arr);
+    if n == 0 { return target_fn(); }
+    if n == 1 { return target_fn(args_arr[0]); }
+    if n == 2 { return target_fn(args_arr[0], args_arr[1]); }
+    if n == 3 { return target_fn(args_arr[0], args_arr[1], args_arr[2]); }
+    if n == 4 { return target_fn(args_arr[0], args_arr[1], args_arr[2], args_arr[3]); }
+    if n == 5 { return target_fn(args_arr[0], args_arr[1], args_arr[2], args_arr[3], args_arr[4]); }
+    return target_fn(args_arr[0], args_arr[1], args_arr[2], args_arr[3], args_arr[4], args_arr[5]);
+}
+
+fn _is_vm_type_or_arity_mismatch_err(err_msg) {
+    let m = str_lower(str(err_msg));
+    if str_contains(m, "arity mismatch:") { return true; }
+    if str_contains(m, "cannot order ") { return true; }
+    if str_contains(m, "cannot add ") { return true; }
+    if str_contains(m, "cannot subtract ") { return true; }
+    if str_contains(m, "cannot multiply ") { return true; }
+    if str_contains(m, "cannot divide ") { return true; }
+    if str_contains(m, " expects ") and (str_contains(m, "string") or str_contains(m, "number") or str_contains(m, "array") or str_contains(m, "map")) {
+        return true;
+    }
+    return false;
+}
+
+fn _detect_fn_arity(target_fn, explicit_arity) {
+    if explicit_arity != nil and explicit_arity >= 0 { return explicit_arity; }
+    let probe_err = nil;
+    try {
+        target_fn();
+        return 0;
+    } catch err {
+        probe_err = str(err);
+    }
+    let idx = str_index_of(probe_err, "expected ");
+    if idx >= 0 {
+        let rest = str_slice(probe_err, idx + 9, len(probe_err));
+        let d_end = 0;
+        while d_end < len(rest) {
+            let ch = str_slice(rest, d_end, d_end + 1);
+            if ch >= "0" and ch <= "9" { d_end = d_end + 1; } else { break; }
+        }
+        if d_end > 0 {
+            let parsed_n = parse_number(str_slice(rest, 0, d_end));
+            if parsed_n != nil { return parsed_n; }
+        }
+    }
+    // Fallback trial 1..4
+    let a = 1;
+    while a <= 4 {
+        let dummy = [];
+        let k = 0;
+        while k < a { push(dummy, 0); k = k + 1; }
+        let e2 = "";
+        try { _invoke_with_args(target_fn, dummy); return a; } catch err2 { e2 = str(err2); }
+        if not str_contains(e2, "arity mismatch:") { return a; }
+        a = a + 1;
+    }
+    return 1;
+}
+
+fn _default_val_for_type(tp) {
+    if tp == "string" or tp == "str" { return "a"; }
+    if tp == "bool" or tp == "boolean" { return false; }
+    if tp == "array" { return []; }
+    if tp == "map" { return map{}; }
+    return 0;
+}
+
+fn _probe_param_types(target_fn, arity, explicit_types) {
+    if explicit_types != nil and len(explicit_types) == arity {
+        let has_any = false;
+        let i = 0;
+        while i < arity {
+            if explicit_types[i] == "any" or explicit_types[i] == "" { has_any = true; }
+            i = i + 1;
+        }
+        if not has_any { return explicit_types; }
+    }
+
+    if arity == 0 { return []; }
+    let base_cands = ["int", "string", "bool", "array", "map"];
+
+    if arity == 1 {
+        let ci = 0;
+        while ci < len(base_cands) {
+            let tp = base_cands[ci];
+            let v1 = if tp == "int" { 500 } else { _default_val_for_type(tp) };
+            let ok_type = true;
+            try { target_fn(v1); } catch err {
+                if _is_vm_type_or_arity_mismatch_err(err) { ok_type = false; }
+            }
+            if ok_type { return [tp]; }
+            ci = ci + 1;
+        }
+        return ["int"];
+    }
+
+    if arity == 2 {
+        let pairs = [
+            ["int", "int"], ["int", "string"], ["string", "int"], ["string", "string"],
+            ["int", "bool"], ["string", "bool"], ["array", "int"], ["map", "string"]
+        ];
+        let pi = 0;
+        while pi < len(pairs) {
+            let pr = pairs[pi];
+            // Test both neutral and high-value probes so short-circuit `and` arms are exercised!
+            let a0 = if pr[0] == "int" { 0 } else { _default_val_for_type(pr[0]) };
+            let b0 = if pr[1] == "int" { 0 } else { _default_val_for_type(pr[1]) };
+            let a1 = if pr[0] == "int" { 1000 } else { _default_val_for_type(pr[0]) };
+            let b1 = if pr[1] == "int" { 1000 } elif pr[1] == "string" { "abc" } else { _default_val_for_type(pr[1]) };
+            let ok_pair = true;
+            try { target_fn(a0, b0); } catch e_a {
+                if _is_vm_type_or_arity_mismatch_err(e_a) { ok_pair = false; }
+            }
+            if ok_pair {
+                try { target_fn(a1, b1); } catch e_b {
+                    if _is_vm_type_or_arity_mismatch_err(e_b) { ok_pair = false; }
+                }
+            }
+            if ok_pair { return pr; }
+            pi = pi + 1;
+        }
+    }
+
+    // General coordinate type probing for arity >= 3
+    let inferred = [];
+    let k = 0;
+    while k < arity {
+        let hint = if explicit_types != nil and k < len(explicit_types) and explicit_types[k] != "any" and explicit_types[k] != "" {
+            explicit_types[k]
+        } else {
+            "int"
+        };
+        push(inferred, hint);
+        k = k + 1;
+    }
+    let pos = 0;
+    while pos < arity {
+        if explicit_types == nil or pos >= len(explicit_types) or explicit_types[pos] == "any" or explicit_types[pos] == "" {
+            let ci2 = 0;
+            while ci2 < len(base_cands) {
+                let cand_t = base_cands[ci2];
+                let probe_vec = [];
+                let j = 0;
+                while j < arity {
+                    let tj = if j == pos { cand_t } else { inferred[j] };
+                    push(probe_vec, if tj == "int" { 500 } else { _default_val_for_type(tj) });
+                    j = j + 1;
+                }
+                let ok_slot = true;
+                try { _invoke_with_args(target_fn, probe_vec); } catch slot_err {
+                    if _is_vm_type_or_arity_mismatch_err(slot_err) { ok_slot = false; }
+                }
+                if ok_slot {
+                    inferred[pos] = cand_t;
+                    break;
+                }
+                ci2 = ci2 + 1;
+            }
+        }
+        pos = pos + 1;
+    }
+    return inferred;
+}
+
+fn _gen_value_for_type(rng, tp, iter_idx, extra_int_dict, extra_str_dict) {
+    if tp == "bool" or tp == "boolean" {
+        return (_prng_next(rng) % 2) == 0;
+    }
+    if tp == "string" or tp == "str" {
+        let roll = _prng_range(rng, 0, 9);
+        if extra_str_dict != nil and len(extra_str_dict) > 0 and roll < 3 {
+            return extra_str_dict[_prng_range(rng, 0, len(extra_str_dict) - 1)];
+        }
+        if roll < 6 {
+            return _FUZZ_STR_DICT[_prng_range(rng, 0, len(_FUZZ_STR_DICT) - 1)];
+        }
+        let slen = _prng_range(rng, 0, 18);
+        let chars = [];
+        let ci = 0;
+        while ci < slen {
+            let aidx = _prng_range(rng, 0, len(_ASCII_ALPHABET) - 1);
+            push(chars, str_slice(_ASCII_ALPHABET, aidx, aidx + 1));
+            ci = ci + 1;
+        }
+        return str_join(chars, "");
+    }
+    if tp == "array" {
+        let alen = _prng_range(rng, 0, 5);
+        let arr = [];
+        let ai = 0;
+        while ai < alen {
+            push(arr, _gen_value_for_type(rng, "int", iter_idx, extra_int_dict, nil));
+            ai = ai + 1;
+        }
+        return arr;
+    }
+    if tp == "map" {
+        let m = map{};
+        if (_prng_next(rng) % 2) == 0 {
+            m["id"] = _gen_value_for_type(rng, "int", iter_idx, extra_int_dict, nil);
+        }
+        if (_prng_next(rng) % 2) == 0 {
+            m["val"] = _gen_value_for_type(rng, "string", iter_idx, nil, extra_str_dict);
+        }
+        return m;
+    }
+    // Numeric (`int` / `num`)
+    let nroll = _prng_range(rng, 0, 9);
+    if extra_int_dict != nil and len(extra_int_dict) > 0 and nroll < 3 {
+        return extra_int_dict[_prng_range(rng, 0, len(extra_int_dict) - 1)];
+    }
+    if nroll < 6 {
+        return _FUZZ_INT_DICT[_prng_range(rng, 0, len(_FUZZ_INT_DICT) - 1)];
+    }
+    let raw_v = _prng_range(rng, -2000, 2500);
+    if tp == "num" or tp == "float" or tp == "f64" {
+        return raw_v + (_prng_range(rng, 0, 99) / 100.0);
+    }
+    return raw_v;
+}
+
+fn _mutate_value(rng, val, tp, extra_int_dict, extra_str_dict) {
+    let vtype = type(val);
+    if vtype == "number" {
+        let op = _prng_range(rng, 0, 5);
+        if op == 0 { return val + _prng_range(rng, -16, 16); }
+        if op == 1 { return val * _prng_range(rng, -4, 8); }
+        if op == 2 { return 0 - val; }
+        if op == 3 { return bit_xor(num_floor(val), bit_shl(1, _prng_range(rng, 0, 12))); }
+        if op == 4 and extra_int_dict != nil and len(extra_int_dict) > 0 {
+            return extra_int_dict[_prng_range(rng, 0, len(extra_int_dict) - 1)] + _prng_range(rng, -2, 2);
+        }
+        return _FUZZ_INT_DICT[_prng_range(rng, 0, len(_FUZZ_INT_DICT) - 1)] + _prng_range(rng, -3, 3);
+    }
+    if vtype == "string" {
+        let sop = _prng_range(rng, 0, 5);
+        if sop == 0 {
+            // Insert random ASCII / punctuation char
+            let pos = _prng_range(rng, 0, len(val));
+            let aidx = _prng_range(rng, 0, len(_ASCII_ALPHABET) - 1);
+            let ins = str_slice(_ASCII_ALPHABET, aidx, aidx + 1);
+            return str_slice(val, 0, pos) + ins + str_slice(val, pos, len(val));
+        }
+        if sop == 1 and len(val) > 0 {
+            // Delete 1 char
+            let dpos = _prng_range(rng, 0, len(val) - 1);
+            return str_slice(val, 0, dpos) + str_slice(val, dpos + 1, len(val));
+        }
+        if sop == 2 {
+            // Splice dictionary token
+            let dtok = if extra_str_dict != nil and len(extra_str_dict) > 0 and (_prng_next(rng) % 2) == 0 {
+                extra_str_dict[_prng_range(rng, 0, len(extra_str_dict) - 1)]
+            } else {
+                _FUZZ_STR_DICT[_prng_range(rng, 0, len(_FUZZ_STR_DICT) - 1)]
+            };
+            return val + dtok;
+        }
+        if sop == 3 and len(val) > 0 {
+            // Flip character
+            let fpos = _prng_range(rng, 0, len(val) - 1);
+            let aidx2 = _prng_range(rng, 0, len(_ASCII_ALPHABET) - 1);
+            return str_slice(val, 0, fpos) + str_slice(_ASCII_ALPHABET, aidx2, aidx2 + 1) + str_slice(val, fpos + 1, len(val));
+        }
+        return _gen_value_for_type(rng, "string", 1, nil, extra_str_dict);
+    }
+    if vtype == "bool" {
+        return not val;
+    }
+    if vtype == "array" {
+        let cloned = [];
+        let i = 0;
+        while i < len(val) { push(cloned, val[i]); i = i + 1; }
+        if len(cloned) > 0 and (_prng_next(rng) % 2) == 0 {
+            let idx = _prng_range(rng, 0, len(cloned) - 1);
+            cloned[idx] = _mutate_value(rng, cloned[idx], "int", extra_int_dict, extra_str_dict);
+        } else {
+            push(cloned, _gen_value_for_type(rng, "int", 1, extra_int_dict, nil));
+        }
+        return cloned;
+    }
+    return _gen_value_for_type(rng, tp, 1, extra_int_dict, extra_str_dict);
+}
+
+fn _clone_args_arr(args_arr) {
+    let out = [];
+    let i = 0;
+    while i < len(args_arr) {
+        push(out, args_arr[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _execute_fuzz_trial(target_fn, args_arr, check_false_prop, cov_getter) {
+    if cov_getter != nil {
+        try cov_getter("reset") catch nil;
+    }
+    let ret_val = nil;
+    let threw = false;
+    let err_str = "";
+    try {
+        ret_val = _invoke_with_args(target_fn, args_arr);
+    } catch err {
+        threw = true;
+        err_str = str(err);
+    }
+
+    let cov_sig = "";
+    if cov_getter != nil {
+        let snap = try cov_getter("get") catch nil;
+        if snap != nil {
+            let lks = map_keys(snap["lines"]);
+            let bks = map_keys(snap["branches"]);
+            cov_sig = "L:" + str_join(lks, ",") + "|B:" + str_join(bks, ",");
+        }
+    } else {
+        let nat_snap = try coverage_snapshot() catch nil;
+        if nat_snap != nil {
+            cov_sig = json_stringify(nat_snap);
+        }
+    }
+
+    if threw {
+        if _is_vm_type_or_arity_mismatch_err(err_str) {
+            return map{ bug: false, ignored_type_err: true, error_message: err_str, novelty_key: "type_err" };
+        }
+        return map{
+            bug: true,
+            ignored_type_err: false,
+            error_message: err_str,
+            novelty_key: "throw:" + err_str + "|" + cov_sig
+        };
+    }
+
+    if check_false_prop and type(ret_val) == "bool" and ret_val == false {
+        return map{
+            bug: true,
+            ignored_type_err: false,
+            error_message: "Property returned false",
+            novelty_key: "prop_false|" + cov_sig
+        };
+    }
+
+    let ret_bucket = type(ret_val) + ":" + (if type(ret_val) == "number" {
+        if ret_val == 0 { "0" } elif ret_val > 0 { "+" } else { "-" }
+    } elif type(ret_val) == "bool" {
+        str(ret_val)
+    } elif type(ret_val) == "string" {
+        str(len(ret_val))
+    } else {
+        "v"
+    });
+    return map{
+        bug: false,
+        ignored_type_err: false,
+        error_message: "",
+        novelty_key: cov_sig + "|R:" + ret_bucket
+    };
+}
+
+// ── Multi-Coordinate Binary-Search + Delta-Debugging Shrinking Engine ─────────
+
+fn _shrink_single_number(cur_val, slot_idx, base_args, still_fails_fn) {
+    let v = cur_val;
+    if v == 0 { return 0; }
+
+    let cand0 = _clone_args_arr(base_args);
+    cand0[slot_idx] = 0;
+    if still_fails_fn(cand0) { return 0; }
+
+    // If negative, check if positive magnitude works or binary-search toward 0
+    let is_int = (num_floor(v) == v);
+    if is_int {
+        if v > 0 {
+            // Binary search smallest failing integer in `(0 .. v]`
+            let lo = 1;
+            let hi = v;
+            let best = v;
+            while lo <= hi {
+                let mid = num_floor((lo + hi) / 2);
+                let cm = _clone_args_arr(base_args);
+                cm[slot_idx] = mid;
+                if still_fails_fn(cm) {
+                    best = mid;
+                    hi = mid - 1;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            v = best;
+            // Greedy `-1` nudge in case failure predicate was non-monotone
+            while v > 0 {
+                let cn = _clone_args_arr(base_args);
+                cn[slot_idx] = v - 1;
+                if still_fails_fn(cn) { v = v - 1; } else { break; }
+            }
+            return v;
+        } else {
+            // Negative integer: binary search largest (closest to 0) failing integer in `[v .. -1]`
+            let lo2 = v;
+            let hi2 = -1;
+            let best2 = v;
+            while lo2 <= hi2 {
+                let mid2 = num_floor((lo2 + hi2) / 2);
+                let cm2 = _clone_args_arr(base_args);
+                cm2[slot_idx] = mid2;
+                if still_fails_fn(cm2) {
+                    best2 = mid2;
+                    lo2 = mid2 + 1;
+                } else {
+                    hi2 = mid2 - 1;
+                }
+            }
+            v = best2;
+            while v < 0 {
+                let cn2 = _clone_args_arr(base_args);
+                cn2[slot_idx] = v + 1;
+                if still_fails_fn(cn2) { v = v + 1; } else { break; }
+            }
+            return v;
+        }
+    }
+
+    // Floating-point shrink: try `num_floor(v)` first, then halving toward 0
+    let fv = num_floor(v);
+    let cf = _clone_args_arr(base_args);
+    cf[slot_idx] = fv;
+    if still_fails_fn(cf) {
+        return _shrink_single_number(fv, slot_idx, base_args, still_fails_fn);
+    }
+    let step = 0;
+    while step < 16 {
+        let half = _round2(v / 2.0);
+        if half == v { break; }
+        let ch = _clone_args_arr(base_args);
+        ch[slot_idx] = half;
+        if still_fails_fn(ch) { v = half; } else { break; }
+        step = step + 1;
+    }
+    return v;
+}
+
+fn _shrink_single_string(cur_str, slot_idx, base_args, still_fails_fn) {
+    let s = cur_str;
+    if len(s) == 0 { return ""; }
+
+    let c_empty = _clone_args_arr(base_args);
+    c_empty[slot_idx] = "";
+    if still_fails_fn(c_empty) { return ""; }
+
+    // 1. Delta-debugging chunk deletion (`chunk = len/2` down to `1`)
+    let chunk = num_floor(len(s) / 2);
+    if chunk < 1 { chunk = 1; }
+    while chunk >= 1 {
+        let idx = 0;
+        let removed_any = false;
+        while idx + chunk <= len(s) and len(s) > 0 {
+            let cand_s = str_slice(s, 0, idx) + str_slice(s, idx + chunk, len(s));
+            let cs = _clone_args_arr(base_args);
+            cs[slot_idx] = cand_s;
+            if still_fails_fn(cs) {
+                s = cand_s;
+                removed_any = true;
+                if len(s) == 0 { return ""; }
+            } else {
+                idx = idx + 1;
+            }
+        }
+        if not removed_any {
+            if chunk == 1 { break; }
+            chunk = num_floor(chunk / 2);
+            if chunk < 1 { chunk = 1; }
+        } else {
+            if chunk > len(s) {
+                chunk = len(s);
+            }
+        }
+    }
+
+    // 2. Character simplification (`'a'`, `'0'`)
+    let ci = 0;
+    while ci < len(s) {
+        let cur_ch = str_slice(s, ci, ci + 1);
+        if cur_ch != "a" {
+            let sa = str_slice(s, 0, ci) + "a" + str_slice(s, ci + 1, len(s));
+            let ca = _clone_args_arr(base_args);
+            ca[slot_idx] = sa;
+            if still_fails_fn(ca) {
+                s = sa;
+                ci = ci + 1;
+                continue;
+            }
+        }
+        if cur_ch != "0" and cur_ch != "a" {
+            let s0 = str_slice(s, 0, ci) + "0" + str_slice(s, ci + 1, len(s));
+            let c0 = _clone_args_arr(base_args);
+            c0[slot_idx] = s0;
+            if still_fails_fn(c0) {
+                s = s0;
+            }
+        }
+        ci = ci + 1;
+    }
+    return s;
+}
+
+fn _shrink_single_array(cur_arr, slot_idx, base_args, still_fails_fn) {
+    let arr = [];
+    let i = 0;
+    while i < len(cur_arr) { push(arr, cur_arr[i]); i = i + 1; }
+    if len(arr) == 0 { return arr; }
+
+    let c_emp = _clone_args_arr(base_args);
+    c_emp[slot_idx] = [];
+    if still_fails_fn(c_emp) { return []; }
+
+    let idx = 0;
+    while idx < len(arr) {
+        let sub = [];
+        let j = 0;
+        while j < len(arr) {
+            if j != idx { push(sub, arr[j]); }
+            j = j + 1;
+        }
+        let ca = _clone_args_arr(base_args);
+        ca[slot_idx] = sub;
+        if still_fails_fn(ca) {
+            arr = sub;
+        } else {
+            idx = idx + 1;
+        }
+    }
+    return arr;
+}
+
+fn _shrink_failing_args(target_fn, initial_args, check_false_prop) {
+    let cur = _clone_args_arr(initial_args);
+    let last_err = "";
+
+    let still_fails = fn(cand_args) {
+        let res = _execute_fuzz_trial(target_fn, cand_args, check_false_prop, nil);
+        if res["bug"] {
+            last_err = res["error_message"];
+            return true;
+        }
+        return false;
+    };
+
+    // Initial error capture
+    still_fails(cur);
+
+    let pass = 0;
+    while pass < 5 {
+        let before_json = json_stringify(cur);
+        let slot = 0;
+        while slot < len(cur) {
+            let v = cur[slot];
+            let vt = type(v);
+            if vt == "number" {
+                cur[slot] = _shrink_single_number(v, slot, cur, still_fails);
+            } elif vt == "string" {
+                cur[slot] = _shrink_single_string(v, slot, cur, still_fails);
+            } elif vt == "bool" {
+                if v == true {
+                    let cb = _clone_args_arr(cur);
+                    cb[slot] = false;
+                    if still_fails(cb) { cur[slot] = false; }
+                }
+            } elif vt == "array" {
+                cur[slot] = _shrink_single_array(v, slot, cur, still_fails);
+            }
+            slot = slot + 1;
+        }
+        if json_stringify(cur) == before_json { break; }
+        pass = pass + 1;
+    }
+    return map{ shrunk_args: cur, error_message: last_err };
+}
+
+fn _format_repro_arg(v) {
+    let vt = type(v);
+    if vt == "string" or vt == "array" or vt == "map" or vt == "bool" or vt == "number" {
+        return json_stringify(v);
+    }
+    return "nil";
+}
+
+fn _build_reproduce_cmd(file_path, fn_name, shrunk_args) {
+    let fmt_args = [];
+    let i = 0;
+    while i < len(shrunk_args) {
+        push(fmt_args, _format_repro_arg(shrunk_args[i]));
+        i = i + 1;
+    }
+    let call_s = (if fn_name != "" { fn_name } else { "target_fn" }) + "(" + str_join(fmt_args, ", ") + ")";
+    if file_path != "" {
+        return "pblang -e 'const M = import(\"" + file_path + "\"); M." + call_s + ";'";
+    }
+    return "pblang -e '" + call_s + ";'";
+}
+
+// ── Public Fuzzer Entrypoints (`fuzz_function`, `fuzz_sapp_file`, `cli_fuzz_entry`) ──
+
+fn fuzz_function(target_fn, opts = nil) {
+    let o = if opts != nil and type(opts) == "map" { opts } else { map{} };
+    let max_iters = if map_has(o, "max_iterations") and o["max_iterations"] != nil { o["max_iterations"] } else { 400 };
+    let seed = if map_has(o, "seed") and o["seed"] != nil { o["seed"] } else { 1337 };
+    let fn_name = if map_has(o, "fn_name") and o["fn_name"] != nil { str(o["fn_name"]) } else { "" };
+    let file_path = if map_has(o, "file") and o["file"] != nil { str(o["file"]) } else { "" };
+    let check_false = if map_has(o, "check_false_return") { o["check_false_return"] == true } else { true };
+    let cov_getter = if map_has(o, "cov_getter") { o["cov_getter"] } else { nil };
+    let extra_ints = if map_has(o, "int_dict") { o["int_dict"] } else { nil };
+    let extra_strs = if map_has(o, "str_dict") { o["str_dict"] } else { nil };
+
+    let exp_arity = if map_has(o, "arity") { o["arity"] } else { nil };
+    let arity = _detect_fn_arity(target_fn, exp_arity);
+    let exp_types = if map_has(o, "param_types") { o["param_types"] } else { nil };
+    let ptypes = _probe_param_types(target_fn, arity, exp_types);
+
+    let rng = _prng_make(seed);
+    let corpus = [];
+    let seen_novelty = map{};
+
+    // Deterministic high-signal boundary/dictionary seed queue before random/havoc loop
+    let seed_queue = [];
+    if arity == 1 {
+        if ptypes[0] == "int" or ptypes[0] == "num" {
+            let di = 0;
+            while di < len(_FUZZ_INT_DICT) { push(seed_queue, [_FUZZ_INT_DICT[di]]); di = di + 1; }
+        } elif ptypes[0] == "string" {
+            let si = 0;
+            while si < len(_FUZZ_STR_DICT) { push(seed_queue, [_FUZZ_STR_DICT[si]]); si = si + 1; }
+        }
+    } elif arity == 2 {
+        let c0 = if ptypes[0] == "string" { ["", "!", "a!b?@#$_-01", "' OR '1'='1' --"] }
+            elif ptypes[0] == "bool" { [false, true] }
+            else { [0, 1, -1, 100, 400, 401, 500, 1000, -1000] };
+        let c1 = if ptypes[1] == "string" { ["", "!", "a!b?@#$_-01", "' OR '1'='1' --", "<script>alert(1)</script>"] }
+            elif ptypes[1] == "bool" { [false, true] }
+            else { [0, 1, -1, 100, 400, 401, 500, 1000, -1000] };
+        let i0 = 0;
+        while i0 < len(c0) {
+            let i1 = 0;
+            while i1 < len(c1) {
+                push(seed_queue, [c0[i0], c1[i1]]);
+                i1 = i1 + 1;
+            }
+            i0 = i0 + 1;
+        }
+    }
+
+    let iter = 0;
+    while iter < max_iters {
+        let args_vec = [];
+        if iter < len(seed_queue) {
+            args_vec = _clone_args_arr(seed_queue[iter]);
+        } elif len(corpus) > 0 and (_prng_next(rng) % 10) < 7 {
+            // Coverage-guided corpus mutation + havoc
+            let parent = corpus[_prng_range(rng, 0, len(corpus) - 1)];
+            args_vec = _clone_args_arr(parent);
+            let havoc_steps = _prng_range(rng, 1, 3);
+            let hs = 0;
+            while hs < havoc_steps and arity > 0 {
+                let slot = _prng_range(rng, 0, arity - 1);
+                args_vec[slot] = _mutate_value(rng, args_vec[slot], ptypes[slot], extra_ints, extra_strs);
+                hs = hs + 1;
+            }
+        } else {
+            let pi = 0;
+            while pi < arity {
+                push(args_vec, _gen_value_for_type(rng, ptypes[pi], iter, extra_ints, extra_strs));
+                pi = pi + 1;
+            }
+        }
+
+        iter = iter + 1;
+        let trial = _execute_fuzz_trial(target_fn, args_vec, check_false, cov_getter);
+        if trial["ignored_type_err"] {
+            continue;
+        }
+        if trial["bug"] {
+            if len(corpus) == 0 { push(corpus, _clone_args_arr(args_vec)); }
+            let shrink_res = _shrink_failing_args(target_fn, args_vec, check_false);
+            let min_args = shrink_res["shrunk_args"];
+            let final_err = if shrink_res["error_message"] != "" { shrink_res["error_message"] } else { trial["error_message"] };
+            return map{
+                ok: false,
+                bug_found: true,
+                fn_name: fn_name,
+                iterations_run: iter,
+                corpus_size: len(corpus),
+                failing_input: args_vec,
+                minimal_shrunk_input: min_args,
+                error_message: final_err,
+                reproduce_cmd: _build_reproduce_cmd(file_path, fn_name, min_args)
+            };
+        }
+
+        let nkey = trial["novelty_key"];
+        if not map_has(seen_novelty, nkey) {
+            seen_novelty[nkey] = true;
+            push(corpus, _clone_args_arr(args_vec));
+        }
+    }
+
+    if len(corpus) == 0 {
+        let def_vec = [];
+        let di2 = 0;
+        while di2 < arity { push(def_vec, _default_val_for_type(ptypes[di2])); di2 = di2 + 1; }
+        push(corpus, def_vec);
+    }
+
+    return map{
+        ok: true,
+        bug_found: false,
+        fn_name: fn_name,
+        iterations_run: iter,
+        corpus_size: len(corpus),
+        failing_input: nil,
+        minimal_shrunk_input: nil,
+        error_message: "",
+        reproduce_cmd: ""
+    };
+}
+
+fn _extract_ast_fuzz_dictionaries(tokens) {
+    let ints = [];
+    let strs = [];
+    let i = 0;
+    while i < len(tokens) {
+        let t = tokens[i];
+        if t["kind"] == "NUM" {
+            let nv = parse_number(t["val"]);
+            if nv != nil {
+                push(ints, nv);
+                push(ints, nv - 1);
+                push(ints, nv + 1);
+            }
+        } elif t["kind"] == "STR" {
+            if len(t["val"]) <= 64 {
+                push(strs, t["val"]);
+            }
+        }
+        i = i + 1;
+    }
+    return map{ ints: ints, strs: strs };
+}
+
+fn fuzz_sapp_file(path, opts = nil) {
+    let o = if opts != nil and type(opts) == "map" { opts } else { map{} };
+    let src = try fs_read(path) catch nil;
+    if src == nil {
+        return map{
+            ok: false,
+            bug_found: false,
+            file: path,
+            error_message: "Cannot read file: " + str(path),
+            targets: []
+        };
+    }
+
+    let tok_res = SC.tokenize_sapp(src);
+    let dicts = _extract_ast_fuzz_dictionaries(tok_res["tokens"]);
+    let parsed = SC.parse_sapp_ast(src);
+    let target_specs = [];
+    let export_names = [];
+
+    if parsed["ast"] != nil {
+        let stmts = parsed["ast"]["stmts"];
+        let exported_set = map{};
+        let si = 0;
+        while si < len(stmts) {
+            let st_e = stmts[si];
+            if st_e["kind"] == "export_stmt" {
+                let ni = 0;
+                while ni < len(st_e["names"]) {
+                    exported_set[st_e["names"][ni]["val"]] = true;
+                    ni = ni + 1;
+                }
+            } elif st_e["kind"] == "fn_decl" and map_has(st_e, "exported") and st_e["exported"] == true {
+                exported_set[st_e["name"]] = true;
+            }
+            si = si + 1;
+        }
+
+        let fallback_exported = [];
+        let fallback_public = [];
+        let i = 0;
+        while i < len(stmts) {
+            let s = stmts[i];
+            if s["kind"] == "fn_decl" {
+                let nm = s["name"];
+                let pts = [];
+                let pi = 0;
+                while pi < len(s["params"]) {
+                    let p = s["params"][pi];
+                    let raw_t = if p["annot"] != nil { p["annot"]["raw"] } else { "any" };
+                    if raw_t == "i64" or raw_t == "i32" or raw_t == "integer" { raw_t = "int"; }
+                    elif raw_t == "f64" or raw_t == "float" or raw_t == "number" { raw_t = "num"; }
+                    elif raw_t == "str" { raw_t = "string"; }
+                    elif raw_t == "boolean" { raw_t = "bool"; }
+                    push(pts, raw_t);
+                    pi = pi + 1;
+                }
+                let spec_obj = map{
+                    name: nm,
+                    arity: len(s["params"]),
+                    param_types: pts
+                };
+                if str_starts_with(nm, "fuzz_") or str_starts_with(nm, "prop_") {
+                    push(target_specs, spec_obj);
+                    push(export_names, nm);
+                } elif len(s["params"]) >= 1 and len(s["params"]) <= 6 and not str_starts_with(nm, "_") and nm != "main" {
+                    if map_has(exported_set, nm) {
+                        push(fallback_exported, spec_obj);
+                    } else {
+                        push(fallback_public, spec_obj);
+                    }
+                }
+            }
+            i = i + 1;
+        }
+
+        if len(target_specs) == 0 {
+            let chosen = if len(fallback_exported) > 0 { fallback_exported } else { fallback_public };
+            let ci = 0;
+            while ci < len(chosen) {
+                push(target_specs, chosen[ci]);
+                push(export_names, chosen[ci]["name"]);
+                ci = ci + 1;
+            }
+        }
+    }
+
+    if len(target_specs) == 0 {
+        return map{
+            ok: true,
+            bug_found: false,
+            file: path,
+            targets_run: 0,
+            targets: []
+        };
+    }
+
+    let inst_src = _build_instrumented_sapp_source(src, "", export_names);
+    let tmp_path = path_join(path_dirname(path), ".__pb_fuzz_inst_" + _next_tmp_id() + ".sapp");
+    fs_write(tmp_path, inst_src);
+
+    let mod = nil;
+    let load_err = nil;
+    try {
+        mod = import(tmp_path);
+    } catch err {
+        load_err = str(err);
+    }
+    try fs_remove(tmp_path) catch nil;
+
+    if mod == nil {
+        return map{
+            ok: false,
+            bug_found: false,
+            file: path,
+            error_message: "Failed to load fuzz module: " + str(load_err),
+            targets: []
+        };
+    }
+
+    let cov_getter = fn(cmd) {
+        if cmd == "reset" { mod.__pb_reset_cov(); return nil; }
+        return mod.__pb_get_cov();
+    };
+
+    let results = [];
+    let any_bug = false;
+    let first_bug = nil;
+    let max_iters = if map_has(o, "max_iterations") { o["max_iterations"] } else { 300 };
+    let seed = if map_has(o, "seed") { o["seed"] } else { 1337 };
+
+    let ti = 0;
+    while ti < len(target_specs) {
+        let spec = target_specs[ti];
+        let fn_ref = mod[spec["name"]];
+        let fres = fuzz_function(fn_ref, map{
+            fn_name: spec["name"],
+            file: path,
+            arity: spec["arity"],
+            param_types: spec["param_types"],
+            max_iterations: max_iters,
+            seed: seed + ti,
+            cov_getter: cov_getter,
+            int_dict: dicts["ints"],
+            str_dict: dicts["strs"]
+        });
+        push(results, fres);
+        if fres["bug_found"] {
+            any_bug = true;
+            if first_bug == nil { first_bug = fres; }
+        }
+        ti = ti + 1;
+    }
+
+    return map{
+        ok: not any_bug,
+        bug_found: any_bug,
+        file: path,
+        targets_run: len(results),
+        targets: results,
+        minimal_shrunk_input: if first_bug != nil { first_bug["minimal_shrunk_input"] } else { nil },
+        failing_input: if first_bug != nil { first_bug["failing_input"] } else { nil },
+        error_message: if first_bug != nil { first_bug["error_message"] } else { "" },
+        reproduce_cmd: if first_bug != nil { first_bug["reproduce_cmd"] } else { "" }
+    };
+}
+
+fn cli_fuzz_entry(cli_args = nil) {
+    let raw = if cli_args != nil { cli_args } else { os_args() };
+    let max_iters = 300;
+    let seed = 1337;
+    let json_out = false;
+    let target_file = "";
+
+    let i = 0;
+    while i < len(raw) {
+        let a = raw[i];
+        if a == "--json" {
+            json_out = true;
+        } elif a == "--iterations" and i + 1 < len(raw) {
+            let ni = parse_number(raw[i + 1]);
+            if ni != nil { max_iters = ni; }
+            i = i + 1;
+        } elif a == "--seed" and i + 1 < len(raw) {
+            let ns = parse_number(raw[i + 1]);
+            if ns != nil { seed = ns; }
+            i = i + 1;
+        } elif not str_starts_with(a, "-") and str_ends_with(a, ".sapp") and not str_ends_with(a, "coverage_and_fuzzer.sapp") {
+            target_file = a;
+        }
+        i = i + 1;
+    }
+
+    if target_file == "" {
+        return map{ ok: false, error: "Usage: pblang fuzz <file.sapp> [--iterations N] [--seed S] [--json]" };
+    }
+
+    let rep = fuzz_sapp_file(target_file, map{ max_iterations: max_iters, seed: seed });
+    if json_out {
+        println(json_stringify(rep));
+    } else {
+        if rep["bug_found"] {
+            println("✗ FUZZ FAILURE in " + target_file + ": " + rep["error_message"]);
+            println("  Minimal shrunk input: " + json_stringify(rep["minimal_shrunk_input"]));
+            println("  Reproduce: " + rep["reproduce_cmd"]);
+        } else {
+            println("✓ FUZZ OK: " + str(rep["targets_run"]) + " target(s) passed in " + target_file);
+        }
+    }
+    return rep;
+}
+
+fn cli_coverage_entry(cli_args = nil) {
+    let raw = if cli_args != nil { cli_args } else { os_args() };
+    let out_html = "";
+    let out_json = "";
+    let target_file = "";
+
+    let i = 0;
+    while i < len(raw) {
+        let a = raw[i];
+        if a == "--html" and i + 1 < len(raw) {
+            out_html = raw[i + 1];
+            i = i + 1;
+        } elif a == "--json-out" and i + 1 < len(raw) {
+            out_json = raw[i + 1];
+            i = i + 1;
+        } elif not str_starts_with(a, "-") and str_ends_with(a, ".sapp") and not str_ends_with(a, "coverage_and_fuzzer.sapp") and not str_ends_with(a, "pbide.sapp") {
+            target_file = a;
+        }
+        i = i + 1;
+    }
+
+    if target_file == "" {
+        return map{ ok: false, error: "Usage: pblang run stdlib/devtools/coverage_and_fuzzer.sapp --coverage-cli <file.sapp> [--html report.html] [--json-out report.json]" };
+    }
+
+    let rep = instrument_and_measure_sapp(target_file, map{ file: target_file });
+    if out_html == "" {
+        out_html = target_file + ".coverage.html";
+    }
+    if out_json == "" {
+        out_json = target_file + ".coverage.json";
+    }
+    let html_doc = generate_coverage_html(rep, "PBLang Coverage — " + target_file);
+    let json_doc = generate_coverage_json(rep);
+    try fs_write(out_html, html_doc) catch nil;
+    try fs_write(out_json, json_doc) catch nil;
+    let sm = rep["summary"];
+    println("✓ COVERAGE REPORT (" + target_file + "): Lines " + str(sm["lines_covered"]) + "/" + str(sm["lines_total"]) + " (" + str(sm["line_pct"]) + "%), Branches " + str(sm["branches_covered"]) + "/" + str(sm["branches_total"]) + " (" + str(sm["branch_pct"]) + "%)");
+    println("  HTML: " + out_html);
+    println("  JSON: " + out_json);
+    rep["html_path"] = out_html;
+    rep["json_path"] = out_json;
+    return rep;
+}
+
+let _cf_boot_args = try os_args() catch [];
+let _cf_bi = 0;
+while _cf_bi < len(_cf_boot_args) {
+    if _cf_boot_args[_cf_bi] == "--fuzz-cli" {
+        cli_fuzz_entry(_cf_boot_args);
+        break;
+    } elif _cf_boot_args[_cf_bi] == "--coverage-cli" {
+        cli_coverage_entry(_cf_boot_args);
+        break;
+    }
+    _cf_bi = _cf_bi + 1;
+}
+
+export COVERAGE_SCHEMA,
+       DEVTOOLS_VERSION,
+       analyze_coverage_data,
+       generate_coverage_json,
+       generate_coverage_html,
+       instrument_and_measure_sapp,
+       fuzz_function,
+       fuzz_sapp_file,
+       cli_fuzz_entry,
+       cli_coverage_entry;

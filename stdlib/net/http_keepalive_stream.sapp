@@ -1,0 +1,1374 @@
+// stdlib/net/http_keepalive_stream.sapp — Pure-PBLang HTTP/1.1 Keep-Alive Pool,
+// Chunked Transfer-Encoding, Real-Time W3C SSE Client & Multipart Streaming (v4.2.0).
+//
+// Highlights:
+//   - Persistent HTTP/1.1 Keep-Alive connection pooling (`KeepAliveSession` / `new_session`)
+//     over native `tcp_connect` and `tcp_connect_tls` sockets with stale-socket recovery
+//   - Incremental `Transfer-Encoding: chunked` encoder & streaming socket decoder
+//   - Real-time W3C Server-Sent Events (`SSE`) streaming client (`stream_sse_events`)
+//     handling chunked & unchunked streams, UTF-8 BOM, multi-line `data:`, `id:`, `retry:`
+//   - RFC 7578 `multipart/form-data` binary builder, streaming uploader & parser
+//   - Strict SSRF private-IP / cloud-metadata / loopback guard (`check_url_ssrf`),
+//     CRLF header-injection defense, and sensitive header redaction (`redact_headers`)
+
+fn _opt(m, key, fallback) {
+    if is_map(m) and map_has(m, key) and m[key] != nil {
+        return m[key];
+    }
+    return fallback;
+}
+
+fn _append_bytes(dst, src) {
+    let i = 0;
+    let n = len(src);
+    while i < n {
+        array_push(dst, src[i]);
+        i = i + 1;
+    }
+    return dst;
+}
+
+fn array_join(arr, sep) {
+    let out = "";
+    let i = 0;
+    let n = len(arr);
+    while i < n {
+        if i > 0 { out = out + sep; }
+        out = out + str(arr[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _copy_map(m) {
+    let out = map{};
+    if not is_map(m) { return out; }
+    let ks = map_keys(m);
+    let i = 0;
+    while i < len(ks) {
+        let k = ks[i];
+        out[k] = m[k];
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _has_ctl_or_crlf(s) {
+    let bs = str_to_bytes(str(s));
+    let i = 0;
+    while i < len(bs) {
+        let b = bs[i];
+        if b == 0 or b == 10 or b == 13 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ── Header Security & Secret Redaction ───────────────────────────────────────
+
+fn validate_header_clean(name, val) {
+    let ns = str(name);
+    let vs = str(val);
+    if ns == "" {
+        throw "http_keepalive_stream: empty HTTP header name";
+    }
+    if _has_ctl_or_crlf(ns) or _has_ctl_or_crlf(vs) {
+        throw "http_keepalive_stream: CRLF or NUL header injection rejected";
+    }
+    if str_contains(ns, ":") or str_contains(ns, " ") {
+        throw "http_keepalive_stream: invalid HTTP header token '" + ns + "'";
+    }
+    return true;
+}
+
+fn is_sensitive_header(name) {
+    let low = str_lower(str_trim(str(name)));
+    return low == "authorization" or
+           low == "proxy-authorization" or
+           low == "cookie" or
+           low == "set-cookie" or
+           low == "x-api-key" or
+           low == "api-key" or
+           low == "x-auth-token";
+}
+
+fn redact_headers(headers) {
+    let out = map{};
+    if not is_map(headers) { return out; }
+    let ks = map_keys(headers);
+    let i = 0;
+    while i < len(ks) {
+        let k = ks[i];
+        if is_sensitive_header(k) {
+            out[k] = "[REDACTED]";
+        } else {
+            out[k] = str(headers[k]);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── URL Parsing & Strict SSRF Private-IP / Metadata Guard ────────────────────
+
+fn _parse_ipv4_octets(host) {
+    let parts = str_split(host, ".");
+    if len(parts) != 4 { return nil; }
+    let octs = [];
+    let i = 0;
+    while i < 4 {
+        let p = parts[i];
+        if p == "" or len(p) > 3 { return nil; }
+        let bs = str_to_bytes(p);
+        let j = 0;
+        let v = 0;
+        while j < len(bs) {
+            let c = bs[j];
+            if c < 48 or c > 57 { return nil; }
+            v = v * 10 + (c - 48);
+            j = j + 1;
+        }
+        if v < 0 or v > 255 { return nil; }
+        array_push(octs, v);
+        i = i + 1;
+    }
+    return octs;
+}
+
+fn _strip_ipv6_brackets(host) {
+    let h = str_trim(str(host));
+    if str_starts_with(h, "[") and str_ends_with(h, "]") {
+        return str_slice(h, 1, len(h) - 1);
+    }
+    return h;
+}
+
+fn is_loopback_host(host) {
+    let h = str_lower(_strip_ipv6_brackets(host));
+    if h == "localhost" or str_ends_with(h, ".localhost") or h == "::1" or h == "0:0:0:0:0:0:0:1" {
+        return true;
+    }
+    let octs = _parse_ipv4_octets(h);
+    if octs != nil and octs[0] == 127 {
+        return true;
+    }
+    return false;
+}
+
+fn is_cloud_metadata_host(host) {
+    let h = str_lower(_strip_ipv6_brackets(host));
+    if h == "metadata.google.internal" or h == "metadata" {
+        return true;
+    }
+    let octs = _parse_ipv4_octets(h);
+    if octs != nil and octs[0] == 169 and octs[1] == 254 {
+        return true;
+    }
+    if h == "fd00:ec2::254" {
+        return true;
+    }
+    return false;
+}
+
+fn is_private_network_host(host) {
+    let h = str_lower(_strip_ipv6_brackets(host));
+    if h == "::" or h == "0.0.0.0" {
+        return true;
+    }
+    if str_starts_with(h, "fc") or str_starts_with(h, "fd") {
+        if str_contains(h, ":") { return true; }
+    }
+    if str_starts_with(h, "fe8") or str_starts_with(h, "fe9") or str_starts_with(h, "fea") or str_starts_with(h, "feb") {
+        if str_contains(h, ":") { return true; }
+    }
+    let octs = _parse_ipv4_octets(h);
+    if octs != nil {
+        let a = octs[0];
+        let b = octs[1];
+        if a == 0 { return true; }
+        if a == 10 { return true; }
+        if a == 100 and b >= 64 and b <= 127 { return true; }
+        if a == 169 and b == 254 { return true; }
+        if a == 172 and b >= 16 and b <= 31 { return true; }
+        if a == 192 and b == 168 { return true; }
+    }
+    return false;
+}
+
+fn parse_url(url_str) {
+    if type(url_str) != "string" or str_trim(url_str) == "" {
+        throw "http_keepalive_stream: non-empty URL string required";
+    }
+    if _has_ctl_or_crlf(url_str) {
+        throw "http_keepalive_stream: URL contains forbidden control/CRLF characters";
+    }
+    let sep = str_index_of(url_str, "://");
+    if sep <= 0 {
+        throw "http_keepalive_stream: URL missing scheme://";
+    }
+    let scheme = str_lower(str_slice(url_str, 0, sep));
+    if scheme != "http" and scheme != "https" {
+        throw "http_keepalive_stream: unsupported URL scheme '" + scheme + "'";
+    }
+    let rest = str_slice(url_str, sep + 3, len(url_str));
+    // Strip fragment if present
+    let hash_idx = str_index_of(rest, "#");
+    if hash_idx >= 0 {
+        rest = str_slice(rest, 0, hash_idx);
+    }
+
+    let authority = rest;
+    let raw_path = "/";
+    let slash_idx = str_index_of(rest, "/");
+    let q_only_idx = str_index_of(rest, "?");
+    if slash_idx >= 0 and (q_only_idx < 0 or slash_idx < q_only_idx) {
+        authority = str_slice(rest, 0, slash_idx);
+        raw_path = str_slice(rest, slash_idx, len(rest));
+    } elif q_only_idx >= 0 {
+        authority = str_slice(rest, 0, q_only_idx);
+        raw_path = "/" + str_slice(rest, q_only_idx, len(rest));
+    }
+
+    if str_contains(authority, "@") {
+        throw "http_keepalive_stream: embedded credentials in URL authority are forbidden";
+    }
+
+    let host = authority;
+    let port = if scheme == "https" { 443 } else { 80 };
+    if str_starts_with(authority, "[") {
+        let rb = str_index_of(authority, "]");
+        if rb < 0 { throw "http_keepalive_stream: malformed IPv6 host in URL"; }
+        host = str_slice(authority, 1, rb);
+        let after = str_slice(authority, rb + 1, len(authority));
+        if str_starts_with(after, ":") {
+            port = parse_number(str_slice(after, 1, len(after)));
+        }
+    } else {
+        let colon = str_index_of(authority, ":");
+        if colon >= 0 {
+            host = str_slice(authority, 0, colon);
+            port = parse_number(str_slice(authority, colon + 1, len(authority)));
+        }
+    }
+
+    if host == "" or type(port) != "number" or port < 1 or port > 65535 {
+        throw "http_keepalive_stream: invalid host or port in URL";
+    }
+
+    let path_only = raw_path;
+    let query_str = "";
+    let qi = str_index_of(raw_path, "?");
+    if qi >= 0 {
+        path_only = str_slice(raw_path, 0, qi);
+        query_str = str_slice(raw_path, qi + 1, len(raw_path));
+    }
+
+    let host_hdr = if str_contains(host, ":") { "[" + host + "]" } else { host };
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    if port != default_port {
+        host_hdr = host_hdr + ":" + str(port);
+    }
+
+    return map{
+        scheme: scheme,
+        host: host,
+        port: port,
+        host_header: host_hdr,
+        path: path_only,
+        query: query_str,
+        request_target: raw_path,
+        origin_key: scheme + "://" + str_lower(host_hdr)
+    };
+}
+
+fn check_url_ssrf(url_or_parsed, opts = nil) {
+    let u = if is_map(url_or_parsed) { url_or_parsed } else { parse_url(url_or_parsed) };
+    let strict_ssrf = _opt(opts, "strict_ssrf", true) == true;
+    if not strict_ssrf { return u; }
+
+    let allow_loopback = _opt(opts, "allow_loopback", false) == true;
+    let allow_private = _opt(opts, "allow_private_networks", false) == true;
+    let allow_metadata = _opt(opts, "allow_cloud_metadata", false) == true;
+
+    if is_cloud_metadata_host(u.host) and not allow_metadata {
+        throw "http_keepalive_stream: SSRF guard blocked cloud metadata address '" + u.host + "'";
+    }
+    if is_loopback_host(u.host) {
+        if not allow_loopback {
+            throw "http_keepalive_stream: SSRF guard blocked loopback address '" + u.host + "' (set allow_loopback: true for local test servers)";
+        }
+        return u;
+    }
+    if is_private_network_host(u.host) and not allow_private {
+        throw "http_keepalive_stream: SSRF guard blocked private/internal IP '" + u.host + "'";
+    }
+    return u;
+}
+
+fn _resolve_url(base_url, path_or_url) {
+    let target = str(path_or_url);
+    if str_starts_with(str_lower(target), "http://") or str_starts_with(str_lower(target), "https://") {
+        return parse_url(target);
+    }
+    if base_url == nil or str_trim(str(base_url)) == "" {
+        throw "http_keepalive_stream: relative request path '" + target + "' requires session base_url";
+    }
+    let b = str(base_url);
+    while str_ends_with(b, "/") {
+        b = str_slice(b, 0, len(b) - 1);
+    }
+    if not str_starts_with(target, "/") {
+        target = "/" + target;
+    }
+    return parse_url(b + target);
+}
+
+// ── Chunked Transfer-Encoding Codec (RFC 9112 §7.1) ──────────────────────────
+
+fn _int_to_hex_lower(n) {
+    if n == 0 { return "0"; }
+    let digits = "0123456789abcdef";
+    let v = num_floor(n);
+    let out = "";
+    while v > 0 {
+        let rem = v % 16;
+        out = str_slice(digits, rem, rem + 1) + out;
+        v = num_floor(v / 16);
+    }
+    return out;
+}
+
+fn _parse_hex_size(line_str) {
+    let s = str_trim(line_str);
+    // Strip optional chunk extension ";ext=val"
+    let semi = str_index_of(s, ";");
+    if semi >= 0 {
+        s = str_trim(str_slice(s, 0, semi));
+    }
+    if s == "" {
+        throw "http_keepalive_stream: empty chunk size line";
+    }
+    let bs = str_to_bytes(s);
+    let val = 0;
+    let i = 0;
+    while i < len(bs) {
+        let c = bs[i];
+        let d = -1;
+        if c >= 48 and c <= 57 { d = c - 48; }
+        elif c >= 97 and c <= 102 { d = c - 87; }
+        elif c >= 65 and c <= 70 { d = c - 55; }
+        else { throw "http_keepalive_stream: invalid hex digit in chunk size '" + s + "'"; }
+        val = val * 16 + d;
+        i = i + 1;
+    }
+    return val;
+}
+
+fn encode_chunked(chunks_array, trailers = nil) {
+    let out = [];
+    let i = 0;
+    while i < len(chunks_array) {
+        let ch = chunks_array[i];
+        let cb = if is_array(ch) { ch } else { str_to_bytes(str(ch)) };
+        if len(cb) > 0 {
+            _append_bytes(out, str_to_bytes(_int_to_hex_lower(len(cb)) + "\r\n"));
+            _append_bytes(out, cb);
+            _append_bytes(out, [13, 10]);
+        }
+        i = i + 1;
+    }
+    _append_bytes(out, str_to_bytes("0\r\n"));
+    if is_map(trailers) {
+        let ks = map_keys(trailers);
+        let k = 0;
+        while k < len(ks) {
+            let tn = ks[k];
+            let tv = str(trailers[tn]);
+            validate_header_clean(tn, tv);
+            _append_bytes(out, str_to_bytes(tn + ": " + tv + "\r\n"));
+            k = k + 1;
+        }
+    }
+    _append_bytes(out, [13, 10]);
+    return out;
+}
+
+fn _find_crlf_bytes(b, start, end) {
+    let i = start;
+    while i + 1 < end {
+        if b[i] == 13 and b[i + 1] == 10 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn decode_chunked(raw_bytes_or_str, max_body_bytes = 67108864) {
+    let b = if is_array(raw_bytes_or_str) { raw_bytes_or_str } else { str_to_bytes(str(raw_bytes_or_str)) };
+    let n = len(b);
+    let pos = 0;
+    let body_bytes = [];
+    let chunks = [];
+    let trailers = map{};
+    let total = 0;
+
+    while true {
+        let crlf = _find_crlf_bytes(b, pos, n);
+        if crlf < 0 {
+            throw "http_keepalive_stream: truncated chunked encoding (missing CRLF)";
+        }
+        let size_line = bytes_to_str(slice(b, pos, crlf));
+        let csize = _parse_hex_size(size_line);
+        pos = crlf + 2;
+
+        if csize == 0 {
+            while pos < n {
+                let nl = _find_crlf_bytes(b, pos, n);
+                if nl < 0 { break; }
+                let tline = bytes_to_str(slice(b, pos, nl));
+                pos = nl + 2;
+                if tline == "" { break; }
+                let colon = str_index_of(tline, ":");
+                if colon > 0 {
+                    let tk = str_lower(str_trim(str_slice(tline, 0, colon)));
+                    let tv = str_trim(str_slice(tline, colon + 1, len(tline)));
+                    trailers[tk] = tv;
+                }
+            }
+            break;
+        }
+
+        if total + csize > max_body_bytes {
+            throw "http_keepalive_stream: chunked body exceeds max_body_bytes (" + str(max_body_bytes) + ")";
+        }
+        if pos + csize + 2 > n {
+            throw "http_keepalive_stream: truncated chunk payload";
+        }
+        let chunk_b = slice(b, pos, pos + csize);
+        if b[pos + csize] != 13 or b[pos + csize + 1] != 10 {
+            throw "http_keepalive_stream: missing CRLF after chunk payload";
+        }
+        pos = pos + csize + 2;
+        total = total + csize;
+        _append_bytes(body_bytes, chunk_b);
+        array_push(chunks, bytes_to_str(chunk_b));
+    }
+
+    return map{
+        body_text: bytes_to_str(body_bytes),
+        body_bytes: body_bytes,
+        chunks: chunks,
+        trailers: trailers,
+        bytes_decoded: total
+    };
+}
+
+// ── Socket I/O Primitives & Incremental HTTP/1.1 Wire Reader ─────────────────
+
+fn _read_exact_str(handle, n) {
+    if n <= 0 { return ""; }
+    let out = [];
+    while len(out) < n {
+        let want = n - len(out);
+        if want > 65536 { want = 65536; }
+        let chunk = tcp_read(handle, want);
+        if chunk == nil or chunk == "" {
+            throw "http_keepalive_stream: unexpected EOF while reading exact " + str(n) + " bytes";
+        }
+        let cb = str_to_bytes(chunk);
+        if len(cb) == 0 {
+            throw "http_keepalive_stream: unexpected EOF while reading exact " + str(n) + " bytes";
+        }
+        _append_bytes(out, cb);
+    }
+    return bytes_to_str(out);
+}
+
+fn _strip_crlf(line) {
+    let s = line;
+    if str_ends_with(s, "\n") { s = str_slice(s, 0, len(s) - 1); }
+    if str_ends_with(s, "\r") { s = str_slice(s, 0, len(s) - 1); }
+    return s;
+}
+
+fn _parse_status_line(line) {
+    let s = str_trim(line);
+    if not str_starts_with(s, "HTTP/") {
+        throw "http_keepalive_stream: malformed HTTP status line '" + s + "'";
+    }
+    let sp1 = str_index_of(s, " ");
+    if sp1 < 0 {
+        throw "http_keepalive_stream: missing status code in HTTP status line";
+    }
+    let http_ver = str_slice(s, 0, sp1);
+    let after = str_trim(str_slice(s, sp1 + 1, len(s)));
+    let sp2 = str_index_of(after, " ");
+    let code_str = if sp2 >= 0 { str_slice(after, 0, sp2) } else { after };
+    let reason = if sp2 >= 0 { str_trim(str_slice(after, sp2 + 1, len(after))) } else { "" };
+    let status = parse_number(code_str);
+    return map{ version: http_ver, status: status, reason: reason };
+}
+
+fn _read_http_response(handle, method, on_chunk_fn, opts) {
+    let max_headers = _opt(opts, "max_headers", 128);
+    let max_body = _opt(opts, "max_body_bytes", 67108864);
+    let collect_body = _opt(opts, "collect_body", true) == true;
+
+    let first_line_raw = try tcp_read_until(handle, "\n", 16384) catch "";
+    if first_line_raw == nil or first_line_raw == "" {
+        return map{ eof_before_headers: true };
+    }
+    let st = _parse_status_line(_strip_crlf(first_line_raw));
+
+    let headers = map{};
+    let raw_headers = map{};
+    let hcount = 0;
+    while true {
+        let hline_raw = tcp_read_until(handle, "\n", 16384);
+        if hline_raw == nil or hline_raw == "" {
+            throw "http_keepalive_stream: unexpected EOF inside HTTP response headers";
+        }
+        let hline = _strip_crlf(hline_raw);
+        if hline == "" { break; }
+        hcount = hcount + 1;
+        if hcount > max_headers {
+            throw "http_keepalive_stream: response exceeded max_headers (" + str(max_headers) + ")";
+        }
+        let colon = str_index_of(hline, ":");
+        if colon > 0 {
+            let raw_k = str_trim(str_slice(hline, 0, colon));
+            let low_k = str_lower(raw_k);
+            let val_s = str_trim(str_slice(hline, colon + 1, len(hline)));
+            raw_headers[raw_k] = val_s;
+            if map_has(headers, low_k) {
+                headers[low_k] = headers[low_k] + ", " + val_s;
+            } else {
+                headers[low_k] = val_s;
+            }
+        }
+    }
+
+    let conn_hdr = str_lower(_opt(headers, "connection", ""));
+    let keep_alive = true;
+    if st.version == "HTTP/1.0" {
+        keep_alive = str_contains(conn_hdr, "keep-alive");
+    } else {
+        if str_contains(conn_hdr, "close") { keep_alive = false; }
+    }
+
+    let body_parts = [];
+    let trailers = map{};
+    let total_bytes = 0;
+    let halted_early = false;
+
+    let upper_m = str_upper(method);
+    let no_body = upper_m == "HEAD" or st.status == 204 or st.status == 304 or (st.status >= 100 and st.status < 200);
+
+    if not no_body {
+        let te = str_lower(_opt(headers, "transfer-encoding", ""));
+        if str_contains(te, "chunked") {
+            while true {
+                let sz_raw = tcp_read_until(handle, "\n", 4096);
+                if sz_raw == nil or sz_raw == "" {
+                    throw "http_keepalive_stream: EOF reading chunk size";
+                }
+                let csize = _parse_hex_size(_strip_crlf(sz_raw));
+                if csize == 0 {
+                    // Consume trailing headers + final CRLF
+                    while true {
+                        let tr_raw = tcp_read_until(handle, "\n", 8192);
+                        if tr_raw == nil or tr_raw == "" { break; }
+                        let tr_line = _strip_crlf(tr_raw);
+                        if tr_line == "" { break; }
+                        let c2 = str_index_of(tr_line, ":");
+                        if c2 > 0 {
+                            trailers[str_lower(str_trim(str_slice(tr_line, 0, c2)))] = str_trim(str_slice(tr_line, c2 + 1, len(tr_line)));
+                        }
+                    }
+                    break;
+                }
+                if total_bytes + csize > max_body {
+                    keep_alive = false;
+                    throw "http_keepalive_stream: chunked stream exceeded max_body_bytes";
+                }
+                let cdata = _read_exact_str(handle, csize);
+                let crlf_end = _read_exact_str(handle, 2);
+                if crlf_end != "\r\n" {
+                    keep_alive = false;
+                    throw "http_keepalive_stream: invalid chunk terminator";
+                }
+                total_bytes = total_bytes + csize;
+                if collect_body { array_push(body_parts, cdata); }
+                if on_chunk_fn != nil {
+                    let cont = on_chunk_fn(cdata);
+                    if cont == false {
+                        halted_early = true;
+                        keep_alive = false;
+                        break;
+                    }
+                }
+            }
+        } elif map_has(headers, "content-length") {
+            let clen = parse_number(str_trim(headers["content-length"]));
+            if clen < 0 or clen > max_body {
+                keep_alive = false;
+                throw "http_keepalive_stream: Content-Length out of bounds";
+            }
+            let rem = clen;
+            while rem > 0 {
+                let step = if rem > 32768 { 32768 } else { rem };
+                let part = _read_exact_str(handle, step);
+                rem = rem - step;
+                total_bytes = total_bytes + step;
+                if collect_body { array_push(body_parts, part); }
+                if on_chunk_fn != nil {
+                    let cont2 = on_chunk_fn(part);
+                    if cont2 == false {
+                        halted_early = true;
+                        keep_alive = false;
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Unbounded stream (e.g. raw text/event-stream or HTTP/1.0 EOF close)
+            keep_alive = false;
+            while true {
+                let chunk_eof = try tcp_read(handle, 16384) catch "";
+                if chunk_eof == nil or chunk_eof == "" { break; }
+                total_bytes = total_bytes + len(str_to_bytes(chunk_eof));
+                if total_bytes > max_body {
+                    throw "http_keepalive_stream: unbounded response exceeded max_body_bytes";
+                }
+                if collect_body { array_push(body_parts, chunk_eof); }
+                if on_chunk_fn != nil {
+                    let cont3 = on_chunk_fn(chunk_eof);
+                    if cont3 == false {
+                        halted_early = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let body_str = if collect_body { array_join(body_parts, "") } else { "" };
+    return map{
+        eof_before_headers: false,
+        version: st.version,
+        status: st.status,
+        ok: st.status >= 200 and st.status < 300,
+        reason: st.reason,
+        headers: headers,
+        raw_headers: raw_headers,
+        trailers: trailers,
+        body: body_str,
+        bytes_received: total_bytes,
+        keep_alive: keep_alive,
+        halted_early: halted_early
+    };
+}
+
+fn _open_origin_socket(u) {
+    if u.scheme == "https" {
+        return tcp_connect_tls(u.host, u.port);
+    }
+    let addr = if str_contains(u.host, ":") {
+        "[" + u.host + "]:" + str(u.port)
+    } else {
+        u.host + ":" + str(u.port)
+    };
+    return tcp_connect(addr);
+}
+
+fn _write_request_head_and_body(handle, method, u, headers_map, body_val, is_chunked_upload) {
+    let upper_m = str_upper(str_trim(str(method)));
+    if _has_ctl_or_crlf(upper_m) or str_contains(upper_m, " ") {
+        throw "http_keepalive_stream: invalid HTTP method";
+    }
+    if _has_ctl_or_crlf(u.request_target) {
+        throw "http_keepalive_stream: invalid HTTP request target";
+    }
+
+    let hdrs = _copy_map(headers_map);
+    // Ensure Host & Connection defaults unless explicitly provided
+    let has_host = false;
+    let has_conn = false;
+    let has_cl = false;
+    let has_te = false;
+    let hks = map_keys(hdrs);
+    let i = 0;
+    while i < len(hks) {
+        let lk = str_lower(hks[i]);
+        if lk == "host" { has_host = true; }
+        if lk == "connection" { has_conn = true; }
+        if lk == "content-length" { has_cl = true; }
+        if lk == "transfer-encoding" { has_te = true; }
+        i = i + 1;
+    }
+    if not has_host { hdrs["Host"] = u.host_header; }
+    if not has_conn { hdrs["Connection"] = "keep-alive"; }
+
+    let body_bytes = nil;
+    if is_chunked_upload and is_array(body_val) {
+        if not has_te { hdrs["Transfer-Encoding"] = "chunked"; }
+        body_bytes = encode_chunked(body_val, nil);
+    } elif body_val != nil {
+        body_bytes = if is_array(body_val) { body_val } else { str_to_bytes(str(body_val)) };
+        if not has_cl and not has_te {
+            hdrs["Content-Length"] = str(len(body_bytes));
+        }
+    } elif (upper_m == "POST" or upper_m == "PUT" or upper_m == "PATCH") and not has_cl and not has_te {
+        hdrs["Content-Length"] = "0";
+    }
+
+    let head_lines = [upper_m + " " + u.request_target + " HTTP/1.1\r\n"];
+    let final_ks = map_keys(hdrs);
+    let j = 0;
+    while j < len(final_ks) {
+        let hk = final_ks[j];
+        let hv = str(hdrs[hk]);
+        validate_header_clean(hk, hv);
+        array_push(head_lines, hk + ": " + hv + "\r\n");
+        j = j + 1;
+    }
+    array_push(head_lines, "\r\n");
+    let head_str = array_join(head_lines, "");
+    tcp_write(handle, head_str);
+    let sent = len(head_str);
+
+    if body_bytes != nil and len(body_bytes) > 0 {
+        tcp_write(handle, body_bytes);
+        sent = sent + len(body_bytes);
+    }
+    return map{ bytes_sent: sent, redacted_headers: redact_headers(hdrs) };
+}
+
+// ── W3C Server-Sent Events (SSE) Incremental Parser & Live Streamer ──────────
+
+fn new_sse_parser(initial_last_id = "") {
+    return map{
+        buf: "",
+        started: false,
+        event_type: "",
+        data_lines: [],
+        last_event_id: str(initial_last_id),
+        retry_ms: nil,
+        events_dispatched: 0
+    };
+}
+
+fn _dispatch_sse_if_nonempty(parser, on_event_fn) {
+    if len(parser.data_lines) == 0 {
+        parser.event_type = "";
+        return true;
+    }
+    let ev_name = if parser.event_type == "" { "message" } else { parser.event_type };
+    let data_payload = array_join(parser.data_lines, "\n");
+    parser.event_type = "";
+    parser.data_lines = [];
+    parser.events_dispatched = parser.events_dispatched + 1;
+
+    let ev = map{
+        event: ev_name,
+        data: data_payload,
+        id: parser.last_event_id,
+        retry_ms: parser.retry_ms
+    };
+    if on_event_fn != nil {
+        let cont = on_event_fn(ev);
+        if cont == false { return false; }
+    }
+    return true;
+}
+
+fn _process_sse_line(parser, line, on_event_fn) {
+    if line == "" {
+        return _dispatch_sse_if_nonempty(parser, on_event_fn);
+    }
+    if str_starts_with(line, ":") {
+        // Comment / heartbeat line
+        return true;
+    }
+    let colon = str_index_of(line, ":");
+    let field = line;
+    let val = "";
+    if colon >= 0 {
+        field = str_slice(line, 0, colon);
+        val = str_slice(line, colon + 1, len(line));
+        if str_starts_with(val, " ") {
+            val = str_slice(val, 1, len(val));
+        }
+    }
+    if field == "event" {
+        parser.event_type = val;
+    } elif field == "data" {
+        array_push(parser.data_lines, val);
+    } elif field == "id" {
+        // W3C SSE spec: ignore id fields containing NUL
+        let bs = str_to_bytes(val);
+        let has_nul = false;
+        let i = 0;
+        while i < len(bs) {
+            if bs[i] == 0 { has_nul = true; break; }
+            i = i + 1;
+        }
+        if not has_nul {
+            parser.last_event_id = val;
+        }
+    } elif field == "retry" {
+        let r_num = try parse_number(val) catch nil;
+        if type(r_num) == "number" and r_num >= 0 and r_num == num_floor(r_num) {
+            parser.retry_ms = r_num;
+        }
+    }
+    return true;
+}
+
+fn feed_sse_chunk(parser, chunk_str, on_event_fn) {
+    if chunk_str == nil or chunk_str == "" { return true; }
+    let s = parser.buf + chunk_str;
+    if not parser.started {
+        let bs = str_to_bytes(s);
+        if len(bs) >= 3 and bs[0] == 239 and bs[1] == 187 and bs[2] == 191 {
+            s = bytes_to_str(slice(bs, 3, len(bs)));
+            parser.started = true;
+        } elif len(bs) >= 3 {
+            parser.started = true;
+        }
+    }
+
+    let pos = 0;
+    let n = len(s);
+    let i = 0;
+    while i < n {
+        let ch = str_slice(s, i, i + 1);
+        if ch == "\r" {
+            if i + 1 >= n {
+                // Wait for next chunk in case \n follows \r across boundary
+                break;
+            }
+            let line = str_slice(s, pos, i);
+            if str_slice(s, i + 1, i + 2) == "\n" {
+                i = i + 2;
+            } else {
+                i = i + 1;
+            }
+            pos = i;
+            if not _process_sse_line(parser, line, on_event_fn) {
+                parser.buf = str_slice(s, pos, n);
+                return false;
+            }
+        } elif ch == "\n" {
+            let line2 = str_slice(s, pos, i);
+            i = i + 1;
+            pos = i;
+            if not _process_sse_line(parser, line2, on_event_fn) {
+                parser.buf = str_slice(s, pos, n);
+                return false;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+    parser.buf = str_slice(s, pos, n);
+    return true;
+}
+
+fn flush_sse_parser(parser, on_event_fn) {
+    if parser.buf != "" {
+        let rem = _strip_crlf(parser.buf);
+        parser.buf = "";
+        if not _process_sse_line(parser, rem, on_event_fn) {
+            return false;
+        }
+    }
+    return _dispatch_sse_if_nonempty(parser, on_event_fn);
+}
+
+// ── Multipart Form-Data Codec & Streaming Uploader (RFC 7578) ────────────────
+
+fn _escape_multipart_quote(s) {
+    let clean = str_replace_all(str_replace_all(str(s), "\r", ""), "\n", "");
+    return str_replace_all(clean, "\"", "\\\"");
+}
+
+fn build_multipart(parts_array, boundary = nil) {
+    if type(parts_array) != "array" {
+        throw "http_keepalive_stream: multipart parts_array must be an array";
+    }
+    let bnd = if boundary != nil and str(boundary) != "" {
+        str(boundary)
+    } else {
+        "----PBLangBoundary" + hex_encode(bytes_to_str(random_bytes(12)))
+    };
+    if _has_ctl_or_crlf(bnd) or str_contains(bnd, " ") {
+        throw "http_keepalive_stream: invalid multipart boundary";
+    }
+
+    let wire = [];
+    let i = 0;
+    while i < len(parts_array) {
+        let p = parts_array[i];
+        let name = _escape_multipart_quote(_opt(p, "name", "field_" + str(i)));
+        let filename = _opt(p, "filename", nil);
+        let disp = "Content-Disposition: form-data; name=\"" + name + "\"";
+        if filename != nil {
+            disp = disp + "; filename=\"" + _escape_multipart_quote(filename) + "\"";
+        }
+
+        let ctype = _opt(p, "content_type", if filename != nil { "application/octet-stream" } else { nil });
+        let raw_val = _opt(p, "data", _opt(p, "value", ""));
+        let data_bytes = if is_array(raw_val) { raw_val } else { str_to_bytes(str(raw_val)) };
+
+        _append_bytes(wire, str_to_bytes("--" + bnd + "\r\n"));
+        _append_bytes(wire, str_to_bytes(disp + "\r\n"));
+        if ctype != nil {
+            validate_header_clean("Content-Type", ctype);
+            _append_bytes(wire, str_to_bytes("Content-Type: " + str(ctype) + "\r\n"));
+        }
+        _append_bytes(wire, [13, 10]);
+        _append_bytes(wire, data_bytes);
+        _append_bytes(wire, [13, 10]);
+        i = i + 1;
+    }
+    _append_bytes(wire, str_to_bytes("--" + bnd + "--\r\n"));
+
+    return map{
+        boundary: bnd,
+        content_type: "multipart/form-data; boundary=" + bnd,
+        body_bytes: wire,
+        content_length: len(wire)
+    };
+}
+
+fn _extract_disp_param(disp_hdr, key) {
+    let needle = key + "=\"";
+    let idx = str_index_of(disp_hdr, needle);
+    if idx < 0 { return nil; }
+    let start = idx + len(needle);
+    let i = start;
+    let out = "";
+    while i < len(disp_hdr) {
+        let ch = str_slice(disp_hdr, i, i + 1);
+        if ch == "\\" and i + 1 < len(disp_hdr) {
+            out = out + str_slice(disp_hdr, i + 1, i + 2);
+            i = i + 2;
+        } elif ch == "\"" {
+            break;
+        } else {
+            out = out + ch;
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn parse_multipart(body_bytes_or_str, boundary) {
+    let raw = if is_array(body_bytes_or_str) { bytes_to_str(body_bytes_or_str) } else { str(body_bytes_or_str) };
+    let delim = "--" + str(boundary);
+    let segments = str_split(raw, delim);
+    let out = [];
+    let i = 1;
+    while i < len(segments) {
+        let seg = segments[i];
+        if str_starts_with(seg, "--") { break; }
+        if str_starts_with(seg, "\r\n") {
+            seg = str_slice(seg, 2, len(seg));
+        }
+        let sep = str_index_of(seg, "\r\n\r\n");
+        if sep >= 0 {
+            let hdr_block = str_slice(seg, 0, sep);
+            let content = str_slice(seg, sep + 4, len(seg));
+            if str_ends_with(content, "\r\n") {
+                content = str_slice(content, 0, len(content) - 2);
+            }
+            let hlines = str_split(hdr_block, "\r\n");
+            let phdrs = map{};
+            let h = 0;
+            while h < len(hlines) {
+                let hl = hlines[h];
+                let c = str_index_of(hl, ":");
+                if c > 0 {
+                    phdrs[str_lower(str_trim(str_slice(hl, 0, c)))] = str_trim(str_slice(hl, c + 1, len(hl)));
+                }
+                h = h + 1;
+            }
+            let disp = _opt(phdrs, "content-disposition", "");
+            array_push(out, map{
+                name: _extract_disp_param(disp, "name"),
+                filename: _extract_disp_param(disp, "filename"),
+                content_type: _opt(phdrs, "content-type", "text/plain"),
+                headers: phdrs,
+                text: content,
+                data_bytes: str_to_bytes(content)
+            });
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── Persistent HTTP/1.1 Keep-Alive Session Pool (`KeepAliveSession`) ─────────
+
+fn _borrow_idle_socket(sess, origin_key) {
+    mutex_lock(sess.mtx);
+    let sock = nil;
+    if map_has(sess.idle_by_origin, origin_key) {
+        let arr = sess.idle_by_origin[origin_key];
+        if len(arr) > 0 {
+            sock = arr[len(arr) - 1];
+            sess.idle_by_origin[origin_key] = slice(arr, 0, len(arr) - 1);
+            sess.reused_connections = sess.reused_connections + 1;
+        }
+    }
+    mutex_unlock(sess.mtx);
+    return sock;
+}
+
+fn _return_idle_socket(sess, origin_key, handle) {
+    mutex_lock(sess.mtx);
+    if sess.closed {
+        mutex_unlock(sess.mtx);
+        try tcp_close(handle) catch nil;
+        return;
+    }
+    let arr = if map_has(sess.idle_by_origin, origin_key) { sess.idle_by_origin[origin_key] } else { [] };
+    if len(arr) >= sess.max_idle_per_origin {
+        let oldest = arr[0];
+        arr = slice(arr, 1, len(arr));
+        try tcp_close(oldest) catch nil;
+    }
+    array_push(arr, handle);
+    sess.idle_by_origin[origin_key] = arr;
+    mutex_unlock(sess.mtx);
+}
+
+fn _merge_session_opts(sess, call_opts) {
+    let out = _copy_map(sess.default_opts);
+    if is_map(call_opts) {
+        let ks = map_keys(call_opts);
+        let i = 0;
+        while i < len(ks) {
+            out[ks[i]] = call_opts[ks[i]];
+            i = i + 1;
+        }
+    }
+    // Merge default_headers + call headers
+    let hdrs = _copy_map(sess.default_headers);
+    if is_map(call_opts) and is_map(_opt(call_opts, "headers", nil)) {
+        let hks = map_keys(call_opts["headers"]);
+        let j = 0;
+        while j < len(hks) {
+            hdrs[hks[j]] = call_opts["headers"][hks[j]];
+            j = j + 1;
+        }
+    }
+    out["headers"] = hdrs;
+    return out;
+}
+
+fn _session_execute(sess, method, path_or_url, on_chunk_fn, call_opts) {
+    if sess.closed {
+        throw "http_keepalive_stream: KeepAliveSession is closed";
+    }
+    let opts = _merge_session_opts(sess, call_opts);
+    let u = _resolve_url(sess.base_url, path_or_url);
+    check_url_ssrf(u, opts);
+
+    let body_val = _opt(opts, "body", nil);
+    let chunked_up = _opt(opts, "chunked_upload", false) == true;
+    let headers_map = _opt(opts, "headers", map{});
+
+    let reused = false;
+    let handle = _borrow_idle_socket(sess, u.origin_key);
+    if handle != nil {
+        reused = true;
+    } else {
+        handle = _open_origin_socket(u);
+        mutex_lock(sess.mtx);
+        sess.opened_connections = sess.opened_connections + 1;
+        mutex_unlock(sess.mtx);
+    }
+
+    let attempt = 0;
+    while true {
+        attempt = attempt + 1;
+        let wr_ok = try map{
+            ok: true,
+            info: _write_request_head_and_body(handle, method, u, headers_map, body_val, chunked_up),
+            error: nil
+        } catch err {
+            map{ ok: false, info: nil, error: err }
+        };
+
+        if not wr_ok.ok {
+            try tcp_close(handle) catch nil;
+            if reused and attempt == 1 {
+                reused = false;
+                handle = _open_origin_socket(u);
+                mutex_lock(sess.mtx);
+                sess.opened_connections = sess.opened_connections + 1;
+                mutex_unlock(sess.mtx);
+                continue;
+            }
+            throw "http_keepalive_stream: failed writing HTTP request: " + str(wr_ok.error);
+        }
+
+        let resp_try = try map{
+            ok: true,
+            resp: _read_http_response(handle, method, on_chunk_fn, opts),
+            error: nil
+        } catch err2 {
+            map{ ok: false, resp: nil, error: err2 }
+        };
+
+        if not resp_try.ok {
+            try tcp_close(handle) catch nil;
+            throw "http_keepalive_stream: failed reading HTTP response: " + str(resp_try.error);
+        }
+
+        let resp = resp_try.resp;
+        if resp.eof_before_headers {
+            try tcp_close(handle) catch nil;
+            if reused and attempt == 1 {
+                // Server closed idle Keep-Alive socket between requests; reconnect transparently!
+                reused = false;
+                handle = _open_origin_socket(u);
+                mutex_lock(sess.mtx);
+                sess.opened_connections = sess.opened_connections + 1;
+                mutex_unlock(sess.mtx);
+                continue;
+            }
+            throw "http_keepalive_stream: peer closed connection before HTTP status line";
+        }
+
+        mutex_lock(sess.mtx);
+        sess.requests_sent = sess.requests_sent + 1;
+        sess.bytes_sent = sess.bytes_sent + wr_ok.info.bytes_sent;
+        sess.bytes_received = sess.bytes_received + resp.bytes_received;
+        mutex_unlock(sess.mtx);
+
+        let req_conn_hdr = str_lower(_opt(headers_map, "Connection", _opt(headers_map, "connection", "keep-alive")));
+        if resp.keep_alive and not str_contains(req_conn_hdr, "close") {
+            _return_idle_socket(sess, u.origin_key, handle);
+        } else {
+            try tcp_close(handle) catch nil;
+        }
+
+        resp.reused_socket = reused;
+        resp.request_headers_redacted = wr_ok.info.redacted_headers;
+        return resp;
+    }
+}
+
+fn close_session(sess) {
+    mutex_lock(sess.mtx);
+    if sess.closed {
+        mutex_unlock(sess.mtx);
+        return false;
+    }
+    sess.closed = true;
+    let origins = map_keys(sess.idle_by_origin);
+    let i = 0;
+    while i < len(origins) {
+        let arr = sess.idle_by_origin[origins[i]];
+        let j = 0;
+        while j < len(arr) {
+            try tcp_close(arr[j]) catch nil;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    sess.idle_by_origin = map{};
+    mutex_unlock(sess.mtx);
+    return true;
+}
+
+fn session_stats(sess) {
+    mutex_lock(sess.mtx);
+    let idle_total = 0;
+    let origins = map_keys(sess.idle_by_origin);
+    let i = 0;
+    while i < len(origins) {
+        idle_total = idle_total + len(sess.idle_by_origin[origins[i]]);
+        i = i + 1;
+    }
+    let st = map{
+        format: "pblang.net.http_keepalive_session.v1",
+        base_url: sess.base_url,
+        closed: sess.closed,
+        idle_sockets: idle_total,
+        opened_connections: sess.opened_connections,
+        reused_connections: sess.reused_connections,
+        requests_sent: sess.requests_sent,
+        bytes_sent: sess.bytes_sent,
+        bytes_received: sess.bytes_received
+    };
+    mutex_unlock(sess.mtx);
+    return st;
+}
+
+fn session_request(sess, method, path_or_url, opts = nil) {
+    return _session_execute(sess, method, path_or_url, nil, opts);
+}
+
+fn session_get(sess, path_or_url, opts = nil) {
+    return _session_execute(sess, "GET", path_or_url, nil, opts);
+}
+
+fn session_post(sess, path_or_url, body, opts = nil) {
+    let o = _copy_map(opts);
+    o["body"] = body;
+    return _session_execute(sess, "POST", path_or_url, nil, o);
+}
+
+fn session_post_json(sess, path_or_url, payload, opts = nil) {
+    let o = _copy_map(opts);
+    let hdrs = _copy_map(_opt(o, "headers", map{}));
+    hdrs["Content-Type"] = "application/json";
+    if not map_has(hdrs, "Accept") { hdrs["Accept"] = "application/json"; }
+    o["headers"] = hdrs;
+    o["body"] = json_stringify(payload);
+    return _session_execute(sess, "POST", path_or_url, nil, o);
+}
+
+fn session_stream(sess, method, path_or_url, on_chunk_fn, opts = nil) {
+    let o = _copy_map(opts);
+    if not map_has(o, "collect_body") { o["collect_body"] = false; }
+    return _session_execute(sess, method, path_or_url, on_chunk_fn, o);
+}
+
+fn session_stream_sse(sess, path_or_url, on_event_fn, opts = nil) {
+    let o = _copy_map(opts);
+    let hdrs = _copy_map(_opt(o, "headers", map{}));
+    hdrs["Accept"] = "text/event-stream";
+    hdrs["Cache-Control"] = "no-cache";
+    let last_id = str(_opt(o, "last_event_id", ""));
+    if last_id != "" {
+        hdrs["Last-Event-ID"] = last_id;
+    }
+    o["headers"] = hdrs;
+    o["collect_body"] = false;
+
+    let parser = new_sse_parser(last_id);
+    let resp = _session_execute(sess, _opt(o, "method", "GET"), path_or_url, fn(chunk) {
+        return feed_sse_chunk(parser, chunk, on_event_fn);
+    }, o);
+    if not resp.halted_early {
+        flush_sse_parser(parser, on_event_fn);
+    }
+    return map{
+        status: resp.status,
+        ok: resp.ok,
+        headers: resp.headers,
+        events_dispatched: parser.events_dispatched,
+        last_event_id: parser.last_event_id,
+        retry_ms: parser.retry_ms,
+        reused_socket: resp.reused_socket
+    };
+}
+
+fn session_upload_multipart(sess, path_or_url, parts_array, opts = nil) {
+    let built = build_multipart(parts_array, _opt(opts, "boundary", nil));
+    let o = _copy_map(opts);
+    let hdrs = _copy_map(_opt(o, "headers", map{}));
+    hdrs["Content-Type"] = built.content_type;
+    o["headers"] = hdrs;
+    o["body"] = built.body_bytes;
+    return _session_execute(sess, _opt(o, "method", "POST"), path_or_url, nil, o);
+}
+
+fn new_session(base_url = "", opts = nil) {
+    let max_idle = _opt(opts, "max_idle_per_origin", 4);
+    if type(max_idle) != "number" or max_idle < 1 { max_idle = 4; }
+    let def_hdrs = _copy_map(_opt(opts, "headers", map{}));
+    if not map_has(def_hdrs, "User-Agent") {
+        def_hdrs["User-Agent"] = "PBLang-HTTP-Stream/4.2";
+    }
+
+    let sess = map{
+        format: "pblang.net.http_keepalive_session.v1",
+        base_url: str(base_url),
+        max_idle_per_origin: max_idle,
+        default_headers: def_hdrs,
+        default_opts: _copy_map(opts),
+        idle_by_origin: map{},
+        mtx: mutex_new(),
+        closed: false,
+        opened_connections: 0,
+        reused_connections: 0,
+        requests_sent: 0,
+        bytes_sent: 0,
+        bytes_received: 0
+    };
+
+    sess.request = fn(method, path_or_url) { return session_request(sess, method, path_or_url, nil); };
+    sess.request_with = fn(method, path_or_url, call_opts) { return session_request(sess, method, path_or_url, call_opts); };
+    sess.get = fn(path_or_url) { return session_get(sess, path_or_url, nil); };
+    sess.get_with = fn(path_or_url, call_opts) { return session_get(sess, path_or_url, call_opts); };
+    sess.post = fn(path_or_url, body) { return session_post(sess, path_or_url, body, nil); };
+    sess.post_json = fn(path_or_url, payload) { return session_post_json(sess, path_or_url, payload, nil); };
+    sess.stream = fn(method, path_or_url, on_chunk_fn) { return session_stream(sess, method, path_or_url, on_chunk_fn, nil); };
+    sess.stream_sse = fn(path_or_url, on_event_fn) { return session_stream_sse(sess, path_or_url, on_event_fn, nil); };
+    sess.upload_multipart = fn(path_or_url, parts_array) { return session_upload_multipart(sess, path_or_url, parts_array, nil); };
+    sess.stats = fn() { return session_stats(sess); };
+    sess.close = fn() { return close_session(sess); };
+
+    return sess;
+}
+
+fn KeepAliveSession(base_url = "", opts = nil) {
+    return new_session(base_url, opts);
+}
+
+// ── Standalone One-Shot Streaming Helpers ────────────────────────────────────
+
+fn stream_request(method, url, on_chunk_fn, opts = nil) {
+    let o = _copy_map(opts);
+    let hdrs = _copy_map(_opt(o, "headers", map{}));
+    hdrs["Connection"] = "close";
+    o["headers"] = hdrs;
+    let s = new_session("", o);
+    let res = try map{ ok: true, val: session_stream(s, method, url, on_chunk_fn, o) } catch map{ ok: false, val: nil };
+    close_session(s);
+    if not res.ok { throw "http_keepalive_stream: stream_request failed"; }
+    return res.val;
+}
+
+fn stream_sse_events(url, on_event_fn, opts = nil) {
+    let o = _copy_map(opts);
+    let hdrs = _copy_map(_opt(o, "headers", map{}));
+    hdrs["Connection"] = "close";
+    o["headers"] = hdrs;
+    let s = new_session("", o);
+    let res = try map{ ok: true, val: session_stream_sse(s, url, on_event_fn, o) } catch map{ ok: false, val: nil };
+    close_session(s);
+    if not res.ok { throw "http_keepalive_stream: stream_sse_events failed"; }
+    return res.val;
+}
+
+fn upload_multipart(url, parts_array, opts = nil) {
+    let o = _copy_map(opts);
+    let hdrs = _copy_map(_opt(o, "headers", map{}));
+    hdrs["Connection"] = "close";
+    o["headers"] = hdrs;
+    let s = new_session("", o);
+    let res = try map{ ok: true, val: session_upload_multipart(s, url, parts_array, o) } catch map{ ok: false, val: nil };
+    close_session(s);
+    if not res.ok { throw "http_keepalive_stream: upload_multipart failed"; }
+    return res.val;
+}
+
+export KeepAliveSession, new_session, close_session, session_stats,
+       session_request, session_get, session_post, session_post_json,
+       session_stream, session_stream_sse, session_upload_multipart,
+       stream_request, stream_sse_events, upload_multipart,
+       encode_chunked, decode_chunked,
+       new_sse_parser, feed_sse_chunk, flush_sse_parser,
+       build_multipart, parse_multipart,
+       parse_url, check_url_ssrf, is_loopback_host, is_private_network_host, is_cloud_metadata_host,
+       validate_header_clean, is_sensitive_header, redact_headers;

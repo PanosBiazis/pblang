@@ -1,0 +1,3581 @@
+// stdlib/net/http2_http3_adaptive.sapp — Pure-PBLang Multi-Generation HTTP, WebTransport,
+// Encrypted DNS & Web Security/Privacy Suite:
+//   - HTTP/0.9 (1991) & HTTP/1.0 (RFC 1945) legacy interoperability codecs
+//   - HTTP/2 Binary Framing, Stream Multiplexer & HPACK Codec (RFC 9113 / RFC 7541)
+//     with CVE-2023-44487 Rapid Reset & CVE-2024-27316 CONTINUATION Flood DoS shields
+//   - HTTP/3 over QUIC, 99-Entry Stateless QPACK & Alt-Svc (RFC 9114 / RFC 9204 / RFC 7838)
+//   - WebTransport over HTTP/3 (RFC 9297): Extended CONNECT, Uni/Bidi Streams & DATAGRAMs
+//   - Privacy-First Encrypted DNS: DoH (RFC 8484) + DoQ (RFC 9250) + UDP (RFC 1035) fallback
+//   - Hardened Web Security & Anti-Tracking Headers (CSP Nonce, Permissions-Policy Topics/FLoC
+//     block, COOP/CORP/COEP, Sec-Fetch-* CSRF guard, __Host- cookies, Reduced Client Hints)
+//   - Domain-Aware Adaptive Protocol Selector (`select_optimal_http_protocol`) + Happy-Eyeballs
+
+let HTTP1 = import("stdlib:net/http_keepalive_stream.sapp");
+let QUIC_RT = import("stdlib:net/udp_dns_quic_realtime.sapp");
+
+// ── HTTP/2 Constants (RFC 9113) ──────────────────────────────────────────────
+
+let H2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+let H2_FRAME_DATA = 0;
+let H2_FRAME_HEADERS = 1;
+let H2_FRAME_PRIORITY = 2;
+let H2_FRAME_RST_STREAM = 3;
+let H2_FRAME_SETTINGS = 4;
+let H2_FRAME_PUSH_PROMISE = 5;
+let H2_FRAME_PING = 6;
+let H2_FRAME_GOAWAY = 7;
+let H2_FRAME_WINDOW_UPDATE = 8;
+let H2_FRAME_CONTINUATION = 9;
+
+let H2_FLAG_NONE = 0;
+let H2_FLAG_END_STREAM = 1;
+let H2_FLAG_ACK = 1;
+let H2_FLAG_END_HEADERS = 4;
+let H2_FLAG_PADDED = 8;
+let H2_FLAG_PRIORITY = 32;
+
+let H2_NO_ERROR = 0;
+let H2_PROTOCOL_ERROR = 1;
+let H2_INTERNAL_ERROR = 2;
+let H2_FLOW_CONTROL_ERROR = 3;
+let H2_SETTINGS_TIMEOUT = 4;
+let H2_STREAM_CLOSED = 5;
+let H2_FRAME_SIZE_ERROR = 6;
+let H2_REFUSED_STREAM = 7;
+let H2_CANCEL = 8;
+let H2_COMPRESSION_ERROR = 9;
+let H2_CONNECT_ERROR = 10;
+let H2_ENHANCE_YOUR_CALM = 11; // 0x0B
+let H2_INADEQUATE_SECURITY = 12;
+let H2_HTTP_1_1_REQUIRED = 13;
+
+let H2_SETTINGS_HEADER_TABLE_SIZE = 1;
+let H2_SETTINGS_ENABLE_PUSH = 2;
+let H2_SETTINGS_MAX_CONCURRENT_STREAMS = 3;
+let H2_SETTINGS_INITIAL_WINDOW_SIZE = 4;
+let H2_SETTINGS_MAX_FRAME_SIZE = 5;
+let H2_SETTINGS_MAX_HEADER_LIST_SIZE = 6;
+
+// ── HTTP/3 Constants (RFC 9114 & RFC 9204) ───────────────────────────────────
+
+let H3_FRAME_DATA = 0;         // 0x00
+let H3_FRAME_HEADERS = 1;      // 0x01
+let H3_FRAME_CANCEL_PUSH = 3;  // 0x03
+let H3_FRAME_SETTINGS = 4;     // 0x04
+let H3_FRAME_PUSH_PROMISE = 5; // 0x05
+let H3_FRAME_GOAWAY = 7;       // 0x07
+let H3_FRAME_MAX_PUSH_ID = 13; // 0x0D
+
+let H3_NO_ERROR = 256;                // 0x0100
+let H3_GENERAL_PROTOCOL_ERROR = 257;  // 0x0101
+let H3_INTERNAL_ERROR = 258;          // 0x0102
+let H3_STREAM_CREATION_ERROR = 259;   // 0x0103
+let H3_FRAME_UNEXPECTED = 261;        // 0x0105
+let H3_FRAME_ERROR = 262;             // 0x0106
+let H3_EXCESSIVE_LOAD = 263;          // 0x0107
+let H3_SETTINGS_ERROR = 265;          // 0x0109
+
+let H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY = 1;
+let H3_SETTINGS_MAX_FIELD_SECTION_SIZE = 6;
+let H3_SETTINGS_QPACK_BLOCKED_STREAMS = 7;
+
+// ── Internal Byte & String Utilities ─────────────────────────────────────────
+
+fn _opt(m, key, fallback) {
+    if is_map(m) and map_has(m, key) and m[key] != nil {
+        return m[key];
+    }
+    return fallback;
+}
+
+fn _append_bytes(dst, src) {
+    let i = 0;
+    let n = len(src);
+    while i < n {
+        array_push(dst, src[i]);
+        i = i + 1;
+    }
+    return dst;
+}
+
+fn array_join(arr, sep) {
+    let out = "";
+    let i = 0;
+    let n = len(arr);
+    while i < n {
+        if i > 0 { out = out + sep; }
+        out = out + str(arr[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _push_u16_be(buf, v) {
+    array_push(buf, bit_and(bit_shr(v, 8), 255));
+    array_push(buf, bit_and(v, 255));
+}
+
+fn _push_u24_be(buf, v) {
+    array_push(buf, bit_and(bit_shr(v, 16), 255));
+    array_push(buf, bit_and(bit_shr(v, 8), 255));
+    array_push(buf, bit_and(v, 255));
+}
+
+fn _push_u32_be(buf, v) {
+    let hi = num_floor(v / 65536);
+    let lo = v - hi * 65536;
+    _push_u16_be(buf, hi);
+    _push_u16_be(buf, lo);
+}
+
+fn _read_u16_be(b, pos) {
+    return b[pos] * 256 + b[pos + 1];
+}
+
+fn _read_u24_be(b, pos) {
+    return (b[pos] * 256 + b[pos + 1]) * 256 + b[pos + 2];
+}
+
+fn _read_u32_be(b, pos) {
+    return ((b[pos] * 256 + b[pos + 1]) * 256 + b[pos + 2]) * 256 + b[pos + 3];
+}
+
+fn _read_exact_bytes(handle, count) {
+    if count <= 0 { return []; }
+    let out = [];
+    while len(out) < count {
+        let chunk = tcp_read(handle, count - len(out));
+        if chunk == nil or chunk == "" {
+            throw "http2_http3_adaptive: unexpected EOF reading " + str(count) + " wire bytes";
+        }
+        let cb = str_to_bytes(chunk);
+        if len(cb) == 0 {
+            throw "http2_http3_adaptive: unexpected EOF reading " + str(count) + " wire bytes";
+        }
+        _append_bytes(out, cb);
+    }
+    return out;
+}
+
+let H2_HARD_MAX_FRAME_SIZE = 1048576;   // 1 MiB hard frame ceiling (anti-OOM)
+let H2_MAX_DYNAMIC_TABLE_BYTES = 4096;  // 4 KiB max HPACK dynamic table
+let H2_MAX_HEADER_COUNT = 128;          // Max 128 headers per block (anti-HPACK/QPACK bomb)
+let H2_HARD_MAX_HEADER_LIST = 65536;    // 64 KiB max decoded header list bytes
+
+fn _has_ctl_bytes(s) {
+    let bs = str_to_bytes(str(s));
+    let i = 0;
+    while i < len(bs) {
+        let b = bs[i];
+        if b == 0 or b == 10 or b == 13 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _is_sensitive_header_name(low_name) {
+    return low_name == "authorization" or
+           low_name == "proxy-authorization" or
+           low_name == "cookie" or
+           low_name == "set-cookie" or
+           low_name == "x-api-key" or
+           low_name == "api-key" or
+           low_name == "x-auth-token";
+}
+
+fn _is_forbidden_h2_connection_header(name_s) {
+    // RFC 9113 §8.2.2 & RFC 9114 §4.2: Connection-specific headers MUST be rejected
+    // to prevent HTTP/2 & HTTP/3 -> HTTP/1.1 request smuggling (e.g. Transfer-Encoding: chunked)!
+    return name_s == "connection" or
+           name_s == "transfer-encoding" or
+           name_s == "keep-alive" or
+           name_s == "proxy-connection" or
+           name_s == "upgrade";
+}
+
+fn _is_valid_pseudo_header_name(name_s) {
+    return name_s == ":method" or
+           name_s == ":scheme" or
+           name_s == ":authority" or
+           name_s == ":path" or
+           name_s == ":status" or
+           name_s == ":protocol";
+}
+
+fn _validate_h2_h3_header_field(raw_name, raw_val) {
+    let ns = str(raw_name);
+    let vs = str(raw_val);
+    let nb = str_to_bytes(ns);
+    if len(nb) == 0 {
+        throw "http2_http3_adaptive: PROTOCOL_ERROR empty HTTP/2 or HTTP/3 header name";
+    }
+    let is_pseudo = (nb[0] == 58); // ':'
+    if is_pseudo and not _is_valid_pseudo_header_name(ns) {
+        throw "http2_http3_adaptive: PROTOCOL_ERROR unknown pseudo-header '" + ns + "'";
+    }
+    let i = if is_pseudo { 1 } else { 0 };
+    if is_pseudo and len(nb) == 1 {
+        throw "http2_http3_adaptive: PROTOCOL_ERROR bare ':' header name";
+    }
+    while i < len(nb) {
+        let c = nb[i];
+        // Reject uppercase A-Z (65..90), CTLs (<= 32 incl SP, NUL, CR, LF), DEL (127), and ':' (58)
+        if (c >= 65 and c <= 90) {
+            throw "http2_http3_adaptive: PROTOCOL_ERROR uppercase character in HTTP/2 or HTTP/3 header name '" + ns + "'";
+        }
+        if c <= 32 or c >= 127 or c == 58 {
+            throw "http2_http3_adaptive: PROTOCOL_ERROR invalid or control byte in header name '" + ns + "'";
+        }
+        i = i + 1;
+    }
+    if not is_pseudo and _is_forbidden_h2_connection_header(ns) {
+        throw "http2_http3_adaptive: PROTOCOL_ERROR forbidden connection-specific header '" + ns + "' (anti-smuggling)";
+    }
+
+    let vb = str_to_bytes(vs);
+    let j = 0;
+    let vn = len(vb);
+    if vn > 0 {
+        // RFC 9113 §8.2.1: field values MUST NOT start or end with SP (32) or HTAB (9)
+        if vb[0] == 32 or vb[0] == 9 or vb[vn - 1] == 32 or vb[vn - 1] == 9 {
+            throw "http2_http3_adaptive: PROTOCOL_ERROR leading/trailing whitespace in header value for '" + ns + "'";
+        }
+    }
+    while j < vn {
+        let vc = vb[j];
+        if vc == 0 or vc == 10 or vc == 13 or (vc < 32 and vc != 9) or vc == 127 {
+            throw "http2_http3_adaptive: PROTOCOL_ERROR NUL/CRLF/CTL injection in header value for '" + ns + "'";
+        }
+        j = j + 1;
+    }
+    if ns == "te" and vs != "trailers" {
+        throw "http2_http3_adaptive: PROTOCOL_ERROR TE header in HTTP/2 or HTTP/3 must only be 'trailers'";
+    }
+    return true;
+}
+
+fn _normalize_header_pairs(headers_in) {
+    // Strictly validates every header against RFC 9113 / RFC 9114 rules (no uppercase,
+    // no CRLF/NUL, no smuggling headers, max 128 headers, no pseudo after regular).
+    let pseudos = [];
+    let regulars = [];
+    let seen_pseudos = map{};
+    if is_array(headers_in) {
+        if len(headers_in) > H2_MAX_HEADER_COUNT {
+            throw "http2_http3_adaptive: header count exceeds max limit (" + str(H2_MAX_HEADER_COUNT) + ")";
+        }
+        let seen_regular_in_list = false;
+        let i = 0;
+        while i < len(headers_in) {
+            let item = headers_in[i];
+            let k = "";
+            let v = "";
+            let never_idx = false;
+            if is_array(item) {
+                k = str(item[0]);
+                v = str(item[1]);
+                if len(item) >= 3 and item[2] == true { never_idx = true; }
+            } elif is_map(item) {
+                k = str(_opt(item, "name", ""));
+                v = str(_opt(item, "value", ""));
+                never_idx = _opt(item, "never_index", false) == true;
+            }
+            _validate_h2_h3_header_field(k, v);
+            if _is_sensitive_header_name(k) { never_idx = true; }
+            let entry = map{ name: k, value: v, never_index: never_idx };
+            if str_starts_with(k, ":") {
+                if seen_regular_in_list {
+                    throw "http2_http3_adaptive: PROTOCOL_ERROR pseudo-header '" + k + "' after regular header";
+                }
+                if map_has(seen_pseudos, k) {
+                    throw "http2_http3_adaptive: PROTOCOL_ERROR duplicate pseudo-header '" + k + "'";
+                }
+                seen_pseudos[k] = true;
+                array_push(pseudos, entry);
+            } else {
+                seen_regular_in_list = true;
+                array_push(regulars, entry);
+            }
+            i = i + 1;
+        }
+    } elif is_map(headers_in) {
+        let ks = map_keys(headers_in);
+        if len(ks) > H2_MAX_HEADER_COUNT {
+            throw "http2_http3_adaptive: header count exceeds max limit (" + str(H2_MAX_HEADER_COUNT) + ")";
+        }
+        let j = 0;
+        while j < len(ks) {
+            let k2 = str(ks[j]);
+            let v2 = str(headers_in[ks[j]]);
+            _validate_h2_h3_header_field(k2, v2);
+            let entry2 = map{ name: k2, value: v2, never_index: _is_sensitive_header_name(k2) };
+            if str_starts_with(k2, ":") {
+                if map_has(seen_pseudos, k2) {
+                    throw "http2_http3_adaptive: PROTOCOL_ERROR duplicate pseudo-header '" + k2 + "'";
+                }
+                seen_pseudos[k2] = true;
+                array_push(pseudos, entry2);
+            } else {
+                array_push(regulars, entry2);
+            }
+            j = j + 1;
+        }
+    }
+    let out = [];
+    _append_bytes(out, pseudos);
+    _append_bytes(out, regulars);
+    return out;
+}
+
+fn _adapt_caller_headers_for_h2_h3(headers_in) {
+    // Translates high-level caller headers (e.g. adaptive_http_request) to lowercase H2/H3
+    // AFTER rejecting NUL/CRLF and forbidden connection-specific smuggling headers.
+    if headers_in == nil { return nil; }
+    if is_map(headers_in) {
+        let out = map{};
+        let ks = map_keys(headers_in);
+        let i = 0;
+        while i < len(ks) {
+            let rk = str(ks[i]);
+            let rv = str(headers_in[ks[i]]);
+            HTTP1.validate_header_clean(rk, rv);
+            let lk = str_lower(rk);
+            if not _is_forbidden_h2_connection_header(lk) {
+                out[lk] = str_trim(rv);
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+    return headers_in;
+}
+
+fn _raw_uncompressed_header_bytes(pairs) {
+    let total = 0;
+    let i = 0;
+    while i < len(pairs) {
+        let p = pairs[i];
+        // HTTP/1.1 equivalent wire cost: "name: value\r\n" -> name + 2 + value + 2
+        total = total + len(str_to_bytes(p.name)) + len(str_to_bytes(p.value)) + 4;
+        i = i + 1;
+    }
+    return total + 2; // trailing "\r\n"
+}
+
+// ============================================================================
+// 1. Legacy HTTP/0.9 (1991) & HTTP/1.0 (RFC 1945) Interoperability Codec
+// ============================================================================
+
+fn encode_http09_request(path = "/") {
+    let raw_p = str(path);
+    if _has_ctl_bytes(raw_p) {
+        throw "http2_http3_adaptive: CRLF/NUL injection rejected in HTTP/0.9 request path";
+    }
+    let p = str_trim(raw_p);
+    if p == "" { p = "/"; }
+    if str_contains(p, " ") or not str_starts_with(p, "/") {
+        throw "http2_http3_adaptive: invalid HTTP/0.9 request path";
+    }
+    return "GET " + p + "\r\n";
+}
+
+fn parse_http09_request(line_str) {
+    let raw_l = str(line_str);
+    // Strip at most trailing CRLF before checking for interior CRLF/NUL
+    let trimmed_end = str_trim(raw_l);
+    if _has_ctl_bytes(trimmed_end) {
+        throw "http2_http3_adaptive: NUL or interior CRLF rejected in HTTP/0.9 request";
+    }
+    if not str_starts_with(trimmed_end, "GET ") {
+        throw "http2_http3_adaptive: HTTP/0.9 only supports 'GET <path>'";
+    }
+    let rest = str_trim(str_slice(trimmed_end, 4, len(trimmed_end)));
+    if str_contains(rest, " HTTP/") or str_contains(rest, " ") {
+        throw "http2_http3_adaptive: versioned or multi-token request line is not HTTP/0.9";
+    }
+    return map{
+        version: "HTTP/0.9",
+        method: "GET",
+        path: if rest == "" { "/" } else { rest }
+    };
+}
+
+fn decode_http09_response(raw_bytes_or_str) {
+    let body_b = if is_array(raw_bytes_or_str) { raw_bytes_or_str } else { str_to_bytes(str(raw_bytes_or_str)) };
+    return map{
+        version: "HTTP/0.9",
+        status: 200,
+        ok: true,
+        headers: map{},
+        body: bytes_to_str(body_b),
+        body_bytes: body_b
+    };
+}
+
+fn encode_http10_request(method, path, headers = nil, body = nil) {
+    let raw_m = str(method);
+    let raw_p = if path == nil or str(path) == "" { "/" } else { str(path) };
+    if _has_ctl_bytes(raw_m) or _has_ctl_bytes(raw_p) or str_contains(raw_p, " ") {
+        throw "http2_http3_adaptive: CRLF/NUL/space injection rejected in HTTP/1.0 request line";
+    }
+    let m = str_upper(str_trim(raw_m));
+    if m == "" or str_contains(m, " ") {
+        throw "http2_http3_adaptive: invalid HTTP/1.0 method";
+    }
+    let p = raw_p;
+    let hdrs = map{};
+    if is_map(headers) {
+        let ks = map_keys(headers);
+        let i = 0;
+        while i < len(ks) {
+            hdrs[ks[i]] = str(headers[ks[i]]);
+            i = i + 1;
+        }
+    }
+    let body_b = [];
+    if body != nil {
+        body_b = if is_array(body) { body } else { str_to_bytes(str(body)) };
+        hdrs["Content-Length"] = str(len(body_b));
+    }
+    let lines = [m + " " + p + " HTTP/1.0\r\n"];
+    let hks = map_keys(hdrs);
+    let j = 0;
+    while j < len(hks) {
+        HTTP1.validate_header_clean(hks[j], hdrs[hks[j]]);
+        array_push(lines, hks[j] + ": " + hdrs[hks[j]] + "\r\n");
+        j = j + 1;
+    }
+    array_push(lines, "\r\n");
+    let out = str_to_bytes(array_join(lines, ""));
+    if len(body_b) > 0 {
+        _append_bytes(out, body_b);
+    }
+    return out;
+}
+
+fn decode_http10_response(raw_bytes_or_str) {
+    let raw_s = if is_array(raw_bytes_or_str) { bytes_to_str(raw_bytes_or_str) } else { str(raw_bytes_or_str) };
+    let sep = str_index_of(raw_s, "\r\n\r\n");
+    if sep < 0 {
+        return decode_http09_response(raw_bytes_or_str);
+    }
+    let head_part = str_slice(raw_s, 0, sep);
+    let body_part = str_slice(raw_s, sep + 4, len(raw_s));
+    let lines = str_split(head_part, "\r\n");
+    let status_line = lines[0];
+    let sp1 = str_index_of(status_line, " ");
+    if sp1 < 0 {
+        throw "http2_http3_adaptive: malformed HTTP/1.0 status line";
+    }
+    let ver = str_slice(status_line, 0, sp1);
+    let after = str_trim(str_slice(status_line, sp1 + 1, len(status_line)));
+    let sp2 = str_index_of(after, " ");
+    let code_s = if sp2 >= 0 { str_slice(after, 0, sp2) } else { after };
+    let reason = if sp2 >= 0 { str_trim(str_slice(after, sp2 + 1, len(after))) } else { "" };
+    let status = parse_number(code_s);
+
+    let headers = map{};
+    let i = 1;
+    while i < len(lines) {
+        let hl = lines[i];
+        let c = str_index_of(hl, ":");
+        if c > 0 {
+            headers[str_lower(str_trim(str_slice(hl, 0, c)))] = str_trim(str_slice(hl, c + 1, len(hl)));
+        }
+        i = i + 1;
+    }
+    let conn_v = str_lower(_opt(headers, "connection", "close"));
+    return map{
+        version: ver,
+        status: status,
+        ok: status >= 200 and status < 300,
+        reason: reason,
+        headers: headers,
+        keep_alive: conn_v == "keep-alive",
+        body: body_part,
+        body_bytes: str_to_bytes(body_part)
+    };
+}
+
+// ============================================================================
+// 2. RFC 7541 HPACK Static Table (61 Entries), Dynamic Table & Prefix Codec
+// ============================================================================
+
+let HPACK_STATIC_TABLE = [
+    [":authority", ""],
+    [":method", "GET"],
+    [":method", "POST"],
+    [":path", "/"],
+    [":path", "/index.html"],
+    [":scheme", "http"],
+    [":scheme", "https"],
+    [":status", "200"],
+    [":status", "204"],
+    [":status", "206"],
+    [":status", "304"],
+    [":status", "400"],
+    [":status", "404"],
+    [":status", "500"],
+    ["accept-charset", ""],
+    ["accept-encoding", "gzip, deflate"],
+    ["accept-language", ""],
+    ["accept-ranges", ""],
+    ["accept", ""],
+    ["access-control-allow-origin", ""],
+    ["age", ""],
+    ["allow", ""],
+    ["authorization", ""],
+    ["cache-control", ""],
+    ["content-disposition", ""],
+    ["content-encoding", ""],
+    ["content-language", ""],
+    ["content-length", ""],
+    ["content-location", ""],
+    ["content-range", ""],
+    ["content-type", ""],
+    ["cookie", ""],
+    ["date", ""],
+    ["etag", ""],
+    ["expect", ""],
+    ["expires", ""],
+    ["from", ""],
+    ["host", ""],
+    ["if-match", ""],
+    ["if-modified-since", ""],
+    ["if-none-match", ""],
+    ["if-range", ""],
+    ["if-unmodified-since", ""],
+    ["last-modified", ""],
+    ["link", ""],
+    ["location", ""],
+    ["max-forwards", ""],
+    ["proxy-authenticate", ""],
+    ["proxy-authorization", ""],
+    ["range", ""],
+    ["referer", ""],
+    ["refresh", ""],
+    ["retry-after", ""],
+    ["server", ""],
+    ["set-cookie", ""],
+    ["strict-transport-security", ""],
+    ["transfer-encoding", ""],
+    ["user-agent", ""],
+    ["vary", ""],
+    ["via", ""],
+    ["www-authenticate", ""]
+];
+
+fn hpack_encode_int(val, prefix_bits, high_bits_mask) {
+    let max_prefix = bit_shl(1, prefix_bits) - 1;
+    let out = [];
+    let n = num_floor(val);
+    if n < max_prefix {
+        array_push(out, bit_or(high_bits_mask, n));
+        return out;
+    }
+    array_push(out, bit_or(high_bits_mask, max_prefix));
+    n = n - max_prefix;
+    while n >= 128 {
+        array_push(out, bit_or(128, bit_and(n, 127)));
+        n = num_floor(n / 128);
+    }
+    array_push(out, n);
+    return out;
+}
+
+fn hpack_decode_int(b, pos, prefix_bits) {
+    if pos >= len(b) {
+        throw "http2_http3_adaptive: truncated HPACK/QPACK integer";
+    }
+    let max_prefix = bit_shl(1, prefix_bits) - 1;
+    let val = bit_and(b[pos], max_prefix);
+    let p = pos + 1;
+    if val < max_prefix {
+        return map{ value: val, next: p };
+    }
+    let mult = 1;
+    let steps = 0;
+    while true {
+        if p >= len(b) {
+            throw "http2_http3_adaptive: truncated multi-byte HPACK/QPACK integer";
+        }
+        steps = steps + 1;
+        if steps > 8 {
+            throw "http2_http3_adaptive: HPACK/QPACK integer overflow";
+        }
+        let octet = b[p];
+        p = p + 1;
+        val = val + bit_and(octet, 127) * mult;
+        if bit_and(octet, 128) == 0 {
+            break;
+        }
+        mult = mult * 128;
+    }
+    return map{ value: val, next: p };
+}
+
+fn _hpack_encode_str(s) {
+    let sb = str_to_bytes(str(s));
+    let out = hpack_encode_int(len(sb), 7, 0); // H=0 raw octet string
+    _append_bytes(out, sb);
+    return out;
+}
+
+fn _hpack_decode_str(b, pos) {
+    if pos >= len(b) {
+        throw "http2_http3_adaptive: truncated HPACK/QPACK string literal";
+    }
+    let huff = bit_and(b[pos], 128) != 0;
+    let len_res = hpack_decode_int(b, pos, 7);
+    let slen = len_res.value;
+    let start = len_res.next;
+    if start + slen > len(b) {
+        throw "http2_http3_adaptive: HPACK/QPACK string literal exceeds block bounds";
+    }
+    let raw = slice(b, start, start + slen);
+    if huff {
+        throw "http2_http3_adaptive: unsupported Huffman literal in strict raw mode";
+    }
+    return map{ text: bytes_to_str(raw), byte_len: slen, next: start + slen };
+}
+
+fn hpack_new_context(max_table_size = 4096) {
+    if max_table_size < 0 or max_table_size > H2_MAX_DYNAMIC_TABLE_BYTES {
+        throw "http2_http3_adaptive: HPACK dynamic table size must be 0.." + str(H2_MAX_DYNAMIC_TABLE_BYTES);
+    }
+    return map{
+        format: "pblang.net.hpack_context.v1",
+        max_size: max_table_size,
+        hard_ceiling: H2_MAX_DYNAMIC_TABLE_BYTES,
+        current_size: 0,
+        entries: [] // newest at index 0 -> HPACK index 62 + i
+    };
+}
+
+fn _hpack_entry_size(name_s, val_s) {
+    return len(str_to_bytes(name_s)) + len(str_to_bytes(val_s)) + 32;
+}
+
+fn _hpack_evict_to_fit(ctx, target_size) {
+    while len(ctx.entries) > 0 and ctx.current_size > target_size {
+        let last_idx = len(ctx.entries) - 1;
+        let evicted = ctx.entries[last_idx];
+        ctx.current_size = ctx.current_size - evicted.size;
+        ctx.entries = slice(ctx.entries, 0, last_idx);
+    }
+    if len(ctx.entries) == 0 {
+        ctx.current_size = 0;
+    }
+}
+
+fn hpack_set_max_table_size(ctx, new_max) {
+    if new_max < 0 or new_max > H2_MAX_DYNAMIC_TABLE_BYTES {
+        throw "http2_http3_adaptive: COMPRESSION_ERROR HPACK dynamic table size " + str(new_max) + " exceeds hard cap (" + str(H2_MAX_DYNAMIC_TABLE_BYTES) + ")";
+    }
+    ctx.max_size = new_max;
+    _hpack_evict_to_fit(ctx, new_max);
+}
+
+fn _hpack_insert_dynamic(ctx, name_s, val_s) {
+    let esz = _hpack_entry_size(name_s, val_s);
+    if esz > ctx.max_size {
+        ctx.entries = [];
+        ctx.current_size = 0;
+        return;
+    }
+    _hpack_evict_to_fit(ctx, ctx.max_size - esz);
+    let next_entries = [map{ name: name_s, value: val_s, size: esz }];
+    _append_bytes(next_entries, ctx.entries);
+    ctx.entries = next_entries;
+    ctx.current_size = ctx.current_size + esz;
+}
+
+fn _hpack_get_by_index(ctx, idx) {
+    if idx < 1 {
+        throw "http2_http3_adaptive: HPACK index 0 is invalid (COMPRESSION_ERROR)";
+    }
+    let st_len = len(HPACK_STATIC_TABLE); // 61
+    if idx <= st_len {
+        let pair = HPACK_STATIC_TABLE[idx - 1];
+        return map{ name: pair[0], value: pair[1] };
+    }
+    let dyn_pos = idx - st_len - 1;
+    if dyn_pos >= len(ctx.entries) {
+        throw "http2_http3_adaptive: HPACK dynamic index " + str(idx) + " out of bounds (COMPRESSION_ERROR)";
+    }
+    let e = ctx.entries[dyn_pos];
+    return map{ name: e.name, value: e.value };
+}
+
+fn _hpack_lookup(ctx, name_s, val_s) {
+    let name_idx = 0;
+    let i = 0;
+    let st_len = len(HPACK_STATIC_TABLE);
+    while i < st_len {
+        let p = HPACK_STATIC_TABLE[i];
+        if p[0] == name_s {
+            if p[1] == val_s {
+                return map{ exact_idx: i + 1, name_idx: i + 1 };
+            }
+            if name_idx == 0 { name_idx = i + 1; }
+        }
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(ctx.entries) {
+        let e = ctx.entries[j];
+        let full_idx = st_len + 1 + j;
+        if e.name == name_s {
+            if e.value == val_s {
+                return map{ exact_idx: full_idx, name_idx: full_idx };
+            }
+            if name_idx == 0 { name_idx = full_idx; }
+        }
+        j = j + 1;
+    }
+    return map{ exact_idx: 0, name_idx: name_idx };
+}
+
+fn hpack_encode_headers(ctx, headers_in) {
+    let pairs = _normalize_header_pairs(headers_in);
+    let out = [];
+    let i = 0;
+    while i < len(pairs) {
+        let h = pairs[i];
+        let lk = _hpack_lookup(ctx, h.name, h.value);
+        if not h.never_index and lk.exact_idx > 0 {
+            // 1xxxxxxx — Indexed Header Field (7-bit prefix)
+            _append_bytes(out, hpack_encode_int(lk.exact_idx, 7, 128));
+        } elif h.never_index {
+            // 0001xxxx — Literal Header Field Never Indexed (4-bit prefix)
+            if lk.name_idx > 0 {
+                _append_bytes(out, hpack_encode_int(lk.name_idx, 4, 16));
+            } else {
+                array_push(out, 16);
+                _append_bytes(out, _hpack_encode_str(h.name));
+            }
+            _append_bytes(out, _hpack_encode_str(h.value));
+        } else {
+            // 01xxxxxx — Literal Header Field with Incremental Indexing (6-bit prefix)
+            if lk.name_idx > 0 {
+                _append_bytes(out, hpack_encode_int(lk.name_idx, 6, 64));
+            } else {
+                array_push(out, 64);
+                _append_bytes(out, _hpack_encode_str(h.name));
+            }
+            _append_bytes(out, _hpack_encode_str(h.value));
+            _hpack_insert_dynamic(ctx, h.name, h.value);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _push_validated_decoded_header(decoded, seen_state, hname, hval, is_sens, total_bytes_so_far, max_list_sz) {
+    if len(decoded) >= H2_MAX_HEADER_COUNT {
+        throw "http2_http3_adaptive: HPACK/QPACK decompression bomb blocked (>" + str(H2_MAX_HEADER_COUNT) + " headers)";
+    }
+    _validate_h2_h3_header_field(hname, hval);
+    let next_total = total_bytes_so_far + _hpack_entry_size(hname, hval);
+    if next_total > max_list_sz or next_total > H2_HARD_MAX_HEADER_LIST {
+        throw "http2_http3_adaptive: decoded header list exceeds max size (64 KiB cap)";
+    }
+    if str_starts_with(hname, ":") {
+        if seen_state.seen_regular {
+            throw "http2_http3_adaptive: PROTOCOL_ERROR pseudo-header '" + hname + "' received after regular header";
+        }
+        if map_has(seen_state.pseudos, hname) {
+            throw "http2_http3_adaptive: PROTOCOL_ERROR duplicate pseudo-header '" + hname + "'";
+        }
+        seen_state.pseudos[hname] = true;
+    } else {
+        seen_state.seen_regular = true;
+    }
+    array_push(decoded, map{ name: hname, value: hval, sensitive: is_sens });
+    return next_total;
+}
+
+fn hpack_decode_headers(ctx, block_bytes, max_header_list_size = 65536) {
+    let eff_max = if max_header_list_size > H2_HARD_MAX_HEADER_LIST { H2_HARD_MAX_HEADER_LIST } else { max_header_list_size };
+    let b = if is_array(block_bytes) { block_bytes } else { str_to_bytes(str(block_bytes)) };
+    let pos = 0;
+    let n = len(b);
+    let decoded = [];
+    let total_list_bytes = 0;
+    let seen_non_update = false;
+    let seen_state = map{ seen_regular: false, pseudos: map{} };
+
+    while pos < n {
+        let first = b[pos];
+        if bit_and(first, 128) != 0 {
+            // 1xxxxxxx: Indexed Header Field
+            seen_non_update = true;
+            let ir = hpack_decode_int(b, pos, 7);
+            pos = ir.next;
+            let entry = _hpack_get_by_index(ctx, ir.value);
+            total_list_bytes = _push_validated_decoded_header(decoded, seen_state, entry.name, entry.value, false, total_list_bytes, eff_max);
+        } elif bit_and(first, 192) == 64 {
+            // 01xxxxxx: Literal Header Field with Incremental Indexing
+            seen_non_update = true;
+            let nr = hpack_decode_int(b, pos, 6);
+            pos = nr.next;
+            let hname = "";
+            if nr.value > 0 {
+                hname = _hpack_get_by_index(ctx, nr.value).name;
+            } else {
+                let ns = _hpack_decode_str(b, pos);
+                hname = ns.text;
+                pos = ns.next;
+            }
+            let vs = _hpack_decode_str(b, pos);
+            pos = vs.next;
+            total_list_bytes = _push_validated_decoded_header(decoded, seen_state, hname, vs.text, false, total_list_bytes, eff_max);
+            _hpack_insert_dynamic(ctx, hname, vs.text);
+        } elif bit_and(first, 224) == 32 {
+            // 001xxxxx: Dynamic Table Size Update (RFC 7541 §4.2: only allowed at start of header block)
+            if seen_non_update {
+                throw "http2_http3_adaptive: HPACK dynamic table size update after header field (COMPRESSION_ERROR)";
+            }
+            let sr = hpack_decode_int(b, pos, 5);
+            pos = sr.next;
+            hpack_set_max_table_size(ctx, sr.value);
+        } else {
+            // 0000xxxx (Without Indexing) or 0001xxxx (Never Indexed)
+            seen_non_update = true;
+            let is_never = bit_and(first, 240) == 16;
+            let nr2 = hpack_decode_int(b, pos, 4);
+            pos = nr2.next;
+            let hname2 = "";
+            if nr2.value > 0 {
+                hname2 = _hpack_get_by_index(ctx, nr2.value).name;
+            } else {
+                let ns2 = _hpack_decode_str(b, pos);
+                hname2 = ns2.text;
+                pos = ns2.next;
+            }
+            let vs2 = _hpack_decode_str(b, pos);
+            pos = vs2.next;
+            total_list_bytes = _push_validated_decoded_header(decoded, seen_state, hname2, vs2.text, is_never, total_list_bytes, eff_max);
+        }
+    }
+    return decoded;
+}
+
+fn headers_list_to_map(decoded_list) {
+    let m = map{};
+    let i = 0;
+    while i < len(decoded_list) {
+        let e = decoded_list[i];
+        let ename = if is_array(e) { str(e[0]) } else { str(e.name) };
+        let eval_s = if is_array(e) { str(e[1]) } else { str(e.value) };
+        if map_has(m, ename) and ename == "cookie" {
+            m[ename] = m[ename] + "; " + eval_s;
+        } elif map_has(m, ename) and not str_starts_with(ename, ":") {
+            m[ename] = m[ename] + ", " + eval_s;
+        } else {
+            m[ename] = eval_s;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+// ============================================================================
+// 3. HTTP/2 9-Byte Frame Codec, Stream Multiplexer & CVE DoS Shields (RFC 9113)
+// ============================================================================
+
+fn h2_encode_frame(frame_type, flags, stream_id, payload_bytes = nil) {
+    let pay = if payload_bytes == nil {
+        []
+    } elif is_array(payload_bytes) {
+        payload_bytes
+    } else {
+        str_to_bytes(str(payload_bytes))
+    };
+    let plen = len(pay);
+    if plen > H2_HARD_MAX_FRAME_SIZE {
+        throw "http2_http3_adaptive: HTTP/2 frame payload exceeds hard 1 MiB ceiling (" + str(H2_HARD_MAX_FRAME_SIZE) + ")";
+    }
+    let clean_sid = bit_and(num_floor(stream_id), 2147483647); // Mask reserved R bit (0x7FFFFFFF)
+    let out = [];
+    _push_u24_be(out, plen);
+    array_push(out, bit_and(frame_type, 255));
+    array_push(out, bit_and(flags, 255));
+    _push_u32_be(out, clean_sid);
+    _append_bytes(out, pay);
+    return out;
+}
+
+fn h2_decode_frame(buf, pos = 0, max_frame_size = 16384) {
+    let eff_max = if max_frame_size > H2_HARD_MAX_FRAME_SIZE { H2_HARD_MAX_FRAME_SIZE } else { max_frame_size };
+    let b = if is_array(buf) { buf } else { str_to_bytes(str(buf)) };
+    if pos + 9 > len(b) {
+        throw "http2_http3_adaptive: truncated 9-byte HTTP/2 frame header";
+    }
+    let plen = _read_u24_be(b, pos);
+    if plen > eff_max {
+        throw "http2_http3_adaptive: HTTP/2 FRAME_SIZE_ERROR (length " + str(plen) + " > " + str(eff_max) + ")";
+    }
+    let ftype = b[pos + 3];
+    let flags = b[pos + 4];
+    let raw_sid = _read_u32_be(b, pos + 5);
+    let sid = bit_and(raw_sid, 2147483647); // Mask R bit per RFC 9113 §4.1
+    let end_pos = pos + 9 + plen;
+    if end_pos > len(b) {
+        throw "http2_http3_adaptive: truncated HTTP/2 frame payload";
+    }
+    return map{
+        length: plen,
+        type: ftype,
+        flags: flags,
+        stream_id: sid,
+        payload: slice(b, pos + 9, end_pos),
+        next: end_pos
+    };
+}
+
+fn h2_read_frame_tcp(handle, max_frame_size = 16384) {
+    let eff_max = if max_frame_size > H2_HARD_MAX_FRAME_SIZE { H2_HARD_MAX_FRAME_SIZE } else { max_frame_size };
+    let hdr9 = _read_exact_bytes(handle, 9);
+    let plen = _read_u24_be(hdr9, 0);
+    if plen > eff_max {
+        throw "http2_http3_adaptive: HTTP/2 FRAME_SIZE_ERROR (" + str(plen) + " > " + str(eff_max) + ")";
+    }
+    let ftype = hdr9[3];
+    let flags = hdr9[4];
+    let sid = bit_and(_read_u32_be(hdr9, 5), 2147483647);
+    let payload = if plen > 0 { _read_exact_bytes(handle, plen) } else { [] };
+    return map{
+        length: plen,
+        type: ftype,
+        flags: flags,
+        stream_id: sid,
+        payload: payload
+    };
+}
+
+fn h2_write_frame_tcp(handle, frame_bytes) {
+    return tcp_write(handle, frame_bytes);
+}
+
+fn h2_encode_settings(settings_pairs, is_ack = false) {
+    if is_ack {
+        return h2_encode_frame(H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, []);
+    }
+    let pay = [];
+    if is_array(settings_pairs) {
+        let i = 0;
+        while i < len(settings_pairs) {
+            let p = settings_pairs[i];
+            _push_u16_be(pay, p[0]);
+            _push_u32_be(pay, p[1]);
+            i = i + 1;
+        }
+    } elif is_map(settings_pairs) {
+        let ks = map_keys(settings_pairs);
+        let j = 0;
+        while j < len(ks) {
+            let id_num = parse_number(ks[j]);
+            _push_u16_be(pay, id_num);
+            _push_u32_be(pay, settings_pairs[ks[j]]);
+            j = j + 1;
+        }
+    }
+    return h2_encode_frame(H2_FRAME_SETTINGS, H2_FLAG_NONE, 0, pay);
+}
+
+fn h2_decode_settings(frame) {
+    if frame.stream_id != 0 {
+        throw "http2_http3_adaptive: SETTINGS frame on non-zero stream (PROTOCOL_ERROR)";
+    }
+    let is_ack = bit_and(frame.flags, H2_FLAG_ACK) != 0;
+    if is_ack {
+        if len(frame.payload) != 0 {
+            throw "http2_http3_adaptive: SETTINGS ACK with non-empty payload (FRAME_SIZE_ERROR)";
+        }
+        return map{ ack: true, values: map{} };
+    }
+    if len(frame.payload) % 6 != 0 {
+        throw "http2_http3_adaptive: SETTINGS payload length not a multiple of 6 (FRAME_SIZE_ERROR)";
+    }
+    let vals = map{};
+    let pos = 0;
+    while pos < len(frame.payload) {
+        let sid = _read_u16_be(frame.payload, pos);
+        let sval = _read_u32_be(frame.payload, pos + 2);
+        vals[str(sid)] = sval;
+        pos = pos + 6;
+    }
+    return map{ ack: false, values: vals };
+}
+
+fn h2_encode_window_update(stream_id, increment) {
+    if increment < 1 or increment > 2147483647 {
+        throw "http2_http3_adaptive: invalid WINDOW_UPDATE increment";
+    }
+    let pay = [];
+    _push_u32_be(pay, bit_and(increment, 2147483647));
+    return h2_encode_frame(H2_FRAME_WINDOW_UPDATE, H2_FLAG_NONE, stream_id, pay);
+}
+
+fn h2_encode_rst_stream(stream_id, error_code) {
+    if stream_id == 0 {
+        throw "http2_http3_adaptive: RST_STREAM requires non-zero stream_id";
+    }
+    let pay = [];
+    _push_u32_be(pay, error_code);
+    return h2_encode_frame(H2_FRAME_RST_STREAM, H2_FLAG_NONE, stream_id, pay);
+}
+
+fn h2_encode_ping(opaque8 = nil, is_ack = false) {
+    let pay = if is_array(opaque8) and len(opaque8) == 8 { opaque8 } else { [0, 1, 2, 3, 4, 5, 6, 7] };
+    return h2_encode_frame(H2_FRAME_PING, if is_ack { H2_FLAG_ACK } else { 0 }, 0, pay);
+}
+
+fn h2_encode_goaway(last_stream_id, error_code, debug_msg = "") {
+    let pay = [];
+    _push_u32_be(pay, bit_and(last_stream_id, 2147483647));
+    _push_u32_be(pay, error_code);
+    if debug_msg != "" {
+        _append_bytes(pay, str_to_bytes(debug_msg));
+    }
+    return h2_encode_frame(H2_FRAME_GOAWAY, H2_FLAG_NONE, 0, pay);
+}
+
+fn h2_decode_goaway(frame) {
+    if len(frame.payload) < 8 {
+        throw "http2_http3_adaptive: malformed GOAWAY payload";
+    }
+    return map{
+        last_stream_id: bit_and(_read_u32_be(frame.payload, 0), 2147483647),
+        error_code: _read_u32_be(frame.payload, 4),
+        debug_data: if len(frame.payload) > 8 { bytes_to_str(slice(frame.payload, 8, len(frame.payload))) } else { "" }
+    };
+}
+
+// ── Cycle-Free HTTP/2 Multiplexer State Machine (Safe for `spawn`) ───────────
+
+fn h2_new_connection(role = "client", opts = nil) {
+    let is_client = str_lower(str(role)) != "server";
+    let init_win = _opt(opts, "initial_window_size", 65535);
+    let raw_max_frame = _opt(opts, "max_frame_size", 16384);
+    let max_frame = if raw_max_frame > H2_HARD_MAX_FRAME_SIZE { H2_HARD_MAX_FRAME_SIZE } else { raw_max_frame };
+    let raw_max_hdr = _opt(opts, "max_header_list_size", 65536);
+    let max_hdr_list = if raw_max_hdr > H2_HARD_MAX_HEADER_LIST { H2_HARD_MAX_HEADER_LIST } else { raw_max_hdr };
+    let max_rst = _opt(opts, "max_rst_per_window", 64);
+    let rst_win_ms = _opt(opts, "rst_window_ms", 1000);
+    let raw_cont = _opt(opts, "max_continuation_frames", 8);
+    let max_cont = if raw_cont > 8 { 8 } else { raw_cont };
+    let max_conc = _opt(opts, "max_concurrent_streams", 100);
+
+    return map{
+        format: "pblang.net.h2_connection.v1",
+        role: if is_client { "client" } else { "server" },
+        next_stream_id: if is_client { 1 } else { 2 },
+        last_peer_stream_id: 0,
+        send_window: init_win,
+        recv_window: init_win,
+        initial_window_size: init_win,
+        max_frame_size: max_frame,
+        max_header_list_size: max_hdr_list,
+        max_concurrent_streams: max_conc,
+        encoder_hpack: hpack_new_context(4096),
+        decoder_hpack: hpack_new_context(4096),
+        streams: map{},
+        pending_header_stream: 0,
+        pending_header_end_stream: false,
+        pending_header_buf: [],
+        pending_continuation_count: 0,
+        max_continuation_frames: max_cont,
+        rst_timestamps_ms: [],
+        max_rst_per_window: max_rst,
+        rst_window_ms: rst_win_ms,
+        goaway_sent: false,
+        goaway_frame: nil,
+        goaway_error_code: 0,
+        raw_header_bytes_in: 0,
+        raw_header_bytes_out: 0,
+        compressed_header_bytes_out: 0
+    };
+}
+
+fn _h2_ensure_stream(conn, stream_id) {
+    let k = str(stream_id);
+    if not map_has(conn.streams, k) {
+        if len(map_keys(conn.streams)) >= 1024 {
+            throw "http2_http3_adaptive: HTTP/2 stream table memory bound exceeded";
+        }
+        conn.streams[k] = map{
+            id: stream_id,
+            state: "idle", // idle -> open -> half_closed_local | half_closed_remote -> closed
+            send_window: conn.initial_window_size,
+            recv_window: conn.initial_window_size,
+            headers_list: [],
+            headers: map{},
+            data_bytes: [],
+            rst_error: nil,
+            end_stream_received: false,
+            end_stream_sent: false
+        };
+    }
+    return conn.streams[k];
+}
+
+fn h2_open_stream(conn) {
+    let sid = conn.next_stream_id;
+    conn.next_stream_id = sid + 2; // Client uses odd stream IDs: 1, 3, 5...
+    let st = _h2_ensure_stream(conn, sid);
+    st.state = "open";
+    return sid;
+}
+
+fn h2_build_request_frames(conn, stream_id, headers_in, body_bytes_or_str = nil) {
+    let st = _h2_ensure_stream(conn, stream_id);
+    if st.state == "idle" { st.state = "open"; }
+
+    let norm_pairs = _normalize_header_pairs(headers_in);
+    conn.raw_header_bytes_out = conn.raw_header_bytes_out + _raw_uncompressed_header_bytes(norm_pairs);
+
+    let hblock = hpack_encode_headers(conn.encoder_hpack, norm_pairs);
+    conn.compressed_header_bytes_out = conn.compressed_header_bytes_out + len(hblock);
+
+    let body_b = [];
+    if body_bytes_or_str != nil {
+        body_b = if is_array(body_bytes_or_str) { body_bytes_or_str } else { str_to_bytes(str(body_bytes_or_str)) };
+    }
+    let has_body = len(body_b) > 0;
+    let frames = [];
+
+    let h_flags = H2_FLAG_END_HEADERS;
+    if not has_body {
+        h_flags = bit_or(h_flags, H2_FLAG_END_STREAM);
+        st.end_stream_sent = true;
+        st.state = if st.state == "half_closed_remote" { "closed" } else { "half_closed_local" };
+    }
+    array_push(frames, h2_encode_frame(H2_FRAME_HEADERS, h_flags, stream_id, hblock));
+
+    if has_body {
+        let offset = 0;
+        let total = len(body_b);
+        while offset < total {
+            let take = if total - offset > conn.max_frame_size { conn.max_frame_size } else { total - offset };
+            let is_last = (offset + take >= total);
+            let d_flags = if is_last { H2_FLAG_END_STREAM } else { H2_FLAG_NONE };
+            array_push(frames, h2_encode_frame(H2_FRAME_DATA, d_flags, stream_id, slice(body_b, offset, offset + take)));
+            conn.send_window = conn.send_window - take;
+            st.send_window = st.send_window - take;
+            offset = offset + take;
+        }
+        st.end_stream_sent = true;
+        st.state = if st.state == "half_closed_remote" { "closed" } else { "half_closed_local" };
+    }
+    return frames;
+}
+
+fn h2_build_response_frames(conn, stream_id, status_code, headers_in = nil, body_bytes_or_str = nil) {
+    let pairs = [[":status", str(status_code)]];
+    if headers_in != nil {
+        let extra = _normalize_header_pairs(headers_in);
+        let i = 0;
+        while i < len(extra) {
+            if extra[i].name != ":status" {
+                array_push(pairs, [extra[i].name, extra[i].value, extra[i].never_index]);
+            }
+            i = i + 1;
+        }
+    }
+    return h2_build_request_frames(conn, stream_id, pairs, body_bytes_or_str);
+}
+
+fn _h2_trigger_calm_goaway(conn, reason_msg) {
+    conn.goaway_sent = true;
+    conn.goaway_error_code = H2_ENHANCE_YOUR_CALM;
+    conn.goaway_frame = h2_encode_goaway(conn.last_peer_stream_id, H2_ENHANCE_YOUR_CALM, reason_msg);
+    return map{
+        ok: false,
+        goaway: true,
+        error_code: H2_ENHANCE_YOUR_CALM,
+        reason: reason_msg,
+        goaway_frame: conn.goaway_frame
+    };
+}
+
+fn h2_receive_frame(conn, frame) {
+    if is_array(frame) {
+        frame = h2_decode_frame(frame, 0, conn.max_frame_size);
+    }
+    let ftype = frame.type;
+    let flags = frame.flags;
+    let sid = frame.stream_id;
+
+    // CVE-2024-27316 CONTINUATION lock & flood shield:
+    // While an incomplete header block is open, ONLY CONTINUATION for the exact same stream_id is valid!
+    if conn.pending_header_stream != 0 {
+        if ftype != H2_FRAME_CONTINUATION or sid != conn.pending_header_stream {
+            throw "http2_http3_adaptive: HTTP/2 PROTOCOL_ERROR (expected CONTINUATION on stream " + str(conn.pending_header_stream) + ")";
+        }
+        conn.pending_continuation_count = conn.pending_continuation_count + 1;
+        if conn.pending_continuation_count > conn.max_continuation_frames {
+            return _h2_trigger_calm_goaway(conn, "CVE-2024-27316 CONTINUATION frame flood blocked");
+        }
+        if len(conn.pending_header_buf) + len(frame.payload) > conn.max_header_list_size {
+            return _h2_trigger_calm_goaway(conn, "CVE-2024-27316 header block size flood blocked");
+        }
+        _append_bytes(conn.pending_header_buf, frame.payload);
+        if bit_and(flags, H2_FLAG_END_HEADERS) != 0 {
+            let st_c = _h2_ensure_stream(conn, sid);
+            let dec_c = hpack_decode_headers(conn.decoder_hpack, conn.pending_header_buf, conn.max_header_list_size);
+            st_c.headers_list = dec_c;
+            st_c.headers = headers_list_to_map(dec_c);
+            if conn.pending_header_end_stream {
+                st_c.end_stream_received = true;
+                st_c.state = if st_c.state == "half_closed_local" { "closed" } else { "half_closed_remote" };
+            }
+            conn.pending_header_stream = 0;
+            conn.pending_header_buf = [];
+            conn.pending_continuation_count = 0;
+            return map{ ok: true, event: "headers", stream_id: sid, end_stream: st_c.end_stream_received, stream: st_c };
+        }
+        return map{ ok: true, event: "continuation_buffered", stream_id: sid };
+    }
+
+    if ftype == H2_FRAME_SETTINGS {
+        let sres = h2_decode_settings(frame);
+        if not sres.ack {
+            if map_has(sres.values, str(H2_SETTINGS_HEADER_TABLE_SIZE)) {
+                let req_tsz = sres.values[str(H2_SETTINGS_HEADER_TABLE_SIZE)];
+                let bounded_tsz = if req_tsz > H2_MAX_DYNAMIC_TABLE_BYTES { H2_MAX_DYNAMIC_TABLE_BYTES } else { req_tsz };
+                hpack_set_max_table_size(conn.encoder_hpack, bounded_tsz);
+            }
+            if map_has(sres.values, str(H2_SETTINGS_INITIAL_WINDOW_SIZE)) {
+                let iw = sres.values[str(H2_SETTINGS_INITIAL_WINDOW_SIZE)];
+                if iw > 2147483647 {
+                    throw "http2_http3_adaptive: HTTP/2 FLOW_CONTROL_ERROR invalid SETTINGS_INITIAL_WINDOW_SIZE";
+                }
+                conn.initial_window_size = iw;
+            }
+            if map_has(sres.values, str(H2_SETTINGS_MAX_FRAME_SIZE)) {
+                let mf = sres.values[str(H2_SETTINGS_MAX_FRAME_SIZE)];
+                if mf < 16384 or mf > 16777215 {
+                    throw "http2_http3_adaptive: HTTP/2 PROTOCOL_ERROR invalid SETTINGS_MAX_FRAME_SIZE";
+                }
+                conn.max_frame_size = if mf > H2_HARD_MAX_FRAME_SIZE { H2_HARD_MAX_FRAME_SIZE } else { mf };
+            }
+        }
+        return map{ ok: true, event: if sres.ack { "settings_ack" } else { "settings" }, values: sres.values };
+    }
+
+    if ftype == H2_FRAME_HEADERS {
+        if sid == 0 {
+            throw "http2_http3_adaptive: HTTP/2 PROTOCOL_ERROR HEADERS on stream 0";
+        }
+        if sid > conn.last_peer_stream_id {
+            conn.last_peer_stream_id = sid;
+        }
+        let st_h = _h2_ensure_stream(conn, sid);
+        if st_h.state == "idle" { st_h.state = "open"; }
+
+        let hpay = frame.payload;
+        let hpos = 0;
+        let hend = len(hpay);
+        if bit_and(flags, H2_FLAG_PADDED) != 0 {
+            let pad_len = hpay[0];
+            hpos = 1;
+            hend = hend - pad_len;
+        }
+        if bit_and(flags, H2_FLAG_PRIORITY) != 0 {
+            hpos = hpos + 5;
+        }
+        let fragment = slice(hpay, hpos, hend);
+        let end_stream = bit_and(flags, H2_FLAG_END_STREAM) != 0;
+        let end_headers = bit_and(flags, H2_FLAG_END_HEADERS) != 0;
+
+        if not end_headers {
+            conn.pending_header_stream = sid;
+            conn.pending_header_end_stream = end_stream;
+            conn.pending_header_buf = fragment;
+            conn.pending_continuation_count = 0;
+            return map{ ok: true, event: "headers_incomplete", stream_id: sid };
+        }
+
+        let dec = hpack_decode_headers(conn.decoder_hpack, fragment, conn.max_header_list_size);
+        st_h.headers_list = dec;
+        st_h.headers = headers_list_to_map(dec);
+        if end_stream {
+            st_h.end_stream_received = true;
+            st_h.state = if st_h.state == "half_closed_local" { "closed" } else { "half_closed_remote" };
+        }
+        return map{ ok: true, event: "headers", stream_id: sid, end_stream: end_stream, stream: st_h };
+    }
+
+    if ftype == H2_FRAME_DATA {
+        if sid == 0 {
+            throw "http2_http3_adaptive: HTTP/2 PROTOCOL_ERROR DATA on stream 0";
+        }
+        let st_d = _h2_ensure_stream(conn, sid);
+        if st_d.state == "idle" or st_d.state == "closed" or st_d.state == "half_closed_remote" {
+            throw "http2_http3_adaptive: HTTP/2 STREAM_CLOSED DATA on invalid stream state '" + st_d.state + "'";
+        }
+        let dpay = frame.payload;
+        let dstart = 0;
+        let dend = len(dpay);
+        if bit_and(flags, H2_FLAG_PADDED) != 0 {
+            let dpad = dpay[0];
+            dstart = 1;
+            dend = dend - dpad;
+        }
+        let chunk = slice(dpay, dstart, dend);
+        _append_bytes(st_d.data_bytes, chunk);
+        conn.recv_window = conn.recv_window - len(dpay);
+        st_d.recv_window = st_d.recv_window - len(dpay);
+
+        let end_s = bit_and(flags, H2_FLAG_END_STREAM) != 0;
+        if end_s {
+            st_d.end_stream_received = true;
+            st_d.state = if st_d.state == "half_closed_local" { "closed" } else { "half_closed_remote" };
+        }
+        return map{ ok: true, event: "data", stream_id: sid, bytes_len: len(chunk), end_stream: end_s, stream: st_d };
+    }
+
+    if ftype == H2_FRAME_RST_STREAM {
+        if sid == 0 or len(frame.payload) != 4 {
+            throw "http2_http3_adaptive: malformed RST_STREAM frame";
+        }
+        // CVE-2023-44487 Rapid Reset Sliding-Window Rate Limiter:
+        let now = now_ms();
+        let cutoff = now - conn.rst_window_ms;
+        let kept = [];
+        let i = 0;
+        while i < len(conn.rst_timestamps_ms) {
+            if conn.rst_timestamps_ms[i] >= cutoff {
+                array_push(kept, conn.rst_timestamps_ms[i]);
+            }
+            i = i + 1;
+        }
+        array_push(kept, now);
+        conn.rst_timestamps_ms = kept;
+
+        let err_c = _read_u32_be(frame.payload, 0);
+        let st_r = _h2_ensure_stream(conn, sid);
+        st_r.state = "closed";
+        st_r.rst_error = err_c;
+
+        if len(kept) > conn.max_rst_per_window {
+            return _h2_trigger_calm_goaway(conn, "CVE-2023-44487 HTTP/2 Rapid Reset rate limit exceeded");
+        }
+        return map{ ok: true, event: "rst_stream", stream_id: sid, error_code: err_c };
+    }
+
+    if ftype == H2_FRAME_WINDOW_UPDATE {
+        if len(frame.payload) != 4 {
+            throw "http2_http3_adaptive: WINDOW_UPDATE FRAME_SIZE_ERROR";
+        }
+        let inc = bit_and(_read_u32_be(frame.payload, 0), 2147483647);
+        if inc == 0 {
+            throw "http2_http3_adaptive: WINDOW_UPDATE increment 0 (PROTOCOL_ERROR)";
+        }
+        if sid == 0 {
+            conn.send_window = conn.send_window + inc;
+        } else {
+            let st_w = _h2_ensure_stream(conn, sid);
+            st_w.send_window = st_w.send_window + inc;
+        }
+        return map{ ok: true, event: "window_update", stream_id: sid, increment: inc };
+    }
+
+    if ftype == H2_FRAME_PING {
+        if sid != 0 or len(frame.payload) != 8 {
+            throw "http2_http3_adaptive: malformed PING frame";
+        }
+        let is_ping_ack = bit_and(flags, H2_FLAG_ACK) != 0;
+        return map{
+            ok: true,
+            event: if is_ping_ack { "ping_ack" } else { "ping" },
+            opaque: frame.payload,
+            ack_frame: if is_ping_ack { nil } else { h2_encode_ping(frame.payload, true) }
+        };
+    }
+
+    if ftype == H2_FRAME_GOAWAY {
+        let ga = h2_decode_goaway(frame);
+        return map{
+            ok: true,
+            event: "goaway",
+            last_stream_id: ga.last_stream_id,
+            error_code: ga.error_code,
+            debug_data: ga.debug_data
+        };
+    }
+
+    if ftype == H2_FRAME_CONTINUATION {
+        throw "http2_http3_adaptive: unexpected CONTINUATION without open HEADERS (PROTOCOL_ERROR)";
+    }
+
+    return map{ ok: true, event: "ignored", type: ftype, stream_id: sid };
+}
+
+fn h2_compression_stats(conn) {
+    let raw_b = conn.raw_header_bytes_out;
+    let comp_b = conn.compressed_header_bytes_out;
+    let ratio_pct = if raw_b > 0 { ((raw_b - comp_b) * 100.0) / raw_b } else { 0.0 };
+    return map{
+        raw_header_bytes: raw_b,
+        compressed_header_bytes: comp_b,
+        savings_pct: ratio_pct,
+        dynamic_table_entries: len(conn.encoder_hpack.entries),
+        dynamic_table_bytes: conn.encoder_hpack.current_size
+    };
+}
+
+// ── Live `h2c` Prior-Knowledge Multiplexed Client & Server over TCP ──────────
+
+fn h2c_exchange_multiplexed(addr, requests_array, opts = nil) {
+    let sock = tcp_connect(addr);
+    let conn = h2_new_connection("client", opts);
+
+    let run = try map{
+        ok: true,
+        val: fn() {
+            // 1. Send 24-byte HTTP/2 client connection preface + initial SETTINGS
+            tcp_write(sock, H2_PREFACE);
+            h2_write_frame_tcp(sock, h2_encode_settings([
+                [H2_SETTINGS_INITIAL_WINDOW_SIZE, 65535],
+                [H2_SETTINGS_MAX_FRAME_SIZE, 16384]
+            ], false));
+
+            // 2. Pipeline all multiplexed request streams over the SINGLE TCP socket
+            let stream_order = [];
+            let i = 0;
+            while i < len(requests_array) {
+                let req = requests_array[i];
+                let sid = h2_open_stream(conn);
+                array_push(stream_order, sid);
+
+                let method = str_upper(str(_opt(req, "method", "GET")));
+                let path = str(_opt(req, "path", "/"));
+                let authority = str(_opt(req, "authority", addr));
+                let scheme = str(_opt(req, "scheme", "http"));
+
+                let hdr_pairs = [
+                    [":method", method],
+                    [":path", path],
+                    [":scheme", scheme],
+                    [":authority", authority]
+                ];
+                let extra_h = _opt(req, "headers", nil);
+                if extra_h != nil {
+                    let norm_ex = _normalize_header_pairs(extra_h);
+                    let e = 0;
+                    while e < len(norm_ex) {
+                        array_push(hdr_pairs, [norm_ex[e].name, norm_ex[e].value, norm_ex[e].never_index]);
+                        e = e + 1;
+                    }
+                }
+                let rframes = h2_build_request_frames(conn, sid, hdr_pairs, _opt(req, "body", nil));
+                let f = 0;
+                while f < len(rframes) {
+                    h2_write_frame_tcp(sock, rframes[f]);
+                    f = f + 1;
+                }
+                i = i + 1;
+            }
+
+            // 3. Receive & demultiplex out-of-order server frames until all streams complete
+            let completed = map{};
+            let done_count = 0;
+            let total_streams = len(stream_order);
+            let arrival_order = [];
+
+            while done_count < total_streams {
+                let frm = h2_read_frame_tcp(sock, conn.max_frame_size);
+                let ev = h2_receive_frame(conn, frm);
+                if not ev.ok and ev.goaway {
+                    h2_write_frame_tcp(sock, ev.goaway_frame);
+                    throw "http2_http3_adaptive: h2c peer violated DoS shield: " + ev.reason;
+                }
+                if (ev.event == "headers" or ev.event == "data") and ev.end_stream {
+                    let sk = str(ev.stream_id);
+                    if not map_has(completed, sk) {
+                        completed[sk] = true;
+                        done_count = done_count + 1;
+                        array_push(arrival_order, ev.stream_id);
+                    }
+                }
+                if ev.event == "settings" {
+                    h2_write_frame_tcp(sock, h2_encode_settings([], true));
+                } elif ev.event == "ping" and ev.ack_frame != nil {
+                    h2_write_frame_tcp(sock, ev.ack_frame);
+                } elif ev.event == "data" and ev.bytes_len > 0 and done_count < total_streams {
+                    // Replenish connection flow-control window while additional streams remain
+                    h2_write_frame_tcp(sock, h2_encode_window_update(0, ev.bytes_len));
+                }
+                if ev.event == "goaway" and ev.error_code != H2_NO_ERROR {
+                    throw "http2_http3_adaptive: server sent GOAWAY error=" + str(ev.error_code);
+                }
+            }
+
+            let responses = [];
+            let by_stream = map{};
+            let k = 0;
+            while k < len(stream_order) {
+                let s_id = stream_order[k];
+                let st_obj = conn.streams[str(s_id)];
+                let st_code = parse_number(_opt(st_obj.headers, ":status", "200"));
+                let resp_item = map{
+                    protocol: "HTTP/2",
+                    stream_id: s_id,
+                    status: st_code,
+                    ok: st_code >= 200 and st_code < 300,
+                    headers: st_obj.headers,
+                    body: bytes_to_str(st_obj.data_bytes),
+                    body_bytes: st_obj.data_bytes
+                };
+                array_push(responses, resp_item);
+                by_stream[str(s_id)] = resp_item;
+                k = k + 1;
+            }
+
+            return map{
+                protocol: "HTTP/2",
+                opened_sockets: 1,
+                stream_ids: stream_order,
+                arrival_order: arrival_order,
+                responses: responses,
+                by_stream: by_stream,
+                compression: h2_compression_stats(conn)
+            };
+        }()
+    } catch err {
+        map{ ok: false, error: err }
+    };
+
+    try tcp_close(sock) catch nil;
+    if not run.ok {
+        throw run.error;
+    }
+    return run.val;
+}
+
+fn h2c_serve_connection(sock_handle, expected_requests, batch_or_req_handler, opts = nil) {
+    let preface_b = _read_exact_bytes(sock_handle, 24);
+    if bytes_to_str(preface_b) != H2_PREFACE {
+        throw "http2_http3_adaptive: invalid HTTP/2 client connection preface";
+    }
+    let conn = h2_new_connection("server", opts);
+    h2_write_frame_tcp(sock_handle, h2_encode_settings([
+        [H2_SETTINGS_INITIAL_WINDOW_SIZE, 65535],
+        [H2_SETTINGS_MAX_FRAME_SIZE, 16384]
+    ], false));
+
+    let ready_reqs = [];
+    let seen_ready = map{};
+    while len(ready_reqs) < expected_requests {
+        let frm = h2_read_frame_tcp(sock_handle, conn.max_frame_size);
+        let ev = h2_receive_frame(conn, frm);
+        if not ev.ok and ev.goaway {
+            h2_write_frame_tcp(sock_handle, ev.goaway_frame);
+            return map{ ok: false, goaway_sent: true, error_code: ev.error_code };
+        }
+        if ev.event == "settings" {
+            h2_write_frame_tcp(sock_handle, h2_encode_settings([], true));
+        } elif ev.event == "ping" and ev.ack_frame != nil {
+            h2_write_frame_tcp(sock_handle, ev.ack_frame);
+        }
+        if (ev.event == "headers" or ev.event == "data") and ev.end_stream {
+            let sk = str(ev.stream_id);
+            if not map_has(seen_ready, sk) {
+                seen_ready[sk] = true;
+                let st = conn.streams[sk];
+                array_push(ready_reqs, map{
+                    stream_id: ev.stream_id,
+                    method: _opt(st.headers, ":method", "GET"),
+                    path: _opt(st.headers, ":path", "/"),
+                    authority: _opt(st.headers, ":authority", ""),
+                    scheme: _opt(st.headers, ":scheme", "http"),
+                    headers: st.headers,
+                    body: bytes_to_str(st.data_bytes),
+                    body_bytes: st.data_bytes
+                });
+            }
+        }
+    }
+
+    let reply_list = batch_or_req_handler(ready_reqs, conn);
+    let i = 0;
+    while i < len(reply_list) {
+        let rep = reply_list[i];
+        let out_frames = h2_build_response_frames(
+            conn,
+            rep.stream_id,
+            _opt(rep, "status", 200),
+            _opt(rep, "headers", nil),
+            _opt(rep, "body", "")
+        );
+        let j = 0;
+        while j < len(out_frames) {
+            h2_write_frame_tcp(sock_handle, out_frames[j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    // Drain trailing client control frames (SETTINGS ACK / WINDOW_UPDATE) until client FIN
+    // so kernel SO_RCVBUF is empty and close() sends clean FIN instead of TCP RST!
+    let drain_steps = 0;
+    while drain_steps < 32 {
+        let dchunk = try tcp_read(sock_handle, 4096) catch "";
+        if dchunk == nil or dchunk == "" { break; }
+        drain_steps = drain_steps + 1;
+    }
+    return map{ ok: true, served_streams: len(reply_list), compression: h2_compression_stats(conn) };
+}
+
+// ============================================================================
+// 4. HTTP/3 over QUIC (RFC 9114), QPACK 99-Entry Static Table (RFC 9204) & Alt-Svc
+// ============================================================================
+
+// Complete 99-entry RFC 9204 Appendix A Static Table (indices 0..98)
+let QPACK_STATIC_TABLE = [
+    [":authority", ""],
+    [":path", "/"],
+    ["age", "0"],
+    ["content-disposition", ""],
+    ["content-length", "0"],
+    ["cookie", ""],
+    ["date", ""],
+    ["etag", ""],
+    ["if-modified-since", ""],
+    ["if-none-match", ""],
+    ["last-modified", ""],
+    ["link", ""],
+    ["location", ""],
+    ["referer", ""],
+    ["set-cookie", ""],
+    [":method", "CONNECT"],
+    [":method", "DELETE"],
+    [":method", "GET"],
+    [":method", "HEAD"],
+    [":method", "OPTIONS"],
+    [":method", "POST"],
+    [":method", "PUT"],
+    [":scheme", "http"],
+    [":scheme", "https"],
+    [":status", "103"],
+    [":status", "200"],
+    [":status", "304"],
+    [":status", "404"],
+    [":status", "503"],
+    ["accept", "*/*"],
+    ["accept", "application/dns-message"],
+    ["accept-encoding", "gzip, deflate, br"],
+    ["accept-ranges", "bytes"],
+    ["access-control-allow-headers", "cache-control"],
+    ["access-control-allow-headers", "content-type"],
+    ["access-control-allow-origin", "*"],
+    ["cache-control", "max-age=0"],
+    ["cache-control", "max-age=2592000"],
+    ["cache-control", "max-age=604800"],
+    ["cache-control", "no-cache"],
+    ["cache-control", "no-store"],
+    ["cache-control", "public, max-age=31536000"],
+    ["content-encoding", "br"],
+    ["content-encoding", "gzip"],
+    ["content-type", "application/dns-message"],
+    ["content-type", "application/javascript"],
+    ["content-type", "application/json"],
+    ["content-type", "application/x-www-form-urlencoded"],
+    ["content-type", "image/gif"],
+    ["content-type", "image/jpeg"],
+    ["content-type", "image/png"],
+    ["content-type", "text/css"],
+    ["content-type", "text/html; charset=utf-8"],
+    ["content-type", "text/plain"],
+    ["content-type", "text/plain;charset=utf-8"],
+    ["range", "bytes=0-"],
+    ["strict-transport-security", "max-age=31536000"],
+    ["strict-transport-security", "max-age=31536000; includesubdomains"],
+    ["strict-transport-security", "max-age=31536000; includesubdomains; preload"],
+    ["vary", "accept-encoding"],
+    ["vary", "origin"],
+    ["x-content-type-options", "nosniff"],
+    ["x-xss-protection", "1; mode=block"],
+    [":status", "100"],
+    [":status", "204"],
+    [":status", "206"],
+    [":status", "302"],
+    [":status", "400"],
+    [":status", "403"],
+    [":status", "421"],
+    [":status", "425"],
+    [":status", "500"],
+    ["accept-language", ""],
+    ["access-control-allow-credentials", "FALSE"],
+    ["access-control-allow-credentials", "TRUE"],
+    ["access-control-allow-headers", "*"],
+    ["access-control-allow-methods", "get"],
+    ["access-control-allow-methods", "get, post, options"],
+    ["access-control-allow-methods", "options"],
+    ["access-control-expose-headers", "content-length"],
+    ["access-control-request-headers", "content-type"],
+    ["access-control-request-method", "get"],
+    ["access-control-request-method", "post"],
+    ["alt-svc", "clear"],
+    ["authorization", ""],
+    ["content-security-policy", "script-src 'none'; object-src 'none'; base-uri 'none'"],
+    ["early-data", "1"],
+    ["expect-ct", ""],
+    ["forwarded", ""],
+    ["if-range", ""],
+    ["origin", ""],
+    ["purpose", "prefetch"],
+    ["server", ""],
+    ["timing-allow-origin", "*"],
+    ["upgrade-insecure-requests", "1"],
+    ["user-agent", ""],
+    ["x-forwarded-for", ""],
+    ["x-frame-options", "deny"],
+    ["x-frame-options", "sameorigin"]
+];
+
+fn _is_forbidden_h2_frame_in_h3(ftype) {
+    // RFC 9114 §7.2.8: HTTP/2 PRIORITY (0x02), PING (0x06), WINDOW_UPDATE (0x08),
+    // and CONTINUATION (0x09) frames are explicitly retired and MUST be treated as H3_FRAME_UNEXPECTED!
+    return ftype == 2 or ftype == 6 or ftype == 8 or ftype == 9;
+}
+
+fn h3_encode_frame(frame_type, payload_bytes = nil) {
+    if _is_forbidden_h2_frame_in_h3(frame_type) {
+        throw "http2_http3_adaptive: H3_FRAME_UNEXPECTED (0x0105) — HTTP/2 frame type " + str(frame_type) + " is forbidden in HTTP/3";
+    }
+    let pay = if payload_bytes == nil {
+        []
+    } elif is_array(payload_bytes) {
+        payload_bytes
+    } else {
+        str_to_bytes(str(payload_bytes))
+    };
+    if len(pay) > H2_HARD_MAX_FRAME_SIZE {
+        throw "http2_http3_adaptive: H3_FRAME_ERROR — payload exceeds 1 MiB ceiling";
+    }
+    let out = [];
+    _append_bytes(out, QUIC_RT.quic_encode_varint(frame_type));
+    _append_bytes(out, QUIC_RT.quic_encode_varint(len(pay)));
+    _append_bytes(out, pay);
+    return out;
+}
+
+fn h3_decode_frame(buf, pos = 0, max_frame_size = 1048576) {
+    let eff_max = if max_frame_size > H2_HARD_MAX_FRAME_SIZE { H2_HARD_MAX_FRAME_SIZE } else { max_frame_size };
+    let b = if is_array(buf) { buf } else { str_to_bytes(str(buf)) };
+    let t_vi = QUIC_RT.quic_decode_varint(b, pos);
+    let ftype = t_vi.value;
+    if _is_forbidden_h2_frame_in_h3(ftype) {
+        throw "http2_http3_adaptive: H3_FRAME_UNEXPECTED (0x0105) — forbidden HTTP/2 frame type " + str(ftype) + " received on HTTP/3 stream";
+    }
+    let l_vi = QUIC_RT.quic_decode_varint(b, t_vi.next);
+    let flen = l_vi.value;
+    if flen > eff_max {
+        throw "http2_http3_adaptive: H3_EXCESSIVE_LOAD — HTTP/3 frame length " + str(flen) + " exceeds ceiling";
+    }
+    let end_p = l_vi.next + flen;
+    if end_p > len(b) {
+        throw "http2_http3_adaptive: H3_FRAME_ERROR — truncated HTTP/3 frame payload";
+    }
+    return map{
+        type: ftype,
+        length: flen,
+        payload: slice(b, l_vi.next, end_p),
+        next: end_p
+    };
+}
+
+fn h3_encode_settings(settings_map = nil) {
+    let pay = [];
+    let m = if is_map(settings_map) { settings_map } else { map{ "1": 0, "6": 65536, "7": 0 } };
+    let ks = map_keys(m);
+    let i = 0;
+    while i < len(ks) {
+        let sid = parse_number(ks[i]);
+        // RFC 9114 §7.2.4.1: HTTP/2 settings 0x02, 0x03, 0x04, 0x05 are forbidden in HTTP/3!
+        if sid == 2 or sid == 3 or sid == 4 or sid == 5 {
+            throw "http2_http3_adaptive: H3_SETTINGS_ERROR (0x0109) — reserved HTTP/2 setting identifier " + str(sid);
+        }
+        _append_bytes(pay, QUIC_RT.quic_encode_varint(sid));
+        _append_bytes(pay, QUIC_RT.quic_encode_varint(m[ks[i]]));
+        i = i + 1;
+    }
+    return h3_encode_frame(H3_FRAME_SETTINGS, pay);
+}
+
+fn h3_decode_settings(frame) {
+    if frame.type != H3_FRAME_SETTINGS {
+        throw "http2_http3_adaptive: expected H3_FRAME_SETTINGS";
+    }
+    let out = map{};
+    let pos = 0;
+    let b = frame.payload;
+    while pos < len(b) {
+        let k_vi = QUIC_RT.quic_decode_varint(b, pos);
+        let v_vi = QUIC_RT.quic_decode_varint(b, k_vi.next);
+        pos = v_vi.next;
+        if k_vi.value == 2 or k_vi.value == 3 or k_vi.value == 4 or k_vi.value == 5 {
+            throw "http2_http3_adaptive: H3_SETTINGS_ERROR (0x0109) — forbidden HTTP/2 setting identifier";
+        }
+        out[str(k_vi.value)] = v_vi.value;
+    }
+    return out;
+}
+
+fn _qpack_static_lookup(name_s, val_s) {
+    let name_idx = -1;
+    let i = 0;
+    let n = len(QPACK_STATIC_TABLE);
+    while i < n {
+        let p = QPACK_STATIC_TABLE[i];
+        if p[0] == name_s {
+            if p[1] == val_s {
+                return map{ exact_idx: i, name_idx: i };
+            }
+            if name_idx < 0 { name_idx = i; }
+        }
+        i = i + 1;
+    }
+    return map{ exact_idx: -1, name_idx: name_idx };
+}
+
+fn qpack_encode_headers(headers_in) {
+    let pairs = _normalize_header_pairs(headers_in);
+    // RFC 9204 §4.5.1: 2-byte Prefix [Required Insert Count = 0x00, S|Delta Base = 0x00]
+    // Zero dynamic encoder-stream dependency = ZERO cross-stream Head-of-Line blocking!
+    let out = [0, 0];
+    let i = 0;
+    while i < len(pairs) {
+        let h = pairs[i];
+        let lk = _qpack_static_lookup(h.name, h.value);
+        if not h.never_index and lk.exact_idx >= 0 {
+            // 1Txxxxxx (T=1 static -> 0xC0 = 192, 6-bit prefix)
+            _append_bytes(out, hpack_encode_int(lk.exact_idx, 6, 192));
+        } elif lk.name_idx >= 0 {
+            // 01NTxxxx (T=1 static -> 0x50 = 80, N=0x20 = 32 if sensitive, 4-bit prefix)
+            let mask_ref = if h.never_index { 112 } else { 80 };
+            _append_bytes(out, hpack_encode_int(lk.name_idx, 4, mask_ref));
+            _append_bytes(out, _hpack_encode_str(h.value));
+        } else {
+            // 001NHxxx (H=0 raw name -> 0x20 = 32, N=0x10 = 16 if sensitive, 3-bit name len prefix)
+            let mask_lit = if h.never_index { 48 } else { 32 };
+            let nb = str_to_bytes(h.name);
+            _append_bytes(out, hpack_encode_int(len(nb), 3, mask_lit));
+            _append_bytes(out, nb);
+            _append_bytes(out, _hpack_encode_str(h.value));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn qpack_decode_headers(block_bytes, max_field_section_size = 65536) {
+    let eff_max = if max_field_section_size > H2_HARD_MAX_HEADER_LIST { H2_HARD_MAX_HEADER_LIST } else { max_field_section_size };
+    let b = if is_array(block_bytes) { block_bytes } else { str_to_bytes(str(block_bytes)) };
+    if len(b) < 2 {
+        throw "http2_http3_adaptive: truncated QPACK field section prefix";
+    }
+    let ric = hpack_decode_int(b, 0, 8);
+    let dbase = hpack_decode_int(b, ric.next, 7);
+    if ric.value != 0 {
+        throw "http2_http3_adaptive: QPACK stateless decoder expects Required Insert Count = 0";
+    }
+    let pos = dbase.next;
+    let n = len(b);
+    let out = [];
+    let total_sz = 0;
+    let seen_state = map{ seen_regular: false, pseudos: map{} };
+
+    while pos < n {
+        let first = b[pos];
+        if bit_and(first, 128) != 0 {
+            // 1Txxxxxx: Indexed Field Line
+            if bit_and(first, 64) == 0 {
+                throw "http2_http3_adaptive: invalid dynamic QPACK reference with RIC=0";
+            }
+            let ir = hpack_decode_int(b, pos, 6);
+            pos = ir.next;
+            if ir.value >= len(QPACK_STATIC_TABLE) {
+                throw "http2_http3_adaptive: QPACK static index out of range";
+            }
+            let sp = QPACK_STATIC_TABLE[ir.value];
+            total_sz = _push_validated_decoded_header(out, seen_state, sp[0], sp[1], false, total_sz, eff_max);
+        } elif bit_and(first, 192) == 64 {
+            // 01NTxxxx: Literal Field Line With Name Reference
+            let sens = bit_and(first, 32) != 0;
+            if bit_and(first, 16) == 0 {
+                throw "http2_http3_adaptive: invalid dynamic QPACK name reference with RIC=0";
+            }
+            let nr = hpack_decode_int(b, pos, 4);
+            pos = nr.next;
+            if nr.value >= len(QPACK_STATIC_TABLE) {
+                throw "http2_http3_adaptive: QPACK static name index out of range";
+            }
+            let vs = _hpack_decode_str(b, pos);
+            pos = vs.next;
+            let hname = QPACK_STATIC_TABLE[nr.value][0];
+            total_sz = _push_validated_decoded_header(out, seen_state, hname, vs.text, sens, total_sz, eff_max);
+        } elif bit_and(first, 224) == 32 {
+            // 001NHxxx: Literal Field Line With Literal Name
+            let sens2 = bit_and(first, 16) != 0;
+            let huff_n = bit_and(first, 8) != 0;
+            if huff_n {
+                throw "http2_http3_adaptive: unsupported Huffman QPACK name in raw mode";
+            }
+            let nlen_r = hpack_decode_int(b, pos, 3);
+            let nstart = nlen_r.next;
+            let nend = nstart + nlen_r.value;
+            if nend > n {
+                throw "http2_http3_adaptive: truncated QPACK literal header name";
+            }
+            let hname2 = bytes_to_str(slice(b, nstart, nend));
+            let vs2 = _hpack_decode_str(b, nend);
+            pos = vs2.next;
+            total_sz = _push_validated_decoded_header(out, seen_state, hname2, vs2.text, sens2, total_sz, eff_max);
+        } else {
+            throw "http2_http3_adaptive: unrecognized QPACK representation byte " + str(first);
+        }
+    }
+    return out;
+}
+
+// ── RFC 7838 `Alt-Svc` Parser & Origin Upgrade Cache (Hardened per §9) ───────
+
+fn _is_dangerous_alt_svc_port(p) {
+    if p == nil or p <= 0 or p > 65535 { return true; }
+    return p == 21 or p == 22 or p == 23 or p == 25 or p == 53 or
+           p == 110 or p == 143 or p == 389 or p == 445 or p == 465 or
+           p == 587 or p == 636 or p == 1433 or p == 1521 or p == 2049 or
+           p == 3306 or p == 3389 or p == 5432 or p == 5900 or p == 6379 or
+           p == 9042 or p == 11211 or p == 27017;
+}
+
+fn _validate_alt_svc_target(alt_host, alt_port, opts = nil) {
+    if _is_dangerous_alt_svc_port(alt_port) {
+        throw "http2_http3_adaptive: security — Alt-Svc blocked dangerous or invalid service port " + str(alt_port);
+    }
+    if alt_host != "" {
+        if _has_ctl_bytes(alt_host) {
+            throw "http2_http3_adaptive: security — CRLF/NUL in Alt-Svc host";
+        }
+        // RFC 7838 §9 anti-SSRF: NEVER allow Alt-Svc to redirect to loopback, RFC1918 private IPs,
+        // link-local, or cloud metadata (169.254.169.254)!
+        HTTP1.check_url_ssrf("https://" + alt_host + ":" + str(alt_port) + "/", map{
+            allow_loopback: false,
+            allow_private: false
+        });
+        let origin_host = str_lower(str_trim(str(_opt(opts, "origin_host", ""))));
+        let allow_cross = _opt(opts, "allow_cross_host_alt_svc", false) == true;
+        if not allow_cross {
+            if origin_host == "" or str_lower(alt_host) != origin_host {
+                throw "http2_http3_adaptive: security — cross-host Alt-Svc origin hijack rejected ('" + alt_host + "')";
+            }
+        }
+    }
+    return true;
+}
+
+fn parse_alt_svc(header_val, opts = nil) {
+    let raw_in = str(header_val);
+    if _has_ctl_bytes(raw_in) {
+        throw "http2_http3_adaptive: security — CRLF/NUL injection in Alt-Svc header";
+    }
+    let raw = str_trim(raw_in);
+    if str_lower(raw) == "clear" {
+        return map{ clear: true, entries: [] };
+    }
+    let entries = [];
+    let items = str_split(raw, ",");
+    let i = 0;
+    while i < len(items) {
+        let seg = str_trim(items[i]);
+        if seg != "" {
+            let params = str_split(seg, ";");
+            let first = str_trim(params[0]);
+            let eq = str_index_of(first, "=");
+            if eq > 0 {
+                let alpn = str_trim(str_slice(first, 0, eq));
+                if str_lower(alpn) == "h2c" or str_lower(alpn) == "http/1.0" or str_lower(alpn) == "http/0.9" {
+                    throw "http2_http3_adaptive: security — cleartext/legacy ALPN '" + alpn + "' forbidden in Alt-Svc";
+                }
+                let authority = str_trim(str_slice(first, eq + 1, len(first)));
+                if str_starts_with(authority, "\"") and str_ends_with(authority, "\"") and len(authority) >= 2 {
+                    authority = str_slice(authority, 1, len(authority) - 1);
+                }
+                // Handle IPv6 bracketed authority `[::1]:443` vs `host:443` vs `:443`
+                let alt_host = "";
+                let alt_port = 443;
+                if str_starts_with(authority, "[") {
+                    let rb = str_index_of(authority, "]");
+                    if rb < 0 {
+                        throw "http2_http3_adaptive: malformed IPv6 authority in Alt-Svc";
+                    }
+                    alt_host = str_slice(authority, 1, rb);
+                    if rb + 1 < len(authority) and str_slice(authority, rb + 1, rb + 2) == ":" {
+                        alt_port = parse_number(str_slice(authority, rb + 2, len(authority)));
+                    }
+                } else {
+                    let colon = str_index_of(authority, ":");
+                    alt_host = if colon >= 0 { str_slice(authority, 0, colon) } else { authority };
+                    alt_port = if colon >= 0 { parse_number(str_slice(authority, colon + 1, len(authority))) } else { 443 };
+                }
+
+                _validate_alt_svc_target(alt_host, alt_port, opts);
+
+                let max_age = 86400; // RFC 7838 §3.1 default 24h
+                let persist = false;
+                let p = 1;
+                while p < len(params) {
+                    let kv = str_trim(params[p]);
+                    let peq = str_index_of(kv, "=");
+                    if peq > 0 {
+                        let pk = str_lower(str_trim(str_slice(kv, 0, peq)));
+                        let pv = str_trim(str_slice(kv, peq + 1, len(kv)));
+                        if pk == "ma" {
+                            let parsed_ma = try parse_number(pv) catch nil;
+                            if parsed_ma != nil and parsed_ma >= 0 {
+                                max_age = if parsed_ma > 2592000 { 2592000 } else { parsed_ma };
+                            }
+                        } elif pk == "persist" and pv == "1" {
+                            persist = true;
+                        }
+                    }
+                    p = p + 1;
+                }
+                array_push(entries, map{
+                    alpn: alpn,
+                    host: alt_host,
+                    port: alt_port,
+                    max_age: max_age,
+                    persist: persist,
+                    is_h3: alpn == "h3" or str_starts_with(alpn, "h3-")
+                });
+            }
+        }
+        i = i + 1;
+    }
+    return map{ clear: false, entries: entries };
+}
+
+fn new_alt_svc_cache() {
+    return map{ format: "pblang.net.alt_svc_cache.v1", origins: map{} };
+}
+
+fn _extract_host_from_origin_key(origin_key) {
+    let k = str_lower(str_trim(str(origin_key)));
+    let u = try HTTP1.parse_url(k + "/") catch nil;
+    if u != nil { return str_lower(u.host); }
+    return "";
+}
+
+fn record_alt_svc(cache, origin_key, alt_svc_header, opts = nil) {
+    let k = str_lower(str_trim(str(origin_key)));
+    if str_starts_with(k, "http://") and _opt(opts, "allow_insecure_origin_alt_svc", false) != true {
+        throw "http2_http3_adaptive: security — RFC 7838 forbids unauthenticated http:// Alt-Svc upgrade";
+    }
+    let ohost = _extract_host_from_origin_key(k);
+    let merged_opts = map{
+        origin_host: _opt(opts, "origin_host", ohost),
+        allow_cross_host_alt_svc: _opt(opts, "allow_cross_host_alt_svc", false)
+    };
+    let parsed = parse_alt_svc(alt_svc_header, merged_opts);
+    if parsed.clear {
+        if map_has(cache.origins, k) { map_remove(cache.origins, k); }
+        return parsed;
+    }
+    cache.origins[k] = map{
+        recorded_ms: now_ms(),
+        entries: parsed.entries
+    };
+    return parsed;
+}
+
+fn lookup_alt_svc_h3(cache, origin_key) {
+    let k = str_lower(str_trim(str(origin_key)));
+    if not map_has(cache.origins, k) { return nil; }
+    let rec = cache.origins[k];
+    let now = now_ms();
+    let i = 0;
+    while i < len(rec.entries) {
+        let e = rec.entries[i];
+        if e.is_h3 and (now - rec.recorded_ms) <= (e.max_age * 1000) {
+            return e;
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+// ── HTTP/3 over Encrypted QUIC/UDP Stream Capsule & Zero-HoL Exchange ────────
+
+fn h3_pack_quic_stream_datagram(chan, stream_id, headers_in, body_bytes_or_str = nil, fin = true) {
+    // QUIC client-initiated bidirectional request streams use IDs 0, 4, 8, 12... (RFC 9000 §2.1)
+    let qblock = qpack_encode_headers(headers_in);
+    let stream_buf = [];
+    _append_bytes(stream_buf, QUIC_RT.quic_encode_varint(stream_id));
+    _append_bytes(stream_buf, QUIC_RT.quic_encode_varint(0)); // stream offset = 0
+    array_push(stream_buf, if fin { 1 } else { 0 });
+    _append_bytes(stream_buf, h3_encode_frame(H3_FRAME_HEADERS, qblock));
+    if body_bytes_or_str != nil {
+        let bb = if is_array(body_bytes_or_str) { body_bytes_or_str } else { str_to_bytes(str(body_bytes_or_str)) };
+        if len(bb) > 0 {
+            _append_bytes(stream_buf, h3_encode_frame(H3_FRAME_DATA, bb));
+        }
+    }
+    return QUIC_RT.encode_telemetry_datagram(chan, stream_buf);
+}
+
+fn h3_unpack_quic_stream_datagram(chan, wire_bytes) {
+    let dec_pkt = QUIC_RT.decode_telemetry_datagram(chan, wire_bytes);
+    let sb = dec_pkt.data;
+    let sid_vi = QUIC_RT.quic_decode_varint(sb, 0);
+    let off_vi = QUIC_RT.quic_decode_varint(sb, sid_vi.next);
+    let fin = sb[off_vi.next] != 0;
+    let pos = off_vi.next + 1;
+
+    let headers_list = [];
+    let data_bytes = [];
+    let settings = nil;
+
+    while pos < len(sb) {
+        let frm = h3_decode_frame(sb, pos);
+        pos = frm.next;
+        if frm.type == H3_FRAME_HEADERS {
+            headers_list = qpack_decode_headers(frm.payload, 65536);
+        } elif frm.type == H3_FRAME_DATA {
+            _append_bytes(data_bytes, frm.payload);
+        } elif frm.type == H3_FRAME_SETTINGS {
+            settings = h3_decode_settings(frm);
+        }
+    }
+    let hmap = headers_list_to_map(headers_list);
+    return map{
+        protocol: "HTTP/3",
+        quic_seq: dec_pkt.seq,
+        stream_id: sid_vi.value,
+        offset: off_vi.value,
+        fin: fin,
+        headers_list: headers_list,
+        headers: hmap,
+        status: if map_has(hmap, ":status") { parse_number(hmap[":status"]) } else { nil },
+        method: _opt(hmap, ":method", nil),
+        path: _opt(hmap, ":path", nil),
+        body_bytes: data_bytes,
+        body: bytes_to_str(data_bytes),
+        settings: settings
+    };
+}
+
+fn h3_quic_request(server_addr, shared_key, req_opts, timeout_ms = 1500) {
+    let sock = QUIC_RT.udp_bind("127.0.0.1:0");
+    let tx_chan = QUIC_RT.new_telemetry_channel(shared_key);
+    let rx_chan = QUIC_RT.new_telemetry_channel(shared_key);
+
+    let out = try map{
+        ok: true,
+        val: fn() {
+            let sid = _opt(req_opts, "stream_id", 0); // QUIC bidi stream 0, 4, 8...
+            let hdrs = [
+                [":method", str_upper(str(_opt(req_opts, "method", "GET")))],
+                [":scheme", str(_opt(req_opts, "scheme", "https"))],
+                [":authority", str(_opt(req_opts, "authority", server_addr))],
+                [":path", str(_opt(req_opts, "path", "/"))]
+            ];
+            let extra = _adapt_caller_headers_for_h2_h3(_opt(req_opts, "headers", nil));
+            if extra != nil {
+                let nex = _normalize_header_pairs(extra);
+                let i = 0;
+                while i < len(nex) {
+                    array_push(hdrs, [nex[i].name, nex[i].value, nex[i].never_index]);
+                    i = i + 1;
+                }
+            }
+            let wire = h3_pack_quic_stream_datagram(tx_chan, sid, hdrs, _opt(req_opts, "body", nil), true);
+            QUIC_RT.udp_sendto(sock, wire, server_addr);
+            let rx = QUIC_RT.udp_recvfrom(sock, 8192, timeout_ms);
+            if not rx.ok {
+                throw "http2_http3_adaptive: HTTP/3 QUIC UDP timeout";
+            }
+            return h3_unpack_quic_stream_datagram(rx_chan, rx.data);
+        }()
+    } catch err {
+        map{ ok: false, error: err }
+    };
+    QUIC_RT.udp_close(sock);
+    if not out.ok { throw out.error; }
+    return out.val;
+}
+
+// ============================================================================
+// 5. Smart Domain-Aware Adaptive HTTP Protocol Selector & Happy-Eyeballs Router
+// ============================================================================
+
+fn select_optimal_http_protocol(profile = nil) {
+    let p = if is_map(profile) { profile } else { map{} };
+    let url_s = str(_opt(p, "url", ""));
+    let scheme = str_lower(str(_opt(p, "scheme", "")));
+    let host = str_lower(str(_opt(p, "host", "")));
+    if url_s != "" {
+        let pu = try HTTP1.parse_url(url_s) catch nil;
+        if pu != nil {
+            if host == "" { host = str_lower(pu.host); }
+            if scheme == "" { scheme = str_lower(pu.scheme); }
+        }
+    }
+
+    // Anti-Downgrade Invariant #1:
+    // Legacy HTTP/0.9 and HTTP/1.0 are NEVER allowed on https:// AND require explicit `allow_legacy_http: true`!
+    let legacy_peer = str(_opt(p, "legacy_peer", ""));
+    if legacy_peer != "" {
+        if scheme == "https" {
+            throw "http2_http3_adaptive: security — protocol downgrade from https:// to legacy " + legacy_peer + " is strictly forbidden";
+        }
+        if _opt(p, "allow_legacy_http", false) != true {
+            throw "http2_http3_adaptive: security — legacy HTTP/0.9 and HTTP/1.0 require explicit allow_legacy_http: true";
+        }
+        if legacy_peer == "0.9" or legacy_peer == "HTTP/0.9" {
+            return map{
+                chosen_protocol: "HTTP/0.9",
+                fallback_chain: ["HTTP/0.9"],
+                rationale: "Explicit opt-in legacy 1991 HTTP/0.9 embedded target over http://",
+                hol_blocking_risk: "none (single-shot TCP)",
+                cpu_ram_cost: "minimal",
+                header_compression_gain: "0% (headerless)"
+            };
+        }
+        if legacy_peer == "1.0" or legacy_peer == "HTTP/1.0" {
+            return map{
+                chosen_protocol: "HTTP/1.0",
+                fallback_chain: ["HTTP/1.0"],
+                rationale: "Explicit opt-in RFC 1945 HTTP/1.0 legacy endpoint over http://",
+                hol_blocking_risk: "low (1 request per TCP connection)",
+                cpu_ram_cost: "minimal",
+                header_compression_gain: "0%"
+            };
+        }
+    }
+
+    let is_loopback = (host == "127.0.0.1" or host == "localhost" or host == "::1") or (_opt(p, "is_loopback", false) == true);
+    let rtt_ms = _opt(p, "rtt_ms", if is_loopback { 0.1 } else { 15.0 });
+    let loss_pct = _opt(p, "packet_loss_pct", 0.0);
+    let streams = _opt(p, "concurrent_streams", 1);
+    let payload_bytes = _opt(p, "payload_bytes", 0);
+    let is_ws = _opt(p, "websocket_upgrade", false) == true or str_lower(str(_opt(p, "upgrade", ""))) == "websocket";
+    let is_sse = _opt(p, "sse", false) == true;
+    let low_mem = _opt(p, "low_memory", false) == true or _opt(p, "embedded", false) == true;
+    let udp_blocked = _opt(p, "udp_blocked", false) == true;
+    let mobile_roaming = _opt(p, "mobile_roaming", false) == true;
+    let raw_zero_rtt = _opt(p, "zero_rtt", false) == true;
+    let req_method = str_upper(str(_opt(p, "method", "GET")));
+    // RFC 8470 / RFC 9001 Anti-Replay: 0-RTT is strictly forbidden for non-idempotent methods unless allow_unsafe_0rtt: true!
+    if raw_zero_rtt and req_method != "GET" and req_method != "HEAD" and req_method != "OPTIONS" and _opt(p, "allow_unsafe_0rtt", false) != true {
+        throw "http2_http3_adaptive: security — 0-RTT Early Data rejected for state-mutating method '" + req_method + "' (replay risk)";
+    }
+    let zero_rtt = raw_zero_rtt;
+    let alt_svc_h3 = _opt(p, "alt_svc_h3", false) == true;
+    let is_webtransport = _opt(p, "webtransport", false) == true;
+
+    // Rule 0: RFC 9297 WebTransport requires HTTP/3 over QUIC (unless UDP is blocked -> HTTP/2 fallback)
+    if is_webtransport {
+        if udp_blocked {
+            return map{
+                chosen_protocol: "HTTP/2",
+                fallback_chain: ["HTTP/2"],
+                rationale: "WebTransport requested while UDP/443 is blocked: falling back to multiplexed HTTP/2 Extended CONNECT over TLS",
+                hol_blocking_risk: "moderate (TCP stream multiplexing)",
+                cpu_ram_cost: "low-moderate",
+                header_compression_gain: "65%-80% (HPACK)"
+            };
+        }
+        return map{
+            chosen_protocol: "HTTP/3",
+            fallback_chain: ["HTTP/3", "HTTP/2"],
+            rationale: "RFC 9297 WebTransport uses HTTP/3 Extended CONNECT + QUIC unreliable DATAGRAMs and independent uni/bidi streams with zero HoL blocking",
+            hol_blocking_risk: "eliminated (QUIC streams + RFC 9221/9297 DATAGRAMs)",
+            cpu_ram_cost: "moderate (AES-256-GCM QUIC datagrams)",
+            header_compression_gain: "65%-80% (QPACK)"
+        };
+    }
+
+    // Rule 1: Classic WebSocket 101 Switching Protocols, single-stream SSE, or ultra-constrained RAM
+    if is_ws {
+        return map{
+            chosen_protocol: "HTTP/1.1",
+            fallback_chain: ["HTTP/1.1"],
+            rationale: "WebSocket 101 Switching Protocols upgrades directly over persistent socket without H2/QUIC framing overhead",
+            hol_blocking_risk: "low (dedicated upgraded stream)",
+            cpu_ram_cost: "low",
+            header_compression_gain: "0% (one-time handshake)"
+        };
+    }
+    if low_mem {
+        // NEVER include HTTP/1.0 or HTTP/0.9 in automatic fallback chains!
+        return map{
+            chosen_protocol: "HTTP/1.1",
+            fallback_chain: ["HTTP/1.1"],
+            rationale: "Constrained/embedded RAM mode: HTTP/1.1 Keep-Alive avoids HPACK/QPACK tables and userspace QUIC buffers without legacy downgrade",
+            hol_blocking_risk: "low",
+            cpu_ram_cost: "minimal",
+            header_compression_gain: "0%"
+        };
+    }
+    if is_sse and streams <= 1 and loss_pct < 0.5 and not mobile_roaming {
+        return map{
+            chosen_protocol: "HTTP/1.1",
+            fallback_chain: ["HTTP/1.1", "HTTP/2"],
+            rationale: "Single-stream W3C SSE over stable network runs zero-framing-overhead over HTTP/1.1 chunked stream",
+            hol_blocking_risk: "none (single unidirectional event stream)",
+            cpu_ram_cost: "low",
+            header_compression_gain: "0%"
+        };
+    }
+
+    // Rule 2: Large sequential bulk transfer (>= 16 MiB) on stable low-loss network -> HTTP/1.1 wins on CPU/TSO!
+    if payload_bytes >= 16777216 and streams <= 2 and loss_pct < 0.5 and not mobile_roaming {
+        return map{
+            chosen_protocol: "HTTP/1.1",
+            fallback_chain: ["HTTP/1.1", "HTTP/2"],
+            rationale: "Large sequential transfer (>= 16 MiB) on low-loss link: kernel TCP TSO/zero-copy beats userspace UDP QUIC per-packet AEAD CPU cost",
+            hol_blocking_risk: "none (single sequential bulk stream)",
+            cpu_ram_cost: "low (kernel TCP offload)",
+            header_compression_gain: "negligible (<0.01% of bulk payload)"
+        };
+    }
+
+    // Rule 3: Loopback / ultra-low-RTT IPC (< 1 ms) with low concurrency (<= 2) -> HTTP/1.1 Keep-Alive!
+    if (is_loopback or rtt_ms < 1.0) and streams <= 2 and loss_pct < 0.5 and not mobile_roaming and not zero_rtt {
+        return map{
+            chosen_protocol: "HTTP/1.1",
+            fallback_chain: ["HTTP/1.1", "HTTP/2"],
+            rationale: "Sub-millisecond loopback/LAN IPC with <= 2 streams: HTTP/1.1 Keep-Alive delivers lowest CPU latency without HPACK/QUIC state",
+            hol_blocking_risk: "negligible (< 1 ms RTT)",
+            cpu_ram_cost: "low",
+            header_compression_gain: "minimal for <= 2 requests"
+        };
+    }
+
+    // Rule 4: Lossy WAN (>= 0.5% loss), High-RTT WAN (>= 40 ms), Mobile Wi-Fi<->5G migration, or 0-RTT -> HTTP/3 over QUIC!
+    if not udp_blocked and (loss_pct >= 0.5 or mobile_roaming or zero_rtt or (rtt_ms >= 40.0 and (streams >= 2 or alt_svc_h3))) {
+        return map{
+            chosen_protocol: "HTTP/3",
+            fallback_chain: ["HTTP/3", "HTTP/2", "HTTP/1.1"],
+            rationale: "Lossy/high-RTT WAN or mobile connection migration: HTTP/3 over QUIC eliminates TCP cross-stream Head-of-Line blocking and supports Connection-ID roaming with encrypted Happy-Eyeballs fallback",
+            hol_blocking_risk: "eliminated (independent QUIC streams + stateless QPACK)",
+            cpu_ram_cost: "moderate (userspace UDP + per-datagram AES-256-GCM)",
+            header_compression_gain: "65%-80% (QPACK 99-entry static table)"
+        };
+    }
+
+    // Rule 5: High-concurrency multiplexed bursts (>= 4 streams) on stable low-loss network OR when UDP:443 is blocked -> HTTP/2!
+    if streams >= 4 or (udp_blocked and (streams >= 2 or loss_pct >= 0.5 or rtt_ms >= 40.0)) {
+        let why_h2 = if udp_blocked {
+            "UDP/443 blocked by firewall/enterprise policy: HTTP/2 multiplexes concurrent streams over a single TCP/TLS connection with HPACK compression"
+        } else {
+            "High-concurrency burst (" + str(streams) + " streams) on low-loss network: HTTP/2 achieves >65% HPACK header compression and single-socket TCP multiplexing without UDP packet overhead"
+        };
+        return map{
+            chosen_protocol: "HTTP/2",
+            fallback_chain: ["HTTP/2", "HTTP/1.1"],
+            rationale: why_h2,
+            hol_blocking_risk: if loss_pct >= 0.5 { "elevated (TCP HoL under loss, UDP blocked)" } else { "low (< 0.5% packet loss)" },
+            cpu_ram_cost: "low-moderate (single TCP socket + 4 KiB HPACK table)",
+            header_compression_gain: "65%-85% (HPACK static + dynamic table)"
+        };
+    }
+
+    // Default: lightweight HTTP/1.1 Keep-Alive
+    return map{
+        chosen_protocol: "HTTP/1.1",
+        fallback_chain: ["HTTP/1.1", "HTTP/2"],
+        rationale: "Low-concurrency request on healthy link: HTTP/1.1 Keep-Alive maximizes simplicity and minimizes CPU/RAM footprint",
+        hol_blocking_risk: "low",
+        cpu_ram_cost: "low",
+        header_compression_gain: "0%"
+    };
+}
+
+fn adaptive_http_request(url, opts = nil) {
+    if _has_ctl_bytes(url) {
+        throw "http2_http3_adaptive: security — CRLF/NUL injection rejected in request URL";
+    }
+    let u = HTTP1.parse_url(url);
+    HTTP1.check_url_ssrf(u, opts);
+
+    let is_https = (u.scheme == "https");
+    let method = str_upper(str(_opt(opts, "method", "GET")));
+    if _has_ctl_bytes(method) or method == "" {
+        throw "http2_http3_adaptive: security — invalid HTTP method";
+    }
+
+    let alt_cache = _opt(opts, "alt_svc_cache", nil);
+    let cached_h3 = if alt_cache != nil and is_https { lookup_alt_svc_h3(alt_cache, u.origin_key) } else { nil };
+
+    let prof = map{
+        url: url,
+        scheme: u.scheme,
+        host: u.host,
+        method: method,
+        legacy_peer: _opt(opts, "legacy_peer", ""),
+        allow_legacy_http: _opt(opts, "allow_legacy_http", false),
+        allow_unsafe_0rtt: _opt(opts, "allow_unsafe_0rtt", false),
+        rtt_ms: _opt(opts, "rtt_ms", if HTTP1.is_loopback_host(u.host) { 0.1 } else { 15.0 }),
+        packet_loss_pct: _opt(opts, "packet_loss_pct", 0.0),
+        concurrent_streams: _opt(opts, "concurrent_streams", 1),
+        payload_bytes: if _opt(opts, "body", nil) != nil { len(str_to_bytes(str(_opt(opts, "body", "")))) } else { _opt(opts, "payload_bytes", 0) },
+        websocket_upgrade: _opt(opts, "websocket_upgrade", false),
+        webtransport: _opt(opts, "webtransport", false),
+        sse: _opt(opts, "sse", false),
+        low_memory: _opt(opts, "low_memory", false),
+        udp_blocked: _opt(opts, "udp_blocked", false),
+        mobile_roaming: _opt(opts, "mobile_roaming", false),
+        zero_rtt: _opt(opts, "zero_rtt", false),
+        alt_svc_h3: cached_h3 != nil or (_opt(opts, "alt_svc_h3", false) == true)
+    };
+    let decision = select_optimal_http_protocol(prof);
+
+    let chain = decision.fallback_chain;
+    let idx = 0;
+    let attempts = [];
+    let adapted_hdrs = _adapt_caller_headers_for_h2_h3(_opt(opts, "headers", nil));
+
+    while idx < len(chain) {
+        let proto = chain[idx];
+        // Anti-Downgrade Invariant #1: NEVER permit HTTP/0.9 or HTTP/1.0 on https://!
+        if is_https and (proto == "HTTP/0.9" or proto == "HTTP/1.0") {
+            throw "http2_http3_adaptive: security — blocked TLS/protocol downgrade to " + proto;
+        }
+        array_push(attempts, proto);
+
+        if proto == "HTTP/3" {
+            let h3_target_host = if cached_h3 != nil and cached_h3.host != "" { cached_h3.host } else { u.host };
+            let h3_target_port = if cached_h3 != nil { cached_h3.port } else { u.port };
+            let h3_addr = _opt(opts, "h3_addr", h3_target_host + ":" + str(h3_target_port));
+            let h3_key = _opt(opts, "quic_shared_key", "PBLang-H3-Default-Channel-Key");
+            let h3_timeout = _opt(opts, "h3_timeout_ms", 250);
+            let h3_try = try map{
+                ok: true,
+                resp: h3_quic_request(h3_addr, h3_key, map{
+                    method: method,
+                    scheme: u.scheme,
+                    authority: u.host_header,
+                    path: u.request_target,
+                    headers: adapted_hdrs,
+                    body: _opt(opts, "body", nil)
+                }, h3_timeout)
+            } catch map{ ok: false, resp: nil };
+
+            if h3_try.ok {
+                let r3 = h3_try.resp;
+                r3.decision = decision;
+                r3.attempted_protocols = attempts;
+                r3.fell_back = len(attempts) > 1;
+                r3.tls_preserved = is_https;
+                return r3;
+            }
+            // Happy-Eyeballs: UDP blocked or timed out -> fall through strictly preserving scheme (`https://` stays TLS)!
+        } elif proto == "HTTP/2" {
+            // Anti-Downgrade Invariant #1: Cleartext `h2c` (`tcp_connect`) is STRICTLY FORBIDDEN for `https://` URLs!
+            if not is_https {
+                let h2_addr = _opt(opts, "h2_addr", u.host + ":" + str(u.port));
+                let h2_try = try map{
+                    ok: true,
+                    ex: h2c_exchange_multiplexed(h2_addr, [map{
+                        method: method,
+                        scheme: u.scheme,
+                        authority: u.host_header,
+                        path: u.request_target,
+                        headers: adapted_hdrs,
+                        body: _opt(opts, "body", nil)
+                    }], opts)
+                } catch map{ ok: false, ex: nil };
+
+                if h2_try.ok and len(h2_try.ex.responses) > 0 {
+                    let r2 = h2_try.ex.responses[0];
+                    r2.decision = decision;
+                    r2.attempted_protocols = attempts;
+                    r2.fell_back = len(attempts) > 1;
+                    r2.tls_preserved = false;
+                    return r2;
+                }
+            }
+            // For `https://`, skip cleartext `h2c` and proceed to `HTTP/1.1` over TLS (`tcp_connect_tls`), NEVER cleartext!
+        } elif proto == "HTTP/1.1" {
+            // `HTTP1.KeepAliveSession` connects via `tcp_connect_tls` whenever `url` is `https://` — zero plaintext downgrade!
+            let sess = HTTP1.KeepAliveSession("", opts);
+            let r1_try = try map{
+                ok: true,
+                resp: HTTP1.session_request(sess, method, url, opts)
+            } catch err1 {
+                map{ ok: false, error: err1 }
+            };
+            HTTP1.close_session(sess);
+            if r1_try.ok {
+                let r1 = r1_try.resp;
+                if is_https and alt_cache != nil and map_has(r1.headers, "alt-svc") {
+                    try record_alt_svc(alt_cache, u.origin_key, r1.headers["alt-svc"]) catch nil;
+                }
+                r1.protocol = "HTTP/1.1";
+                r1.decision = decision;
+                r1.attempted_protocols = attempts;
+                r1.fell_back = len(attempts) > 1;
+                r1.tls_preserved = is_https;
+                return r1;
+            }
+            if idx + 1 >= len(chain) {
+                throw r1_try.error;
+            }
+        } elif proto == "HTTP/1.0" or proto == "HTTP/0.9" {
+            if is_https or _opt(opts, "allow_legacy_http", false) != true {
+                throw "http2_http3_adaptive: security — legacy " + proto + " strictly forbidden without allow_legacy_http: true on http://";
+            }
+            let leg_sock = tcp_connect(u.host + ":" + str(u.port));
+            let leg_wire = if proto == "HTTP/0.9" {
+                encode_http09_request(u.request_target)
+            } else {
+                bytes_to_str(encode_http10_request(method, u.request_target, _opt(opts, "headers", nil), _opt(opts, "body", nil)))
+            };
+            tcp_write(leg_sock, leg_wire);
+            let leg_raw = tcp_read_all(leg_sock);
+            tcp_close(leg_sock);
+            let leg_resp = if proto == "HTTP/0.9" { decode_http09_response(leg_raw) } else { decode_http10_response(leg_raw) };
+            leg_resp.decision = decision;
+            leg_resp.attempted_protocols = attempts;
+            leg_resp.fell_back = len(attempts) > 1;
+            leg_resp.tls_preserved = false;
+            return leg_resp;
+        }
+        idx = idx + 1;
+    }
+
+    throw "http2_http3_adaptive: all protocols in fallback chain failed";
+}
+
+// ============================================================================
+// 6. WebTransport over HTTP/3 (RFC 9297) — Extended CONNECT, Unidirectional &
+//    Bidirectional Streams, HTTP/3 DATAGRAMs (`quarter_stream_id`) & Capsules
+// ============================================================================
+
+let H3_SETTINGS_ENABLE_CONNECT_PROTOCOL = 8; // 0x08 (RFC 9220 / RFC 9297)
+let H3_SETTINGS_H3_DATAGRAM = 51;            // 0x33 (RFC 9297 §2.1.1)
+let WT_UNI_STREAM_TYPE = 84;                 // 0x54 (RFC 9297 §3.2)
+let WT_BIDI_SIGNAL_TYPE = 65;                // 0x41 (RFC 9297 §3.3)
+let WT_CAPSULE_CLOSE_SESSION = 10307;        // 0x2843 (RFC 9297 §5)
+
+fn h3_encode_webtransport_settings(max_field_section_size = 65536) {
+    let smap = map{};
+    smap[str(H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY)] = 0;
+    smap[str(H3_SETTINGS_MAX_FIELD_SECTION_SIZE)] = max_field_section_size;
+    smap[str(H3_SETTINGS_ENABLE_CONNECT_PROTOCOL)] = 1;
+    smap[str(H3_SETTINGS_H3_DATAGRAM)] = 1;
+    return h3_encode_settings(smap);
+}
+
+fn wt_build_connect_headers(authority, path = "/", origin = nil, extra_headers = nil) {
+    let auth_s = str_trim(str(authority));
+    if auth_s == "" or _has_ctl_bytes(auth_s) {
+        throw "http2_http3_adaptive: WebTransport CONNECT requires clean non-empty :authority";
+    }
+    let path_s = if path == nil or str(path) == "" { "/" } else { str(path) };
+    if _has_ctl_bytes(path_s) or not str_starts_with(path_s, "/") {
+        throw "http2_http3_adaptive: security — invalid or CRLF/NUL-injected WebTransport :path";
+    }
+    let pairs = [
+        [":method", "CONNECT"],
+        [":protocol", "webtransport"],
+        [":scheme", "https"],
+        [":authority", auth_s],
+        [":path", path_s],
+        ["sec-webtransport-http3-draft02", "1"]
+    ];
+    if origin != nil and str(origin) != "" {
+        if _has_ctl_bytes(origin) {
+            throw "http2_http3_adaptive: security — CRLF/NUL injection rejected in WebTransport Origin";
+        }
+        array_push(pairs, ["origin", str(origin)]);
+    }
+    if extra_headers != nil {
+        let ex = _normalize_header_pairs(extra_headers);
+        let i = 0;
+        while i < len(ex) {
+            if not str_starts_with(ex[i].name, ":") {
+                array_push(pairs, [ex[i].name, ex[i].value, ex[i].never_index]);
+            }
+            i = i + 1;
+        }
+    }
+    return pairs;
+}
+
+fn wt_validate_connect_request(headers_map, allowed_origins = nil) {
+    if not is_map(headers_map) {
+        return map{ ok: false, status: 400, reason: "missing headers map" };
+    }
+    let method = _opt(headers_map, ":method", "");
+    let proto = _opt(headers_map, ":protocol", "");
+    let scheme = _opt(headers_map, ":scheme", "");
+    let authority = _opt(headers_map, ":authority", "");
+    let path = _opt(headers_map, ":path", "");
+
+    if _has_ctl_bytes(authority) or _has_ctl_bytes(path) {
+        return map{ ok: false, status: 400, reason: "CRLF/NUL injection in WebTransport pseudo-headers" };
+    }
+    if method != "CONNECT" or proto != "webtransport" {
+        return map{ ok: false, status: 400, reason: "RFC 9297 requires :method=CONNECT and :protocol=webtransport" };
+    }
+    if scheme != "https" or authority == "" or path == "" {
+        return map{ ok: false, status: 400, reason: "RFC 9297 requires :scheme=https, :authority, and :path" };
+    }
+    if is_array(allowed_origins) and len(allowed_origins) > 0 {
+        let req_origin = str_lower(str(_opt(headers_map, "origin", "")));
+        let matched = false;
+        let i = 0;
+        while i < len(allowed_origins) {
+            if str_lower(str(allowed_origins[i])) == req_origin {
+                matched = true;
+                break;
+            }
+            i = i + 1;
+        }
+        if not matched {
+            return map{ ok: false, status: 403, reason: "WebTransport Origin rejected by allowlist" };
+        }
+    }
+    return map{
+        ok: true,
+        status: 200,
+        authority: authority,
+        path: path,
+        origin: _opt(headers_map, "origin", nil)
+    };
+}
+
+fn wt_build_connect_response_headers(status_code = 200, extra_headers = nil) {
+    let pairs = [
+        [":status", str(status_code)],
+        ["sec-webtransport-http3-draft", "draft02"]
+    ];
+    if extra_headers != nil {
+        let ex = _normalize_header_pairs(extra_headers);
+        let i = 0;
+        while i < len(ex) {
+            if ex[i].name != ":status" {
+                array_push(pairs, [ex[i].name, ex[i].value, ex[i].never_index]);
+            }
+            i = i + 1;
+        }
+    }
+    return pairs;
+}
+
+fn wt_encode_datagram(session_id, payload_bytes_or_str) {
+    // RFC 9297 §4.4: HTTP/3 DATAGRAM carries Quarter Stream ID = session_id / 4
+    // where session_id is a client-initiated bidirectional stream ID (divisible by 4).
+    if session_id < 0 or (session_id % 4) != 0 {
+        throw "http2_http3_adaptive: WebTransport session_id must be a client-initiated bidi stream (0, 4, 8...)";
+    }
+    let qsid = num_floor(session_id / 4);
+    let pay = if is_array(payload_bytes_or_str) { payload_bytes_or_str } else { str_to_bytes(str(payload_bytes_or_str)) };
+    let h3_dgram = [];
+    _append_bytes(h3_dgram, QUIC_RT.quic_encode_varint(qsid));
+    _append_bytes(h3_dgram, pay);
+    return QUIC_RT.quic_encode_datagram_frame(h3_dgram, true);
+}
+
+fn wt_decode_datagram(quic_dgram_frame_bytes) {
+    let qf = QUIC_RT.quic_decode_datagram_frame(quic_dgram_frame_bytes, 0);
+    let inner = qf.data;
+    if len(inner) == 0 {
+        throw "http2_http3_adaptive: empty HTTP/3 DATAGRAM payload (missing quarter_stream_id)";
+    }
+    let qsid_vi = QUIC_RT.quic_decode_varint(inner, 0);
+    let qsid = qsid_vi.value;
+    let app_data = slice(inner, qsid_vi.next, len(inner));
+    return map{
+        session_id: qsid * 4,
+        quarter_stream_id: qsid,
+        data: app_data,
+        text: bytes_to_str(app_data)
+    };
+}
+
+fn wt_encode_uni_stream(session_id, payload_bytes_or_str) {
+    if session_id < 0 or (session_id % 4) != 0 {
+        throw "http2_http3_adaptive: invalid WebTransport session_id for unidirectional stream";
+    }
+    let pay = if is_array(payload_bytes_or_str) { payload_bytes_or_str } else { str_to_bytes(str(payload_bytes_or_str)) };
+    let out = [];
+    _append_bytes(out, QUIC_RT.quic_encode_varint(WT_UNI_STREAM_TYPE)); // 0x54
+    _append_bytes(out, QUIC_RT.quic_encode_varint(session_id));
+    _append_bytes(out, pay);
+    return out;
+}
+
+fn wt_decode_uni_stream(stream_bytes) {
+    let b = if is_array(stream_bytes) { stream_bytes } else { str_to_bytes(str(stream_bytes)) };
+    let t_vi = QUIC_RT.quic_decode_varint(b, 0);
+    if t_vi.value != WT_UNI_STREAM_TYPE {
+        throw "http2_http3_adaptive: expected WebTransport uni stream type 0x54, got " + str(t_vi.value);
+    }
+    let s_vi = QUIC_RT.quic_decode_varint(b, t_vi.next);
+    let pay = slice(b, s_vi.next, len(b));
+    return map{
+        stream_type: t_vi.value,
+        session_id: s_vi.value,
+        data: pay,
+        text: bytes_to_str(pay)
+    };
+}
+
+fn wt_encode_bidi_stream(session_id, payload_bytes_or_str) {
+    if session_id < 0 or (session_id % 4) != 0 {
+        throw "http2_http3_adaptive: invalid WebTransport session_id for bidirectional stream";
+    }
+    let pay = if is_array(payload_bytes_or_str) { payload_bytes_or_str } else { str_to_bytes(str(payload_bytes_or_str)) };
+    let out = [];
+    _append_bytes(out, QUIC_RT.quic_encode_varint(WT_BIDI_SIGNAL_TYPE)); // 0x41
+    _append_bytes(out, QUIC_RT.quic_encode_varint(session_id));
+    _append_bytes(out, pay);
+    return out;
+}
+
+fn wt_decode_bidi_stream(stream_bytes) {
+    let b = if is_array(stream_bytes) { stream_bytes } else { str_to_bytes(str(stream_bytes)) };
+    let t_vi = QUIC_RT.quic_decode_varint(b, 0);
+    if t_vi.value != WT_BIDI_SIGNAL_TYPE {
+        throw "http2_http3_adaptive: expected WebTransport bidi signal 0x41, got " + str(t_vi.value);
+    }
+    let s_vi = QUIC_RT.quic_decode_varint(b, t_vi.next);
+    let pay = slice(b, s_vi.next, len(b));
+    return map{
+        signal_type: t_vi.value,
+        session_id: s_vi.value,
+        data: pay,
+        text: bytes_to_str(pay)
+    };
+}
+
+fn wt_encode_close_capsule(error_code = 0, error_msg = "") {
+    let mb = str_to_bytes(str(error_msg));
+    let val = [];
+    _push_u32_be(val, error_code);
+    _append_bytes(val, mb);
+    let out = [];
+    _append_bytes(out, QUIC_RT.quic_encode_varint(WT_CAPSULE_CLOSE_SESSION));
+    _append_bytes(out, QUIC_RT.quic_encode_varint(len(val)));
+    _append_bytes(out, val);
+    return out;
+}
+
+fn wt_decode_close_capsule(capsule_bytes) {
+    let b = if is_array(capsule_bytes) { capsule_bytes } else { str_to_bytes(str(capsule_bytes)) };
+    let t_vi = QUIC_RT.quic_decode_varint(b, 0);
+    if t_vi.value != WT_CAPSULE_CLOSE_SESSION {
+        throw "http2_http3_adaptive: expected CLOSE_WEBTRANSPORT_SESSION capsule (0x2843)";
+    }
+    let l_vi = QUIC_RT.quic_decode_varint(b, t_vi.next);
+    let start = l_vi.next;
+    if l_vi.value < 4 or start + l_vi.value > len(b) {
+        throw "http2_http3_adaptive: malformed CLOSE_WEBTRANSPORT_SESSION capsule";
+    }
+    let code = _read_u32_be(b, start);
+    let msg = bytes_to_str(slice(b, start + 4, start + l_vi.value));
+    return map{
+        capsule_type: t_vi.value,
+        error_code: code,
+        reason: msg
+    };
+}
+
+fn wt_pack_encrypted_datagram(chan, session_id, payload_bytes_or_str) {
+    let wt_dgram = wt_encode_datagram(session_id, payload_bytes_or_str);
+    return QUIC_RT.encode_telemetry_datagram(chan, wt_dgram);
+}
+
+fn wt_unpack_encrypted_datagram(chan, wire_bytes) {
+    let dec = QUIC_RT.decode_telemetry_datagram(chan, wire_bytes);
+    let wt = wt_decode_datagram(dec.data);
+    wt.quic_seq = dec.seq;
+    return wt;
+}
+
+// ============================================================================
+// 7. Privacy-First Encrypted DNS: DoH (RFC 8484) + DoQ (RFC 9250) +
+//    Automatic Legacy UDP (RFC 1035) Fallback
+// ============================================================================
+
+let _B64_STD_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+let _B64_URL_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn _encode_b64_alpha(bytes_arr, alphabet_str, with_padding) {
+    let alpha = str_to_bytes(alphabet_str);
+    let out = [];
+    let n = len(bytes_arr);
+    let i = 0;
+    while i + 2 < n {
+        let b0 = bytes_arr[i];
+        let b1 = bytes_arr[i + 1];
+        let b2 = bytes_arr[i + 2];
+        array_push(out, alpha[bit_shr(b0, 2)]);
+        array_push(out, alpha[bit_or(bit_shl(bit_and(b0, 3), 4), bit_shr(b1, 4))]);
+        array_push(out, alpha[bit_or(bit_shl(bit_and(b1, 15), 2), bit_shr(b2, 6))]);
+        array_push(out, alpha[bit_and(b2, 63)]);
+        i = i + 3;
+    }
+    let rem = n - i;
+    if rem == 1 {
+        let r0 = bytes_arr[i];
+        array_push(out, alpha[bit_shr(r0, 2)]);
+        array_push(out, alpha[bit_shl(bit_and(r0, 3), 4)]);
+        if with_padding {
+            array_push(out, 61); // '='
+            array_push(out, 61);
+        }
+    } elif rem == 2 {
+        let r0 = bytes_arr[i];
+        let r1 = bytes_arr[i + 1];
+        array_push(out, alpha[bit_shr(r0, 2)]);
+        array_push(out, alpha[bit_or(bit_shl(bit_and(r0, 3), 4), bit_shr(r1, 4))]);
+        array_push(out, alpha[bit_shl(bit_and(r1, 15), 2)]);
+        if with_padding {
+            array_push(out, 61);
+        }
+    }
+    return bytes_to_str(out);
+}
+
+fn base64_encode_bytes(bytes_arr) {
+    let b = if is_array(bytes_arr) { bytes_arr } else { str_to_bytes(str(bytes_arr)) };
+    return _encode_b64_alpha(b, _B64_STD_CHARS, true);
+}
+
+fn base64url_encode_bytes(bytes_arr) {
+    let b = if is_array(bytes_arr) { bytes_arr } else { str_to_bytes(str(bytes_arr)) };
+    return _encode_b64_alpha(b, _B64_URL_CHARS, false);
+}
+
+fn _b64url_val(byte_c) {
+    if byte_c >= 65 and byte_c <= 90 { return byte_c - 65; }       // A-Z
+    if byte_c >= 97 and byte_c <= 122 { return byte_c - 97 + 26; } // a-z
+    if byte_c >= 48 and byte_c <= 57 { return byte_c - 48 + 52; }  // 0-9
+    if byte_c == 45 or byte_c == 43 { return 62; }                 // '-' or '+'
+    if byte_c == 95 or byte_c == 47 { return 63; }                 // '_' or '/'
+    return -1;
+}
+
+fn base64url_decode_bytes(b64_str) {
+    let raw = str_to_bytes(str_trim(str(b64_str)));
+    let vals = [];
+    let i = 0;
+    while i < len(raw) {
+        let c = raw[i];
+        if c == 61 { break; } // '=' padding
+        let v = _b64url_val(c);
+        if v < 0 {
+            throw "http2_http3_adaptive: invalid base64url character byte " + str(c);
+        }
+        array_push(vals, v);
+        i = i + 1;
+    }
+    let out = [];
+    let j = 0;
+    let m = len(vals);
+    if (m % 4) == 1 {
+        throw "http2_http3_adaptive: invalid base64url length";
+    }
+    while j + 3 < m {
+        let v0 = vals[j];
+        let v1 = vals[j + 1];
+        let v2 = vals[j + 2];
+        let v3 = vals[j + 3];
+        array_push(out, bit_or(bit_shl(v0, 2), bit_shr(v1, 4)));
+        array_push(out, bit_and(bit_or(bit_shl(v1, 4), bit_shr(v2, 2)), 255));
+        array_push(out, bit_and(bit_or(bit_shl(v2, 6), v3), 255));
+        j = j + 4;
+    }
+    let rem = m - j;
+    if rem == 2 {
+        array_push(out, bit_or(bit_shl(vals[j], 2), bit_shr(vals[j + 1], 4)));
+    } elif rem == 3 {
+        array_push(out, bit_or(bit_shl(vals[j], 2), bit_shr(vals[j + 1], 4)));
+        array_push(out, bit_and(bit_or(bit_shl(vals[j + 1], 4), bit_shr(vals[j + 2], 2)), 255));
+    }
+    return out;
+}
+
+fn doh_encode_wire_query(domain, qtype = 1) {
+    // RFC 8484 §4.1: DoH clients SHOULD use a DNS ID of 0 in every request
+    // to maximize HTTP caching efficiency and avoid correlation fingerprinting!
+    let q = QUIC_RT.encode_dns_query(domain, qtype, 0, true);
+    return q.packet;
+}
+
+fn doh_build_request(endpoint_url, domain, qtype = 1, method = "POST") {
+    if _has_ctl_bytes(endpoint_url) or _has_ctl_bytes(domain) {
+        throw "http2_http3_adaptive: security — CRLF/NUL injection rejected in DoH endpoint or domain";
+    }
+    let m = str_upper(str_trim(str(method)));
+    if m != "GET" and m != "POST" {
+        throw "http2_http3_adaptive: DoH RFC 8484 only permits GET or POST";
+    }
+    let wire_pkt = doh_encode_wire_query(domain, qtype);
+    let b64_param = base64url_encode_bytes(wire_pkt);
+
+    if m == "GET" {
+        let sep = if str_contains(endpoint_url, "?") { "&" } else { "?" };
+        let full_url = endpoint_url + sep + "dns=" + b64_param;
+        let pu = HTTP1.parse_url(full_url);
+        return map{
+            method: "GET",
+            url: full_url,
+            request_target: pu.request_target,
+            headers: map{
+                "accept": "application/dns-message"
+            },
+            body_bytes: nil,
+            wire_packet: wire_pkt,
+            dns_param_b64url: b64_param
+        };
+    }
+
+    let pu_post = HTTP1.parse_url(endpoint_url);
+    return map{
+        method: "POST",
+        url: endpoint_url,
+        request_target: pu_post.request_target,
+        headers: map{
+            "accept": "application/dns-message",
+            "content-type": "application/dns-message",
+            "content-length": str(len(wire_pkt))
+        },
+        body_bytes: wire_pkt,
+        wire_packet: wire_pkt,
+        dns_param_b64url: b64_param
+    };
+}
+
+fn doh_extract_server_query(method, request_target, headers = nil, body_bytes_or_str = nil) {
+    let m = str_upper(str_trim(str(method)));
+    if m == "GET" {
+        let qidx = str_index_of(request_target, "?");
+        if qidx < 0 {
+            throw "http2_http3_adaptive: DoH GET missing '?dns=' query parameter";
+        }
+        let qstr = str_slice(request_target, qidx + 1, len(request_target));
+        let parts = str_split(qstr, "&");
+        let dns_val = "";
+        let i = 0;
+        while i < len(parts) {
+            if str_starts_with(parts[i], "dns=") {
+                dns_val = str_slice(parts[i], 4, len(parts[i]));
+                break;
+            }
+            i = i + 1;
+        }
+        if dns_val == "" {
+            throw "http2_http3_adaptive: DoH GET missing 'dns' parameter";
+        }
+        let raw_q = base64url_decode_bytes(dns_val);
+        return map{
+            wire_bytes: raw_q,
+            packet: QUIC_RT.decode_dns_packet(raw_q)
+        };
+    }
+    if m == "POST" {
+        let raw_p = if is_array(body_bytes_or_str) { body_bytes_or_str } else { str_to_bytes(str(body_bytes_or_str)) };
+        return map{
+            wire_bytes: raw_p,
+            packet: QUIC_RT.decode_dns_packet(raw_p)
+        };
+    }
+    throw "http2_http3_adaptive: unsupported DoH HTTP method '" + m + "'";
+}
+
+fn doh_parse_response(http_resp_or_bytes) {
+    if is_array(http_resp_or_bytes) {
+        return QUIC_RT.decode_dns_response(http_resp_or_bytes);
+    }
+    if is_map(http_resp_or_bytes) {
+        let st = _opt(http_resp_or_bytes, "status", 200);
+        if st != 200 {
+            throw "http2_http3_adaptive: DoH HTTP response failed with status " + str(st);
+        }
+        let hdrs = _opt(http_resp_or_bytes, "headers", map{});
+        let ct = str_lower(str(_opt(hdrs, "content-type", _opt(hdrs, "Content-Type", "application/dns-message"))));
+        if not str_starts_with(ct, "application/dns-message") {
+            throw "http2_http3_adaptive: invalid DoH Content-Type '" + ct + "'";
+        }
+        let bb = if map_has(http_resp_or_bytes, "body_bytes") and is_array(http_resp_or_bytes.body_bytes) {
+            http_resp_or_bytes.body_bytes
+        } else {
+            str_to_bytes(str(_opt(http_resp_or_bytes, "body", "")))
+        };
+        return QUIC_RT.decode_dns_response(bb);
+    }
+    return QUIC_RT.decode_dns_response(str_to_bytes(str(http_resp_or_bytes)));
+}
+
+fn doh_lookup(endpoint_url, domain, qtype = 1, opts = nil) {
+    let method = str_upper(str(_opt(opts, "method", "POST")));
+    let req_spec = doh_build_request(endpoint_url, domain, qtype, method);
+    let u = HTTP1.parse_url(req_spec.url);
+
+    // Anti-Leak Invariant #3: RFC 8484 DoH MUST use `https://` unless explicitly testing on local loopback!
+    let allow_insecure_loopback = _opt(opts, "allow_insecure_doh_loopback", false) == true and HTTP1.is_loopback_host(u.host);
+    if u.scheme != "https" and not allow_insecure_loopback {
+        throw "http2_http3_adaptive: security — RFC 8484 DoH requires https:// endpoint (plaintext http:// DoH forbidden)";
+    }
+
+    let req_opts = map{
+        method: req_spec.method,
+        headers: req_spec.headers,
+        body: if req_spec.body_bytes != nil { bytes_to_str(req_spec.body_bytes) } else { nil },
+        allow_loopback: _opt(opts, "allow_loopback", HTTP1.is_loopback_host(u.host)),
+        allow_private: _opt(opts, "allow_private", false),
+        h2_addr: _opt(opts, "h2_addr", nil),
+        h3_addr: _opt(opts, "h3_addr", nil),
+        quic_shared_key: _opt(opts, "quic_shared_key", nil),
+        concurrent_streams: _opt(opts, "concurrent_streams", 1)
+    };
+    let http_resp = adaptive_http_request(req_spec.url, req_opts);
+    let parsed = doh_parse_response(http_resp);
+    return map{
+        ok: parsed.rcode == 0,
+        transport: "DoH",
+        http_protocol: _opt(http_resp, "protocol", "HTTP/1.1"),
+        encrypted: u.scheme == "https" or _opt(http_resp, "protocol", "") == "HTTP/3",
+        tx_id: parsed.id,
+        rcode: parsed.rcode,
+        answers: parsed.answers
+    };
+}
+
+fn doq_encode_frame(dns_wire_bytes) {
+    // RFC 9250 §4.2 & §4.2.1:
+    //   1. DNS Message ID MUST be set to 0 on every DoQ QUIC stream!
+    //   2. All DoQ messages MUST be encoded with a 2-octet big-endian length field!
+    let raw = if is_array(dns_wire_bytes) { dns_wire_bytes } else { str_to_bytes(str(dns_wire_bytes)) };
+    if len(raw) < 12 or len(raw) > 65535 {
+        throw "http2_http3_adaptive: invalid DNS message length for DoQ frame";
+    }
+    let out = [];
+    _push_u16_be(out, len(raw));
+    array_push(out, 0); // Force DNS tx_id high byte = 0 per RFC 9250 §4.2.1
+    array_push(out, 0); // Force DNS tx_id low byte = 0 per RFC 9250 §4.2.1
+    let i = 2;
+    while i < len(raw) {
+        array_push(out, raw[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn doq_decode_frame(buf, pos = 0) {
+    let b = if is_array(buf) { buf } else { str_to_bytes(str(buf)) };
+    if pos + 2 > len(b) {
+        throw "http2_http3_adaptive: truncated 2-byte DoQ length prefix";
+    }
+    let mlen = _read_u16_be(b, pos);
+    let start = pos + 2;
+    let end_p = start + mlen;
+    if mlen < 12 or end_p > len(b) {
+        throw "http2_http3_adaptive: truncated DoQ DNS payload";
+    }
+    let dns_b = slice(b, start, end_p);
+    let pkt = QUIC_RT.decode_dns_packet(dns_b);
+    if pkt.id != 0 {
+        throw "http2_http3_adaptive: RFC 9250 §4.2.1 DOQ_PROTOCOL_ERROR — non-zero DNS tx_id on DoQ stream";
+    }
+    return map{
+        length: mlen,
+        dns_bytes: dns_b,
+        packet: pkt,
+        next: end_p
+    };
+}
+
+fn doq_lookup_quic(domain, qtype = 1, server_addr = "127.0.0.1:853", shared_key = "PBLang-DoQ-Default-Key", timeout_ms = 800) {
+    let sock = QUIC_RT.udp_bind("127.0.0.1:0");
+    let tx_chan = QUIC_RT.new_telemetry_channel(shared_key);
+    let rx_chan = QUIC_RT.new_telemetry_channel(shared_key);
+
+    let res = try map{
+        ok: true,
+        val: fn() {
+            let q = QUIC_RT.encode_dns_query(domain, qtype, 0, true);
+            let frame = doq_encode_frame(q.packet);
+            QUIC_RT.udp_telemetry_send(sock, tx_chan, frame, server_addr);
+            let rx = QUIC_RT.udp_telemetry_recv(sock, rx_chan, timeout_ms);
+            if not rx.ok {
+                throw "http2_http3_adaptive: DoQ QUIC lookup timed out";
+            }
+            let dec_f = doq_decode_frame(rx.data, 0);
+            let parsed = QUIC_RT.decode_dns_response(dec_f.dns_bytes);
+            return map{
+                ok: parsed.rcode == 0,
+                transport: "DoQ",
+                encrypted: true,
+                tx_id: parsed.id,
+                rcode: parsed.rcode,
+                answers: parsed.answers
+            };
+        }()
+    } catch err {
+        map{ ok: false, error: err }
+    };
+    QUIC_RT.udp_close(sock);
+    if not res.ok { throw res.error; }
+    return res.val;
+}
+
+fn resolve_dns_private(domain, qtype = 1, opts = nil) {
+    // Privacy-First Smart DNS Resolver (Zero Silent Plaintext Leak Invariant #3):
+    //   1. DoQ (RFC 9250 encrypted QUIC) if configured
+    //   2. DoH (RFC 8484 encrypted HTTPS) if configured
+    //   3. `strict_dns_privacy: true` IS THE DEFAULT — NEVER silently falls back to
+    //      unencrypted `UDP:53` on timeout/UDP-block unless `allow_plaintext_dns_fallback: true`
+    //      is explicitly passed by the caller!
+    if _has_ctl_bytes(domain) {
+        throw "http2_http3_adaptive: security — CRLF/NUL injection rejected in DNS domain";
+    }
+    let attempted = [];
+    let strict_privacy = _opt(opts, "strict_dns_privacy", true) == true;
+    let allow_plaintext = _opt(opts, "allow_plaintext_dns_fallback", false) == true;
+    let require_enc = _opt(opts, "require_encrypted", false) == true;
+    let doq_addr = _opt(opts, "doq_addr", nil);
+    let doh_url = _opt(opts, "doh_url", nil);
+    let udp_addr = _opt(opts, "udp_addr", nil);
+
+    if doq_addr != nil and str(doq_addr) != "" {
+        array_push(attempted, "DoQ");
+        let r_doq = try doq_lookup_quic(
+            domain,
+            qtype,
+            str(doq_addr),
+            _opt(opts, "doq_shared_key", "PBLang-DoQ-Default-Key"),
+            _opt(opts, "doq_timeout_ms", 350)
+        ) catch nil;
+        if r_doq != nil and r_doq.ok {
+            return map{
+                ok: true,
+                domain: domain,
+                qtype: qtype,
+                transport_used: "DoQ",
+                encrypted: true,
+                fallback_used: false,
+                attempted_transports: attempted,
+                answers: r_doq.answers
+            };
+        }
+    }
+
+    if doh_url != nil and str(doh_url) != "" {
+        array_push(attempted, "DoH");
+        let r_doh = try doh_lookup(str(doh_url), domain, qtype, opts) catch nil;
+        if r_doh != nil and r_doh.ok {
+            return map{
+                ok: true,
+                domain: domain,
+                qtype: qtype,
+                transport_used: "DoH",
+                encrypted: true,
+                fallback_used: len(attempted) > 1,
+                attempted_transports: attempted,
+                answers: r_doh.answers
+            };
+        }
+    }
+
+    if require_enc or (strict_privacy and not allow_plaintext) {
+        throw "http2_http3_adaptive: security — strict_dns_privacy blocked silent plaintext UDP:53 fallback (set allow_plaintext_dns_fallback: true to permit legacy UDP)";
+    }
+
+    if udp_addr != nil and str(udp_addr) != "" {
+        array_push(attempted, "UDP-RFC1035");
+        let r_udp = QUIC_RT.dns_lookup_udp(domain, qtype, str(udp_addr), _opt(opts, "udp_timeout_ms", 1000));
+        if r_udp.rcode == 0 {
+            return map{
+                ok: true,
+                domain: domain,
+                qtype: qtype,
+                transport_used: "UDP-RFC1035",
+                encrypted: false,
+                fallback_used: len(attempted) > 1,
+                attempted_transports: attempted,
+                answers: r_udp.answers
+            };
+        }
+    }
+
+    throw "http2_http3_adaptive: all configured DNS transports failed (" + array_join(attempted, " -> ") + ")";
+}
+
+// ============================================================================
+// 8. Modern Web Security, Anti-Tracking & Anti-CSRF Header Suite
+// ============================================================================
+
+fn generate_csp_nonce(num_bytes = 16) {
+    let n = if num_bytes < 16 { 16 } else { num_bytes };
+    return base64_encode_bytes(random_bytes(n));
+}
+
+fn build_hardened_http_security_headers(opts = nil) {
+    let nonce = _opt(opts, "csp_nonce", nil);
+    if nonce == nil or len(str(nonce)) < 16 {
+        nonce = generate_csp_nonce(16);
+    } else {
+        nonce = str(nonce);
+    }
+    HTTP1.validate_header_clean("X-CSP-Nonce-Check", nonce);
+
+    let hsts_max_age = _opt(opts, "hsts_max_age", 63072000);
+    let coop = str(_opt(opts, "coop", "same-origin"));
+    let corp = str(_opt(opts, "corp", "same-origin"));
+    let coep = str(_opt(opts, "coep", "require-corp"));
+    let referrer = str(_opt(opts, "referrer_policy", "strict-origin-when-cross-origin"));
+
+    let csp = "default-src 'none'; " +
+              "script-src 'nonce-" + nonce + "' 'strict-dynamic'; " +
+              "style-src 'self' 'nonce-" + nonce + "'; " +
+              "img-src 'self' data:; " +
+              "font-src 'self'; " +
+              "connect-src 'self'; " +
+              "object-src 'none'; " +
+              "base-uri 'none'; " +
+              "frame-ancestors 'none'; " +
+              "form-action 'self'; " +
+              "upgrade-insecure-requests";
+
+    // Explicitly disables unauthorized hardware sensors AND Google Topics / FLoC ad-tracking!
+    let permissions_policy = "accelerometer=(), autoplay=(), browsing-topics=(), camera=(), " +
+                             "display-capture=(), geolocation=(), gyroscope=(), hid=(), " +
+                             "interest-cohort=(), magnetometer=(), microphone=(), midi=(), " +
+                             "payment=(), usb=(), xr-spatial-tracking=()";
+
+    let headers = map{
+        "Content-Security-Policy": csp,
+        "Permissions-Policy": permissions_policy,
+        "Cross-Origin-Opener-Policy": coop,
+        "Cross-Origin-Resource-Policy": corp,
+        "Cross-Origin-Embedder-Policy": coep,
+        "Strict-Transport-Security": "max-age=" + str(hsts_max_age) + "; includeSubDomains; preload",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": referrer,
+        "X-Permitted-Cross-Domain-Policies": "none"
+    };
+
+    return map{
+        headers: headers,
+        csp_nonce: nonce
+    };
+}
+
+fn _ci_header_get(headers_in, target_lower) {
+    if not is_map(headers_in) { return ""; }
+    if map_has(headers_in, target_lower) and headers_in[target_lower] != nil {
+        return str_trim(str(headers_in[target_lower]));
+    }
+    let ks = map_keys(headers_in);
+    let i = 0;
+    while i < len(ks) {
+        if str_lower(str(ks[i])) == target_lower and headers_in[ks[i]] != nil {
+            return str_trim(str(headers_in[ks[i]]));
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn validate_sec_fetch_csrf(headers_in, method = "POST", opts = nil) {
+    let m = str_upper(str_trim(str(method)));
+    let is_safe_method = (m == "GET" or m == "HEAD" or m == "OPTIONS");
+
+    let site = str_lower(_ci_header_get(headers_in, "sec-fetch-site"));
+    let mode = str_lower(_ci_header_get(headers_in, "sec-fetch-mode"));
+    let dest = str_lower(_ci_header_get(headers_in, "sec-fetch-dest"));
+    let origin = str_lower(_ci_header_get(headers_in, "origin"));
+
+    // 1. Browser explicitly reports Fetch Metadata (`Sec-Fetch-Site`)
+    if site != "" {
+        if site == "same-origin" or site == "none" {
+            return map{ ok: true, status: 200, site: site, mode: mode, dest: dest, reason: "trusted same-origin or direct user action" };
+        }
+        if site == "same-site" {
+            if is_safe_method or _opt(opts, "allow_same_site", false) == true {
+                return map{ ok: true, status: 200, site: site, mode: mode, dest: dest, reason: "allowed same-site request" };
+            }
+            return map{
+                ok: false,
+                status: 403,
+                site: site,
+                mode: mode,
+                dest: dest,
+                reason: "CSRF blocked: Sec-Fetch-Site=same-site disallowed for state-mutating " + m
+            };
+        }
+        if site == "cross-site" {
+            // Allow safe top-level GET navigation (`<a href>`) unless strict cross-site isolation requested
+            if is_safe_method and mode == "navigate" and (dest == "document" or dest == "") and _opt(opts, "block_cross_site_navigation", false) != true {
+                return map{ ok: true, status: 200, site: site, mode: mode, dest: dest, reason: "safe top-level GET navigation" };
+            }
+            return map{
+                ok: false,
+                status: 403,
+                site: site,
+                mode: mode,
+                dest: dest,
+                reason: "CSRF/XSSI blocked: cross-site request rejected via Fetch Metadata (" + m + ", mode=" + mode + ")"
+            };
+        }
+        return map{ ok: false, status: 400, site: site, reason: "invalid Sec-Fetch-Site token" };
+    }
+
+    // 2. Fallback for older / non-browser clients without `Sec-Fetch-Site`
+    let expected_origin = str_lower(str(_opt(opts, "expected_origin", "")));
+    if origin != "" and expected_origin != "" and origin != expected_origin {
+        return map{ ok: false, status: 403, site: "", reason: "CSRF blocked: Origin mismatch (" + origin + ")" };
+    }
+    if not is_safe_method and _opt(opts, "allow_legacy_missing_sec_fetch", false) != true and expected_origin == "" {
+        return map{ ok: false, status: 403, site: "", reason: "CSRF blocked: missing Sec-Fetch-Site on state-mutating " + m };
+    }
+    return map{ ok: true, status: 200, site: "", reason: "legacy client permitted by policy" };
+}
+
+fn build_hardened_cookie(name, value, opts = nil) {
+    let raw_name = str_trim(str(name));
+    let val_s = str(value);
+    if _has_ctl_bytes(raw_name) or _has_ctl_bytes(val_s) {
+        throw "http2_http3_adaptive: security — CRLF/NUL injection rejected in cookie name or value";
+    }
+    if raw_name == "" or str_contains(raw_name, ";") or str_contains(raw_name, "=") or str_contains(val_s, ";") {
+        throw "http2_http3_adaptive: invalid cookie name or value";
+    }
+    HTTP1.validate_header_clean(raw_name, val_s);
+
+    let enforce_host = _opt(opts, "host_prefix", true) == true;
+    let final_name = if enforce_host and not str_starts_with(raw_name, "__Host-") {
+        "__Host-" + raw_name
+    } else {
+        raw_name
+    };
+    let is_host_prefixed = str_starts_with(final_name, "__Host-");
+    let domain_opt = str_trim(str(_opt(opts, "domain", "")));
+    if _has_ctl_bytes(domain_opt) or str_contains(domain_opt, ";") {
+        throw "http2_http3_adaptive: security — invalid or CRLF/NUL-injected cookie Domain attribute";
+    }
+    if is_host_prefixed and domain_opt != "" {
+        throw "http2_http3_adaptive: RFC 6265bis violation — __Host- cookies MUST NOT specify a Domain attribute";
+    }
+    let path_s = str(_opt(opts, "path", "/"));
+    if _has_ctl_bytes(path_s) or str_contains(path_s, ";") {
+        throw "http2_http3_adaptive: security — invalid or CRLF/NUL-injected cookie Path attribute";
+    }
+    if is_host_prefixed and path_s != "/" {
+        throw "http2_http3_adaptive: RFC 6265bis violation — __Host- cookies MUST specify Path=/";
+    }
+
+    let same_site = str(_opt(opts, "same_site", "Strict"));
+    if _has_ctl_bytes(same_site) or str_contains(same_site, ";") {
+        throw "http2_http3_adaptive: security — invalid or CRLF/NUL-injected cookie SameSite attribute";
+    }
+    let max_age = _opt(opts, "max_age", 3600);
+    let http_only = _opt(opts, "http_only", true) == true;
+
+    let parts = [final_name + "=" + val_s, "Path=" + path_s, "Secure"];
+    if http_only {
+        array_push(parts, "HttpOnly");
+    }
+    array_push(parts, "SameSite=" + same_site);
+    if max_age != nil {
+        array_push(parts, "Max-Age=" + str(max_age));
+    }
+    if not is_host_prefixed and domain_opt != "" {
+        array_push(parts, "Domain=" + domain_opt);
+    }
+    return array_join(parts, "; ");
+}
+
+fn validate_hardened_cookie(set_cookie_header) {
+    if _has_ctl_bytes(set_cookie_header) {
+        return map{ ok: false, issues: ["CRLF/NUL control-byte injection in Set-Cookie header"] };
+    }
+    let s = str_trim(str(set_cookie_header));
+    let segs = str_split(s, ";");
+    if len(segs) == 0 or str_index_of(segs[0], "=") <= 0 {
+        return map{ ok: false, issues: ["malformed name=value pair"] };
+    }
+    let first_eq = str_index_of(segs[0], "=");
+    let cname = str_trim(str_slice(segs[0], 0, first_eq));
+
+    let has_secure = false;
+    let has_httponly = false;
+    let has_domain = false;
+    let path_val = "";
+    let samesite_val = "";
+
+    let i = 1;
+    while i < len(segs) {
+        let attr = str_trim(segs[i]);
+        let low = str_lower(attr);
+        if low == "secure" {
+            has_secure = true;
+        } elif low == "httponly" {
+            has_httponly = true;
+        } elif str_starts_with(low, "domain=") {
+            has_domain = true;
+        } elif str_starts_with(low, "path=") {
+            path_val = str_trim(str_slice(attr, 5, len(attr)));
+        } elif str_starts_with(low, "samesite=") {
+            samesite_val = str_lower(str_trim(str_slice(attr, 9, len(attr))));
+        }
+        i = i + 1;
+    }
+
+    let issues = [];
+    let is_host = str_starts_with(cname, "__Host-");
+    let is_secure_pref = str_starts_with(cname, "__Secure-");
+
+    if not has_secure {
+        array_push(issues, "missing Secure attribute");
+    }
+    if not has_httponly {
+        array_push(issues, "missing HttpOnly attribute");
+    }
+    if samesite_val != "strict" and samesite_val != "lax" {
+        array_push(issues, "SameSite must be Strict or Lax (got '" + samesite_val + "')");
+    }
+    if is_host {
+        if has_domain {
+            array_push(issues, "__Host- cookie MUST NOT contain a Domain attribute");
+        }
+        if path_val != "/" {
+            array_push(issues, "__Host- cookie MUST specify Path=/");
+        }
+    }
+    if is_secure_pref and not has_secure {
+        array_push(issues, "__Secure- cookie MUST specify Secure");
+    }
+
+    return map{
+        ok: len(issues) == 0,
+        cookie_name: cname,
+        has_host_prefix: is_host,
+        secure: has_secure,
+        http_only: has_httponly,
+        same_site: samesite_val,
+        path: path_val,
+        has_domain: has_domain,
+        issues: issues
+    };
+}
+
+fn build_privacy_client_hints(opts = nil) {
+    // W3C User-Agent Reduction & Zero High-Entropy Fingerprinting:
+    // Emits frozen minimal User-Agent + low-entropy Client Hints + Global Privacy Control (`Sec-GPC: 1`),
+    // deliberately omitting OS build version, CPU architecture/bitness, device model, and minor build IDs!
+    let brand = str(_opt(opts, "brand", "PBLang"));
+    let major_ver = str(_opt(opts, "major_version", "4"));
+    let platform = str(_opt(opts, "platform", "Unknown")); // Neutral platform avoids OS fingerprinting
+    if _has_ctl_bytes(brand) or _has_ctl_bytes(major_ver) or _has_ctl_bytes(platform) {
+        throw "http2_http3_adaptive: security — CRLF/NUL injection rejected in Client Hints";
+    }
+    let is_mobile = _opt(opts, "mobile", false) == true;
+    let send_gpc = _opt(opts, "gpc", true) == true;
+
+    let hdrs = map{
+        "User-Agent": brand + "/" + major_ver + ".0",
+        "Sec-CH-UA": "\"" + brand + "\";v=\"" + major_ver + "\"",
+        "Sec-CH-UA-Mobile": if is_mobile { "?1" } else { "?0" },
+        "Sec-CH-UA-Platform": "\"" + platform + "\""
+    };
+    if send_gpc {
+        hdrs["Sec-GPC"] = "1";
+        hdrs["DNT"] = "1";
+    }
+    return hdrs;
+}
+
+fn strip_fingerprinting_headers(headers_in) {
+    let out = map{};
+    if not is_map(headers_in) { return out; }
+    let ks = map_keys(headers_in);
+    let i = 0;
+    while i < len(ks) {
+        let k = ks[i];
+        let low = str_lower(str(k));
+        let is_high_entropy = (
+            low == "sec-ch-ua-full-version" or
+            low == "sec-ch-ua-full-version-list" or
+            low == "sec-ch-ua-platform-version" or
+            low == "sec-ch-ua-arch" or
+            low == "sec-ch-ua-bitness" or
+            low == "sec-ch-ua-model" or
+            low == "sec-ch-ua-wow64" or
+            low == "device-memory" or
+            low == "dpr" or
+            low == "viewport-width" or
+            low == "x-client-data"
+        );
+        if not is_high_entropy {
+            out[k] = headers_in[k];
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+export H2_PREFACE,
+       H2_FRAME_DATA, H2_FRAME_HEADERS, H2_FRAME_PRIORITY, H2_FRAME_RST_STREAM,
+       H2_FRAME_SETTINGS, H2_FRAME_PUSH_PROMISE, H2_FRAME_PING, H2_FRAME_GOAWAY,
+       H2_FRAME_WINDOW_UPDATE, H2_FRAME_CONTINUATION,
+       H2_FLAG_NONE, H2_FLAG_END_STREAM, H2_FLAG_ACK, H2_FLAG_END_HEADERS,
+       H2_FLAG_PADDED, H2_FLAG_PRIORITY,
+       H2_NO_ERROR, H2_PROTOCOL_ERROR, H2_INTERNAL_ERROR, H2_FLOW_CONTROL_ERROR,
+       H2_STREAM_CLOSED, H2_FRAME_SIZE_ERROR, H2_COMPRESSION_ERROR, H2_ENHANCE_YOUR_CALM,
+       H2_SETTINGS_HEADER_TABLE_SIZE, H2_SETTINGS_ENABLE_PUSH,
+       H2_SETTINGS_MAX_CONCURRENT_STREAMS, H2_SETTINGS_INITIAL_WINDOW_SIZE,
+       H2_SETTINGS_MAX_FRAME_SIZE, H2_SETTINGS_MAX_HEADER_LIST_SIZE,
+       H3_FRAME_DATA, H3_FRAME_HEADERS, H3_FRAME_CANCEL_PUSH, H3_FRAME_SETTINGS,
+       H3_FRAME_PUSH_PROMISE, H3_FRAME_GOAWAY, H3_FRAME_MAX_PUSH_ID,
+       H3_NO_ERROR, H3_GENERAL_PROTOCOL_ERROR, H3_FRAME_UNEXPECTED, H3_SETTINGS_ERROR,
+       H3_SETTINGS_ENABLE_CONNECT_PROTOCOL, H3_SETTINGS_H3_DATAGRAM,
+       WT_UNI_STREAM_TYPE, WT_BIDI_SIGNAL_TYPE, WT_CAPSULE_CLOSE_SESSION,
+       HPACK_STATIC_TABLE, QPACK_STATIC_TABLE,
+       encode_http09_request, parse_http09_request, decode_http09_response,
+       encode_http10_request, decode_http10_response,
+       hpack_encode_int, hpack_decode_int,
+       hpack_new_context, hpack_set_max_table_size, hpack_encode_headers, hpack_decode_headers,
+       headers_list_to_map,
+       h2_encode_frame, h2_decode_frame, h2_read_frame_tcp, h2_write_frame_tcp,
+       h2_encode_settings, h2_decode_settings,
+       h2_encode_window_update, h2_encode_rst_stream, h2_encode_ping,
+       h2_encode_goaway, h2_decode_goaway,
+       h2_new_connection, h2_open_stream, h2_build_request_frames, h2_build_response_frames,
+       h2_receive_frame, h2_compression_stats,
+       h2c_exchange_multiplexed, h2c_serve_connection,
+       h3_encode_frame, h3_decode_frame, h3_encode_settings, h3_decode_settings,
+       qpack_encode_headers, qpack_decode_headers,
+       parse_alt_svc, new_alt_svc_cache, record_alt_svc, lookup_alt_svc_h3,
+       h3_pack_quic_stream_datagram, h3_unpack_quic_stream_datagram, h3_quic_request,
+       select_optimal_http_protocol, adaptive_http_request,
+       h3_encode_webtransport_settings,
+       wt_build_connect_headers, wt_validate_connect_request, wt_build_connect_response_headers,
+       wt_encode_datagram, wt_decode_datagram,
+       wt_encode_uni_stream, wt_decode_uni_stream,
+       wt_encode_bidi_stream, wt_decode_bidi_stream,
+       wt_encode_close_capsule, wt_decode_close_capsule,
+       wt_pack_encrypted_datagram, wt_unpack_encrypted_datagram,
+       base64_encode_bytes, base64url_encode_bytes, base64url_decode_bytes,
+       doh_encode_wire_query, doh_build_request, doh_extract_server_query,
+       doh_parse_response, doh_lookup,
+       doq_encode_frame, doq_decode_frame, doq_lookup_quic,
+       resolve_dns_private,
+       generate_csp_nonce, build_hardened_http_security_headers,
+       validate_sec_fetch_csrf, build_hardened_cookie, validate_hardened_cookie,
+       build_privacy_client_hints, strip_fingerprinting_headers;

@@ -827,6 +827,7 @@ typedef enum {
     PAT_VAR,
     PAT_ARRAY,
     PAT_MAP,
+    PAT_ENUM,
     PAT_OR
 } ZrPatKind;
 
@@ -834,6 +835,9 @@ struct ZrPat {
     ZrPatKind    kind;
     ZrExpr      *lit_expr;
     const char  *var_name;
+    const char  *enum_name;    /* nullable: qualified Enum.Variant vs unqualified Variant(...) */
+    const char  *variant_name; /* for PAT_ENUM */
+    bool         has_parens;   /* true for Variant(...) destructuring, false for unit Enum.Variant */
     ZrPat      **sub_pats;
     const char **map_keys;
     size_t       sub_count;
@@ -923,6 +927,7 @@ typedef enum {
     ST_FOR_COUNT,  /* for i count { body } */
     ST_FOR_IN,     /* for x in col { body } */
     ST_FOR_KV,     /* for k, v in map { body } */
+    ST_FOR_C,      /* for (init; cond; step) { body } */
     ST_BREAK,
     ST_CONTINUE,
     ST_RETURN,
@@ -950,6 +955,7 @@ struct ZrStmt {
         struct { const char *var; ZrExpr *count_e; ZrStmt **body; size_t body_n; } for_c;
         struct { const char *var; ZrExpr *col_e; ZrStmt **body; size_t body_n; } for_in;
         struct { const char *kvar; const char *vvar; ZrExpr *map_e; ZrStmt **body; size_t body_n; } for_kv;
+        struct { ZrStmt *init_st; ZrExpr *cond_e; ZrStmt *step_st; ZrStmt **body; size_t body_n; } cfor_s;
         struct { int prec; ZrExpr *expr; } printf_s;
         struct { const char **names; size_t count; } exp_s;
         struct {
@@ -1181,7 +1187,9 @@ static bool zp_skip_type_expr(ZrParser *p) {
             }
         } else {
             if (!zp_expect_any_name(p, "type name")) return false;
-            while (zp_match(p, TOK_DOT)) {
+            while (zp_match(p, TOK_DOT) ||
+                   (zp_check(p, TOK_COLON) && zp_peek_n(p, 1)->kind == TOK_COLON &&
+                    (zp_advance(p), zp_advance(p), true))) {
                 if (!zp_expect_any_name(p, "qualified type name")) return false;
             }
             if (zp_match(p, TOK_LT)) {
@@ -1204,6 +1212,24 @@ static bool zp_skip_type_expr(ZrParser *p) {
         }
         if (!zp_match(p, TOK_PIPE)) break;
     }
+    return true;
+}
+
+/* Skip optional generic type parameter list `<T, E: Bound, ...>` on declarations and turbofish */
+static bool zp_skip_optional_type_params(ZrParser *p) {
+    if (!zp_match(p, TOK_LT)) return true;
+    int d = 1;
+    while (d > 0 && !zp_check(p, TOK_EOF)) {
+        if (zp_match(p, TOK_LT)) d++;
+        else if (zp_match(p, TOK_GT)) d--;
+        else if (zp_match(p, TOK_SHR)) {
+            if (d < 2) return zp_err(p, "unexpected '>>' in generic type parameter list");
+            d -= 2;
+        } else {
+            zp_advance(p);
+        }
+    }
+    if (d != 0) return zp_err(p, "unclosed '<' in generic type parameter list");
     return true;
 }
 
@@ -1508,6 +1534,30 @@ static ZrExpr *zp_parse_block_expr(ZrParser *p, uint32_t line) {
     return b;
 }
 
+static ZrPat *zp_parse_pat(ZrParser *p);
+
+static bool zp_parse_enum_pat_args(ZrParser *p, ZrPat *pat) {
+    ZrPat **subs = NULL;
+    size_t n = 0, cap = 0;
+    while (!zp_check(p, TOK_RPAREN) && !zp_check(p, TOK_EOF)) {
+        ZrPat *sp = zp_parse_pat(p);
+        if (!sp) return false;
+        if (n >= cap) {
+            cap = cap ? cap * 2 : 4;
+            ZrPat **ns = (ZrPat **)zr_arena_alloc(p->arena, cap * sizeof(ZrPat *));
+            if (n > 0) memcpy(ns, subs, n * sizeof(ZrPat *));
+            subs = ns;
+        }
+        subs[n++] = sp;
+        if (!zp_match(p, TOK_COMMA)) break;
+    }
+    if (!zp_expect(p, TOK_RPAREN, "')'")) return false;
+    pat->sub_pats = subs;
+    pat->sub_count = n;
+    pat->has_parens = true;
+    return true;
+}
+
 static ZrPat *zp_parse_single_pat(ZrParser *p) {
     ZrPat *pat = (ZrPat *)zr_arena_alloc(p->arena, sizeof(ZrPat));
     if (zp_check_ident_str(p, "_")) {
@@ -1624,6 +1674,34 @@ static ZrPat *zp_parse_single_pat(ZrParser *p) {
     }
     const char *vname = zp_expect_decl_name(p, "pattern");
     if (!vname) return NULL;
+    /* Optional turbofish on enum name: `Result::<number, string>::Ok(x)` */
+    if (zp_check(p, TOK_COLON) && zp_peek_n(p, 1)->kind == TOK_COLON && zp_peek_n(p, 2)->kind == TOK_LT) {
+        zp_advance(p);
+        zp_advance(p);
+        if (!zp_skip_optional_type_params(p)) return NULL;
+    }
+    /* Qualified enum variant: `Enum.Variant[(...)]` or `Enum::Variant[(...)]` */
+    if (zp_match(p, TOK_DOT) ||
+        (zp_check(p, TOK_COLON) && zp_peek_n(p, 1)->kind == TOK_COLON && (zp_advance(p), zp_advance(p), true))) {
+        const char *var_nm = zp_expect_any_name(p, "enum variant name");
+        if (!var_nm) return NULL;
+        pat->kind = PAT_ENUM;
+        pat->enum_name = vname;
+        pat->variant_name = var_nm;
+        pat->has_parens = false;
+        if (zp_match(p, TOK_LPAREN)) {
+            if (!zp_parse_enum_pat_args(p, pat)) return NULL;
+        }
+        return pat;
+    }
+    /* Unqualified variant destructuring: `Ok(x)`, `Err(msg)`, `Some(v)` */
+    if (zp_match(p, TOK_LPAREN)) {
+        pat->kind = PAT_ENUM;
+        pat->enum_name = NULL;
+        pat->variant_name = vname;
+        if (!zp_parse_enum_pat_args(p, pat)) return NULL;
+        return pat;
+    }
     pat->kind = PAT_VAR;
     pat->var_name = vname;
     return pat;
@@ -1840,10 +1918,11 @@ static ZrExpr *zp_parse_primary(ZrParser *p) {
             bool is_async = zp_match(p, TOK_ASYNC);
             if (!zp_expect(p, TOK_FN, "'fn'")) { p->depth--; return NULL; }
             const char *fname = NULL;
-            if (!zp_check(p, TOK_LPAREN)) {
+            if (!zp_check(p, TOK_LPAREN) && !zp_check(p, TOK_LT)) {
                 fname = zp_expect_any_name(p, "function name");
                 if (!fname) { p->depth--; return NULL; }
             }
+            if (!zp_skip_optional_type_params(p)) { p->depth--; return NULL; }
             ZrParam *params = NULL; size_t pcount = 0;
             if (!zp_parse_param_list(p, &params, &pcount)) { p->depth--; return NULL; }
             ZrExpr **reqs = NULL, **ens = NULL;
@@ -2108,6 +2187,20 @@ static ZrExpr *zp_parse_postfix(ZrParser *p) {
             ie->u.idx.obj = cur;
             ie->u.idx.idx = idx_e;
             cur = ie;
+        } else if (zp_check(p, TOK_COLON) && zp_peek_n(p, 1)->kind == TOK_COLON) {
+            /* Path access `Enum::Variant` and turbofish `fn::<T, U>(...)` / `Enum::<T>::Variant` */
+            zp_advance(p);
+            zp_advance(p);
+            if (zp_check(p, TOK_LT)) {
+                if (!zp_skip_optional_type_params(p)) return NULL;
+                continue;
+            }
+            const char *attr = zp_expect_any_name(p, "path member name");
+            if (!attr) return NULL;
+            ZrExpr *ae = zp_alloc_expr(p, EX_ATTR, ln);
+            ae->u.attr.obj = cur;
+            ae->u.attr.attr = attr;
+            cur = ae;
         } else if (zp_check(p, TOK_COLON) &&
                    (zp_peek_n(p, 1)->kind == TOK_IDENT ||
                     (zp_peek_n(p, 1)->kind >= TOK_LET && zp_peek_n(p, 1)->kind <= TOK_NIL)) &&
@@ -2601,10 +2694,10 @@ static ZrStmt *zp_parse_let_or_const(ZrParser *p, bool is_const, uint32_t line) 
     return s;
 }
 
-/* Desugar `struct Name { f1: T1, f2: T2 }` -> `fn Name(f1, f2) { return map{ __struct: "Name", f1: f1, f2: f2 }; }` */
+/* Desugar `struct Name<T> { f1: T1, f2: T2 }` -> `fn Name(f1, f2) { return map{ __struct: "Name", f1: f1, f2: f2 }; }` */
 static ZrStmt *zp_parse_struct_stmt(ZrParser *p, uint32_t line) {
     const char *sname = zp_expect_decl_name(p, "struct name");
-    if (!sname || !zp_expect(p, TOK_LBRACE, "'{'")) return NULL;
+    if (!sname || !zp_skip_optional_type_params(p) || !zp_expect(p, TOK_LBRACE, "'{'")) return NULL;
     const char **fields = NULL;
     size_t n = 0, cap = 0;
     while (!zp_check(p, TOK_RBRACE) && !zp_check(p, TOK_EOF)) {
@@ -2655,14 +2748,19 @@ static ZrStmt *zp_parse_struct_stmt(ZrParser *p, uint32_t line) {
     return fn_s;
 }
 
-/* Desugar `interface Name { m1; m2(a); }` -> `fn Name(x) { return is_map(x) and has_member(x, "m1") ...; }` */
-static ZrStmt *zp_parse_interface_stmt(ZrParser *p, uint32_t line) {
-    const char *iname = zp_expect_decl_name(p, "interface name");
-    if (!iname || !zp_expect(p, TOK_LBRACE, "'{'")) return NULL;
+/* Desugar `interface Name<T> { ... }` -> `fn Name(x) { ... }`
+   and `trait Name<T> { ... }` -> `let Name = map{ __trait_name, __methods, check, __call }` */
+static ZrStmt *zp_parse_interface_stmt(ZrParser *p, uint32_t line, bool is_trait) {
+    const char *iname = zp_expect_decl_name(p, is_trait ? "trait name" : "interface name");
+    if (!iname || !zp_skip_optional_type_params(p) || !zp_expect(p, TOK_LBRACE, "'{'")) return NULL;
     ZrExpr *acc = zp_mk_call1(p, "is_map", zp_mk_var(p, "x", line), line);
+    ZrExpr **mnames = NULL;
+    size_t mn = 0, mcap = 0;
     while (!zp_check(p, TOK_RBRACE) && !zp_check(p, TOK_EOF)) {
-        const char *mname = zp_expect_any_name(p, "interface member");
+        zp_match(p, TOK_FN); /* optional `fn` inside trait/interface body */
+        const char *mname = zp_expect_any_name(p, is_trait ? "trait member" : "interface member");
         if (!mname) return NULL;
+        if (!zp_skip_optional_type_params(p)) return NULL;
         if (zp_match(p, TOK_LPAREN)) {
             int d = 1;
             while (d > 0 && !zp_check(p, TOK_EOF)) {
@@ -2676,7 +2774,15 @@ static ZrStmt *zp_parse_interface_stmt(ZrParser *p, uint32_t line) {
         }
         zp_match(p, TOK_SEMI);
         zp_match(p, TOK_COMMA);
-        ZrExpr *hm = zp_mk_call2(p, "has_member", zp_mk_var(p, "x", line), zp_mk_str(p, mname, strlen(mname), line), line);
+        ZrExpr *ms = zp_mk_str(p, mname, strlen(mname), line);
+        if (mn >= mcap) {
+            mcap = mcap ? mcap * 2 : 4;
+            ZrExpr **nm = (ZrExpr **)zr_arena_alloc(p->arena, mcap * sizeof(ZrExpr *));
+            if (mn > 0) memcpy(nm, mnames, mn * sizeof(ZrExpr *));
+            mnames = nm;
+        }
+        mnames[mn++] = ms;
+        ZrExpr *hm = zp_mk_call2(p, "has_member", zp_mk_var(p, "x", line), ms, line);
         ZrExpr *and_e = zp_alloc_expr(p, EX_LOGICAL, line);
         and_e->u.bin.op = TOK_AND;
         and_e->u.bin.lhs = acc;
@@ -2690,21 +2796,49 @@ static ZrStmt *zp_parse_interface_stmt(ZrParser *p, uint32_t line) {
     ret->u.expr = acc;
     ZrStmt **body = (ZrStmt **)zr_arena_alloc(p->arena, sizeof(ZrStmt *));
     body[0] = ret;
-    ZrStmt *fn_s = zp_alloc_stmt(p, ST_FN, line);
-    fn_s->u.fn_s.name = iname;
-    fn_s->u.fn_s.params = params;
-    fn_s->u.fn_s.param_count = 1;
-    fn_s->u.fn_s.body = body;
-    fn_s->u.fn_s.body_count = 1;
-    return fn_s;
+    if (!is_trait) {
+        ZrStmt *fn_s = zp_alloc_stmt(p, ST_FN, line);
+        fn_s->u.fn_s.name = iname;
+        fn_s->u.fn_s.params = params;
+        fn_s->u.fn_s.param_count = 1;
+        fn_s->u.fn_s.body = body;
+        fn_s->u.fn_s.body_count = 1;
+        return fn_s;
+    }
+    ZrExpr *chk_fn = zp_alloc_expr(p, EX_FN, line);
+    chk_fn->u.fn.name = iname;
+    chk_fn->u.fn.params = params;
+    chk_fn->u.fn.param_count = 1;
+    chk_fn->u.fn.body = body;
+    chk_fn->u.fn.body_count = 1;
+
+    ZrExpr *marr = zp_alloc_expr(p, EX_ARRAY, line);
+    marr->u.arr.items = mnames;
+    marr->u.arr.count = mn;
+
+    ZrExpr **tk = (ZrExpr **)zr_arena_alloc(p->arena, 4 * sizeof(ZrExpr *));
+    ZrExpr **tv = (ZrExpr **)zr_arena_alloc(p->arena, 4 * sizeof(ZrExpr *));
+    tk[0] = zp_mk_str(p, "__trait_name", 12, line); tv[0] = zp_mk_str(p, iname, strlen(iname), line);
+    tk[1] = zp_mk_str(p, "__methods", 9, line);     tv[1] = marr;
+    tk[2] = zp_mk_str(p, "check", 5, line);         tv[2] = chk_fn;
+    tk[3] = zp_mk_str(p, "__call", 6, line);        tv[3] = chk_fn;
+    ZrExpr *tmap = zp_alloc_expr(p, EX_MAP, line);
+    tmap->u.map.keys = tk;
+    tmap->u.map.vals = tv;
+    tmap->u.map.count = 4;
+
+    ZrStmt *ls = zp_alloc_stmt(p, ST_LET, line);
+    ls->u.let_s.name = iname;
+    ls->u.let_s.init = tmap;
+    return ls;
 }
 
-/* Desugar `enum Name { Red, Circle(number) }` */
+/* Desugar `enum Name<T, E> { Red, Circle(number), Ok(v: T) }` */
 static ZrStmt *zp_parse_enum_stmt(ZrParser *p, uint32_t line) {
     const char *ename = zp_expect_decl_name(p, "enum name");
-    if (!ename || !zp_expect(p, TOK_LBRACE, "'{'")) return NULL;
-    ZrExpr **ekeys = NULL, **evals = NULL;
-    size_t n = 0, cap = 0;
+    if (!ename || !zp_skip_optional_type_params(p) || !zp_expect(p, TOK_LBRACE, "'{'")) return NULL;
+    ZrExpr **ekeys = NULL, **evals = NULL, **vnames = NULL;
+    size_t n = 0, cap = 0, vn = 0;
     while (!zp_check(p, TOK_RBRACE) && !zp_check(p, TOK_EOF)) {
         const char *vname = zp_expect_any_name(p, "enum variant");
         if (!vname) return NULL;
@@ -2712,6 +2846,12 @@ static ZrStmt *zp_parse_enum_stmt(ZrParser *p, uint32_t line) {
         if (zp_match(p, TOK_LPAREN)) {
             size_t arity = 0;
             while (!zp_check(p, TOK_RPAREN) && !zp_check(p, TOK_EOF)) {
+                if ((zp_peek(p)->kind == TOK_IDENT ||
+                     (zp_peek(p)->kind >= TOK_LET && zp_peek(p)->kind <= TOK_NIL)) &&
+                    zp_peek_n(p, 1)->kind == TOK_COLON) {
+                    zp_advance(p);
+                    zp_advance(p);
+                }
                 if (!zp_skip_type_expr(p)) return NULL;
                 arity++;
                 if (!zp_match(p, TOK_COMMA)) break;
@@ -2754,19 +2894,36 @@ static ZrStmt *zp_parse_enum_stmt(ZrParser *p, uint32_t line) {
             ventry = zp_alloc_expr(p, EX_MAP, line);
             ventry->u.map.keys = vk; ventry->u.map.vals = vv; ventry->u.map.count = 2;
         }
-        if (n >= cap) {
-            cap = cap ? cap * 2 : 4;
+        if (n + 2 >= cap) {
+            cap = cap ? cap * 2 : 8;
             ZrExpr **nk = (ZrExpr **)zr_arena_alloc(p->arena, cap * sizeof(ZrExpr *));
             ZrExpr **nv = (ZrExpr **)zr_arena_alloc(p->arena, cap * sizeof(ZrExpr *));
-            if (n > 0) { memcpy(nk, ekeys, n * sizeof(ZrExpr *)); memcpy(nv, evals, n * sizeof(ZrExpr *)); }
-            ekeys = nk; evals = nv;
+            ZrExpr **nn = (ZrExpr **)zr_arena_alloc(p->arena, cap * sizeof(ZrExpr *));
+            if (n > 0) {
+                memcpy(nk, ekeys, n * sizeof(ZrExpr *));
+                memcpy(nv, evals, n * sizeof(ZrExpr *));
+                memcpy(nn, vnames, vn * sizeof(ZrExpr *));
+            }
+            ekeys = nk; evals = nv; vnames = nn;
         }
-        ekeys[n] = zp_mk_str(p, vname, strlen(vname), line);
+        ZrExpr *vn_s = zp_mk_str(p, vname, strlen(vname), line);
+        ekeys[n] = vn_s;
         evals[n] = ventry;
+        vnames[vn++] = vn_s;
         n++;
         if (!zp_match(p, TOK_COMMA) && !zp_match(p, TOK_SEMI)) break;
     }
     if (!zp_expect(p, TOK_RBRACE, "'}'")) return NULL;
+    if (!ekeys) {
+        ekeys = (ZrExpr **)zr_arena_alloc(p->arena, 2 * sizeof(ZrExpr *));
+        evals = (ZrExpr **)zr_arena_alloc(p->arena, 2 * sizeof(ZrExpr *));
+    }
+    ZrExpr *varr_meta = zp_alloc_expr(p, EX_ARRAY, line);
+    varr_meta->u.arr.items = vnames;
+    varr_meta->u.arr.count = vn;
+    ekeys[n] = zp_mk_str(p, "__enum_name", 11, line); evals[n] = zp_mk_str(p, ename, strlen(ename), line); n++;
+    ekeys[n] = zp_mk_str(p, "__variants", 10, line);  evals[n] = varr_meta; n++;
+
     ZrExpr *emap = zp_alloc_expr(p, EX_MAP, line);
     emap->u.map.keys = ekeys; emap->u.map.vals = evals; emap->u.map.count = n;
     ZrStmt *ls = zp_alloc_stmt(p, ST_LET, line);
@@ -2775,20 +2932,21 @@ static ZrStmt *zp_parse_enum_stmt(ZrParser *p, uint32_t line) {
     return ls;
 }
 
-/* Desugar `class Name [extends Base] [implements ...] { fn m(self, ...) { ... } }` */
+/* Desugar `class Name<T> [extends Base<T>] [implements ...] { fn m<U>(self, ...) { ... } }` */
 static ZrStmt *zp_parse_class_stmt(ZrParser *p, uint32_t line) {
     const char *cname = zp_expect_decl_name(p, "class name");
-    if (!cname) return NULL;
+    if (!cname || !zp_skip_optional_type_params(p)) return NULL;
     const char *parent_name = NULL;
     if (zp_check_ident_str(p, "extends")) {
         zp_advance(p);
         parent_name = zp_expect_decl_name(p, "parent class name");
-        if (!parent_name) return NULL;
+        if (!parent_name || !zp_skip_optional_type_params(p)) return NULL;
     }
     if (zp_check_ident_str(p, "implements")) {
         zp_advance(p);
         do {
             if (!zp_expect_decl_name(p, "interface name")) return NULL;
+            if (!zp_skip_optional_type_params(p)) return NULL;
         } while (zp_match(p, TOK_COMMA));
     }
     if (!zp_expect(p, TOK_LBRACE, "'{'")) return NULL;
@@ -2820,7 +2978,7 @@ static ZrStmt *zp_parse_class_stmt(ZrParser *p, uint32_t line) {
         }
         zp_match(p, TOK_FN); /* optional `fn` keyword inside class body */
         const char *mname = zp_expect_any_name(p, "method name");
-        if (!mname) return NULL;
+        if (!mname || !zp_skip_optional_type_params(p)) return NULL;
         ZrParam *params = NULL; size_t pcount = 0;
         if (!zp_parse_param_list(p, &params, &pcount)) return NULL;
         ZrExpr **reqs = NULL, **ens = NULL;
@@ -3130,16 +3288,19 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
             break;
         case TOK_ASYNC:
         case TOK_FN: {
-            /* Named function declaration if `fn <ident>(...)`; else expression statement */
+            /* Named function declaration if `fn <ident>[<T>](...)`; else expression statement */
             size_t fn_off = (t->kind == TOK_ASYNC) ? 1 : 0;
-            if (zp_peek_n(p, fn_off)->kind == TOK_FN && zp_peek_n(p, fn_off + 1)->kind != TOK_LPAREN) {
+            if (zp_peek_n(p, fn_off)->kind == TOK_FN &&
+                zp_peek_n(p, fn_off + 1)->kind != TOK_LPAREN &&
+                zp_peek_n(p, fn_off + 1)->kind != TOK_LT) {
                 bool is_async = zp_match(p, TOK_ASYNC);
                 zp_advance(p); /* fn */
                 const char *fname = zp_expect_any_name(p, "function name");
                 if (!fname) break;
+                if (!zp_skip_optional_type_params(p)) break;
                 ZrParam *params = NULL; size_t pcount = 0;
                 if (!zp_parse_param_list(p, &params, &pcount)) break;
-                ZrExpr **reqs = NULL, **ens = NULL;
+                ZrExpr **reqs = NULL; ZrExpr **ens = NULL;
                 size_t req_n = 0, ens_n = 0;
                 if (!zp_parse_fn_contracts(p, &reqs, &req_n, &ens, &ens_n)) break;
                 ZrStmt **body = NULL; size_t bcount = 0;
@@ -3193,7 +3354,7 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
         case TOK_FOR: {
             zp_advance(p);
             if (zp_match(p, TOK_LPAREN)) {
-                /* C-style `for (init; cond; step) { body }` -> `{ init; while (cond) { body...; step; } }` */
+                /* C-style `for (init; cond; step) { body }` with per-iteration lexical upvalue capture */
                 ZrStmt *init_st = NULL;
                 if (!zp_check(p, TOK_SEMI)) {
                     init_st = zp_parse_stmt(p);
@@ -3217,27 +3378,12 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
                 if (!zp_expect(p, TOK_RPAREN, "')' after for header")) break;
                 ZrStmt **body = NULL; size_t bn = 0;
                 if (!zp_parse_block_stmts(p, &body, &bn)) break;
-                if (step_st) {
-                    ZrStmt **wbody = (ZrStmt **)zr_arena_alloc(p->arena, (bn + 1) * sizeof(ZrStmt *));
-                    if (bn > 0) memcpy(wbody, body, bn * sizeof(ZrStmt *));
-                    wbody[bn] = step_st;
-                    body = wbody;
-                    bn++;
-                }
-                ZrStmt *ws = zp_alloc_stmt(p, ST_WHILE, ln);
-                ws->u.while_s.cond = cond_e;
-                ws->u.while_s.body = body;
-                ws->u.while_s.body_n = bn;
-                if (init_st) {
-                    ZrStmt **bseq = (ZrStmt **)zr_arena_alloc(p->arena, 2 * sizeof(ZrStmt *));
-                    bseq[0] = init_st;
-                    bseq[1] = ws;
-                    res = zp_alloc_stmt(p, ST_BLOCK, ln);
-                    res->u.blk.stmts = bseq;
-                    res->u.blk.count = 2;
-                } else {
-                    res = ws;
-                }
+                res = zp_alloc_stmt(p, ST_FOR_C, ln);
+                res->u.cfor_s.init_st = init_st;
+                res->u.cfor_s.cond_e = cond_e;
+                res->u.cfor_s.step_st = step_st;
+                res->u.cfor_s.body = body;
+                res->u.cfor_s.body_n = bn;
                 break;
             }
             const char *v1 = zp_expect_decl_name(p, "loop variable");
@@ -3350,10 +3496,12 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
         }
         case TOK_EXPORT: {
             zp_advance(p);
-            /* Support `export fn ...`, `export @nogc fn ...`, `export let ...`, `export const ...`, `export struct/class/enum ...`, AND `export a, b;` */
+            /* Support `export fn ...`, `export @nogc fn ...`, `export let ...`, `export const ...`, `export struct/class/enum/trait ...`, AND `export a, b;` */
             if (zp_check(p, TOK_AT) || zp_check(p, TOK_FN) || zp_check(p, TOK_ASYNC) || zp_check(p, TOK_LET) ||
                 zp_check(p, TOK_CONST) || zp_check(p, TOK_STRUCT) || zp_check(p, TOK_CLASS) ||
-                zp_check(p, TOK_ENUM) || zp_check(p, TOK_INTERFACE)) {
+                zp_check(p, TOK_ENUM) || zp_check(p, TOK_INTERFACE) ||
+                (zp_check_ident_str(p, "trait") &&
+                 (zp_peek_n(p, 1)->kind == TOK_IDENT || (zp_peek_n(p, 1)->kind >= TOK_LET && zp_peek_n(p, 1)->kind <= TOK_NIL)))) {
                 ZrStmt *decl = zp_parse_stmt(p);
                 if (!decl) break;
                 const char *ename = NULL;
@@ -3404,7 +3552,7 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
         case TOK_INTERFACE:
             if (zp_peek_n(p, 1)->kind == TOK_IDENT || (zp_peek_n(p, 1)->kind >= TOK_LET && zp_peek_n(p, 1)->kind <= TOK_NIL)) {
                 zp_advance(p);
-                res = zp_parse_interface_stmt(p, ln);
+                res = zp_parse_interface_stmt(p, ln, false);
                 break;
             }
             goto expr_or_assign;
@@ -3436,6 +3584,14 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
         }
         default:
         expr_or_assign:;
+            /* Contextual `trait Name<T> { ... }` */
+            if (zp_check_ident_str(p, "trait") &&
+                (zp_peek_n(p, 1)->kind == TOK_IDENT ||
+                 (zp_peek_n(p, 1)->kind >= TOK_LET && zp_peek_n(p, 1)->kind <= TOK_NIL))) {
+                zp_advance(p);
+                res = zp_parse_interface_stmt(p, ln, true);
+                break;
+            }
             /* Contextual `goto { ... }` */
             if (zp_check_ident_str(p, "goto") && zp_peek_n(p, 1)->kind == TOK_LBRACE) {
                 zp_advance(p);
@@ -3916,6 +4072,52 @@ static bool zc_compile_pat_check(ZrCompiler *c, const ZrPat *pat, uint32_t val_s
             c->local_count -= 2;
             return true;
         }
+        case PAT_ENUM: {
+            zc_emit(c, OP_CONSTANT, zc_add_const(c, val_nil()), line);
+            uint32_t tmp_slot = zc_add_local(c, "", false);
+            zc_emit(c, OP_CONSTANT, zc_add_const(c, val_bool(false)), line);
+            uint32_t res_slot = zc_add_local(c, "", false);
+            zc_emit(c, OP_CONSTANT, zc_add_const(c, val_nil()), line);
+            uint32_t vals_slot = zc_add_local(c, "", false);
+
+            uint32_t fail_jumps[64];
+            size_t nf = 0;
+
+            zc_emit_get_var(c, "__pat_enum", line);
+            zc_emit(c, OP_GET_LOCAL, val_slot, line);
+            zc_emit(c, OP_CONSTANT, zc_cstr_const(c, pat->enum_name ? pat->enum_name : ""), line);
+            zc_emit(c, OP_CONSTANT, zc_cstr_const(c, pat->variant_name), line);
+            zc_emit(c, OP_CONSTANT, zc_add_const(c, val_num(pat->has_parens ? (double)pat->sub_count : -1.0)), line);
+            zc_emit(c, OP_CALL, 4, line);
+            fail_jumps[nf++] = zc_emit(c, OP_JUMP_IF_FALSE, 0, line);
+            zc_emit(c, OP_SET_LOCAL, vals_slot, line); /* pops returned payload array / true into vals_slot */
+
+            for (size_t i = 0; i < pat->sub_count; i++) {
+                zc_emit(c, OP_GET_LOCAL, vals_slot, line);
+                zc_emit(c, OP_CONSTANT, zc_add_const(c, val_num((double)i)), line);
+                zc_emit(c, OP_GET_INDEX, 0, line);
+                zc_emit(c, OP_SET_LOCAL, tmp_slot, line);
+                if (!zc_compile_pat_check(c, pat->sub_pats[i], tmp_slot, line)) return false;
+                if (nf < 63) fail_jumps[nf++] = zc_emit(c, OP_JUMP_IF_FALSE, 0, line);
+                zc_emit(c, OP_POP, 0, line);
+            }
+
+            zc_emit(c, OP_CONSTANT, zc_add_const(c, val_bool(true)), line);
+            zc_emit(c, OP_SET_LOCAL, res_slot, line);
+            uint32_t done_jmp = zc_emit(c, OP_JUMP, 0, line);
+
+            uint32_t fail_ip = c->fn->code_len;
+            for (size_t i = 0; i < nf; i++) zc_patch_jump(c, fail_jumps[i], fail_ip);
+            zc_emit(c, OP_POP, 0, line); /* pop false result */
+
+            zc_patch_jump(c, done_jmp, c->fn->code_len);
+            zc_emit(c, OP_GET_LOCAL, res_slot, line);
+            zc_emit(c, OP_SET_LOCAL, tmp_slot, line);
+            zc_emit(c, OP_POP, 0, line); /* pop vals_slot */
+            zc_emit(c, OP_POP, 0, line); /* pop res_slot, leaving tmp_slot boolean on stack */
+            c->local_count -= 3;
+            return true;
+        }
     }
     return true;
 }
@@ -3955,6 +4157,24 @@ static bool zc_compile_pat_bind(ZrCompiler *c, const ZrPat *pat, uint32_t val_sl
                 if (!zc_compile_pat_bind(c, pat->sub_pats[i], vslot, line)) return false;
             }
             return true;
+        case PAT_ENUM: {
+            if (pat->sub_count == 0) return true;
+            zc_emit_get_var(c, "__pat_enum", line);
+            zc_emit(c, OP_GET_LOCAL, val_slot, line);
+            zc_emit(c, OP_CONSTANT, zc_cstr_const(c, pat->enum_name ? pat->enum_name : ""), line);
+            zc_emit(c, OP_CONSTANT, zc_cstr_const(c, pat->variant_name), line);
+            zc_emit(c, OP_CONSTANT, zc_add_const(c, val_num((double)pat->sub_count)), line);
+            zc_emit(c, OP_CALL, 4, line);
+            uint32_t vals_slot = zc_add_local(c, "", false);
+            for (size_t i = 0; i < pat->sub_count; i++) {
+                zc_emit(c, OP_GET_LOCAL, vals_slot, line);
+                zc_emit(c, OP_CONSTANT, zc_add_const(c, val_num((double)i)), line);
+                zc_emit(c, OP_GET_INDEX, 0, line);
+                uint32_t eslot = zc_add_local(c, "", false);
+                if (!zc_compile_pat_bind(c, pat->sub_pats[i], eslot, line)) return false;
+            }
+            return true;
+        }
     }
     return true;
 }
@@ -4222,7 +4442,6 @@ static bool zc_compile_expr(ZrCompiler *c, const ZrExpr *e) {
                 zc_begin_scope(c);
                 uint32_t arm_base_locals = c->local_count;
                 if (!zc_compile_pat_bind(c, arm->pat, scrut_slot, ln)) { free(done_jumps); return false; }
-                uint32_t bound_count = c->local_count - arm_base_locals;
 
                 uint32_t j_guard_fail = UINT32_MAX;
                 if (arm->guard) {
@@ -4233,20 +4452,20 @@ static bool zc_compile_expr(ZrCompiler *c, const ZrExpr *e) {
 
                 if (!zc_compile_expr(c, arm->body)) { free(done_jumps); return false; }
                 zc_emit(c, OP_SET_LOCAL, res_slot, ln);
-                zc_end_scope(c, ln);
+                zc_emit_pop_to_depth(c, c->scope_depth - 1, ln);
                 done_jumps[ndone++] = zc_emit(c, OP_JUMP, 0, ln);
 
                 if (j_guard_fail != UINT32_MAX) {
                     zc_patch_jump(c, j_guard_fail, c->fn->code_len);
                     zc_emit(c, OP_POP, 0, ln); /* pop false guard */
-                    for (uint32_t b = 0; b < bound_count; b++) {
-                        zc_emit(c, OP_POP, 0, ln);
-                    }
+                    zc_end_scope(c, ln);       /* pops/closes bound pattern variables */
                     uint32_t skip_pat_pop = zc_emit(c, OP_JUMP, 0, ln);
                     zc_patch_jump(c, j_pat_fail, c->fn->code_len);
                     zc_emit(c, OP_POP, 0, ln); /* pop false pat */
                     zc_patch_jump(c, skip_pat_pop, c->fn->code_len);
                 } else {
+                    c->local_count = arm_base_locals;
+                    c->scope_depth--;
                     zc_patch_jump(c, j_pat_fail, c->fn->code_len);
                     zc_emit(c, OP_POP, 0, ln); /* pop false pat */
                 }
@@ -4581,6 +4800,81 @@ static bool zc_compile_stmt(ZrCompiler *c, const ZrStmt *s) {
             free(lctx.break_jumps);
             free(lctx.cont_jumps);
             c->loop = lctx.prev;
+            return true;
+        }
+
+        case ST_FOR_C: {
+            zc_begin_scope(c);
+            bool has_let_init = (s->u.cfor_s.init_st != NULL && s->u.cfor_s.init_st->kind == ST_LET);
+            uint32_t carrier_slot = 0;
+            const char *vname = NULL;
+            bool vconst = false;
+            if (has_let_init) {
+                vname = s->u.cfor_s.init_st->u.let_s.name;
+                vconst = s->u.cfor_s.init_st->u.let_s.is_const;
+                if (!zc_compile_expr(c, s->u.cfor_s.init_st->u.let_s.init)) return false;
+                carrier_slot = zc_add_local(c, vname, false);
+            } else if (s->u.cfor_s.init_st) {
+                if (!zc_compile_stmt(c, s->u.cfor_s.init_st)) return false;
+            }
+
+            ZrLoopCtx lctx;
+            memset(&lctx, 0, sizeof(lctx));
+            lctx.prev = c->loop;
+            lctx.cont_target_ip = -1;
+
+            uint32_t loop_start = c->fn->code_len;
+            uint32_t iter_slot = 0;
+            if (has_let_init) {
+                zc_begin_scope(c);
+                zc_emit(c, OP_GET_LOCAL, carrier_slot, ln);
+                iter_slot = zc_add_local(c, vname, vconst);
+            }
+            lctx.scope_depth = c->scope_depth;
+            c->loop = &lctx;
+
+            if (!zc_compile_expr(c, s->u.cfor_s.cond_e)) {
+                c->loop = lctx.prev; free(lctx.break_jumps); free(lctx.cont_jumps); return false;
+            }
+            uint32_t exit_j = zc_emit(c, OP_JUMP_IF_FALSE, 0, ln);
+            zc_emit(c, OP_POP, 0, ln);
+
+            zc_begin_scope(c);
+            if (!zc_compile_stmt_list(c, s->u.cfor_s.body, s->u.cfor_s.body_n)) {
+                c->loop = lctx.prev; free(lctx.break_jumps); free(lctx.cont_jumps); return false;
+            }
+            zc_end_scope(c, ln);
+
+            uint32_t cont_ip = c->fn->code_len;
+            bool iter_captured = false;
+            if (has_let_init) {
+                iter_captured = c->locals[iter_slot].is_captured;
+                zc_emit(c, OP_GET_LOCAL, iter_slot, ln);
+                zc_emit(c, OP_SET_LOCAL, carrier_slot, ln);
+                zc_end_scope(c, ln); /* closes iter_slot upvalue BEFORE step mutates carrier_slot! */
+            }
+            if (s->u.cfor_s.step_st) {
+                zc_begin_scope(c);
+                if (!zc_compile_stmt(c, s->u.cfor_s.step_st)) {
+                    c->loop = lctx.prev; free(lctx.break_jumps); free(lctx.cont_jumps); return false;
+                }
+                zc_end_scope(c, ln);
+            }
+            zc_emit(c, OP_JUMP, loop_start, ln);
+
+            zc_patch_jump(c, exit_j, c->fn->code_len);
+            zc_emit(c, OP_POP, 0, ln); /* pop false cond */
+
+            uint32_t break_target = c->fn->code_len;
+            for (size_t i = 0; i < lctx.break_len; i++) zc_patch_jump(c, lctx.break_jumps[i], break_target);
+            for (size_t i = 0; i < lctx.cont_len; i++) zc_patch_jump(c, lctx.cont_jumps[i], cont_ip);
+            if (has_let_init) {
+                zc_emit(c, iter_captured ? OP_CLOSE_UPVALUE : OP_POP, 0, ln);
+            }
+            free(lctx.break_jumps);
+            free(lctx.cont_jumps);
+            c->loop = lctx.prev;
+            zc_end_scope(c, ln);
             return true;
         }
 

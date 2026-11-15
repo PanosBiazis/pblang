@@ -15,7 +15,7 @@ let _BUILTIN_ARITIES = _vm_builtin_module.fixed_arities();
 // Orchestrators opt in only when an escaping guest throw ends the whole run.
 // Borrowed contexts keep caller ownership by default.
 fn execution_context(close_on_throw = false) {
-    return map{memory:nil, close_on_throw:close_on_throw, handlers:0};
+    return map{memory:nil, close_on_throw:close_on_throw, handlers:0, coverage:nil, last_error:nil};
 }
 fn close_execution(execution) {
     if execution.memory != nil { _MEMORY.close(execution.memory); execution.memory = nil; }
@@ -81,6 +81,191 @@ let OP_SET_UPVALUE = 39;
 let OP_THROW = 40;
 let OP_ADD_LOCAL_CONST = 41;
 let OP_ADD_LOCAL_LOCAL = 42;
+let OP_DEFER = 43;
+
+fn coverage_tracker() {
+    return map{
+        enabled: true,
+        total_instructions: 0,
+        instruction_hits: map{},
+        line_hits: map{},
+        branches: map{},
+        _defined_lines: map{},
+        executable_lines: [],
+        covered_lines: [],
+        uncovered_lines: [],
+        lines_total: 0,
+        lines_covered: 0,
+        line_coverage_pct: 100,
+        branches_total: 0,
+        branches_taken: 0,
+        branches_not_taken: 0,
+        branches_fully_covered: 0,
+        branch_outcomes_total: 0,
+        branch_outcomes_covered: 0,
+        branch_coverage_pct: 100,
+        _next_chunk_id: 1,
+    };
+}
+
+fn _cov_chunk_id(cov, chunk) {
+    if not is_map(chunk) { return "0"; }
+    if map_has(chunk, "_cov_id") { return str(chunk._cov_id); }
+    let cid = cov._next_chunk_id;
+    cov._next_chunk_id = cid + 1;
+    chunk._cov_id = cid;
+    return str(cid);
+}
+
+fn _cov_is_cond_branch(op) {
+    return op == OP_JUMP_IF_FALSE or op == OP_JUMP_IF_TRUE
+        or op == OP_JUMP_IF_FALSE_PEEK or op == OP_JUMP_IF_TRUE_PEEK
+        or op == OP_JUMP_IF_NIL_PEEK or op == OP_JUMP_IF_NOT_NIL_PEEK;
+}
+
+fn _cov_seed_chunk(cov, chunk, depth = 0) {
+    if cov == nil or not is_map(chunk) or depth > 64 { return; }
+    let cid = _cov_chunk_id(cov, chunk);
+    let ins = try chunk.instructions catch [];
+    let ii = 0;
+    while ii < len(ins) {
+        let inst = ins[ii];
+        let ln = if is_map(inst) and map_has(inst, "line") { inst.line } else { 0 };
+        if is_number(ln) and ln > 0 {
+            let lkey = str(ln);
+            cov._defined_lines[lkey] = ln;
+            if not map_has(cov.line_hits, lkey) { cov.line_hits[lkey] = 0; }
+        }
+        let op = try inst.op catch -1;
+        if _cov_is_cond_branch(op) {
+            let bkey = cid + ":" + str(ii);
+            if not map_has(cov.branches, bkey) {
+                cov.branches[bkey] = map{
+                    chunk_id: cid,
+                    ip: ii,
+                    line: ln,
+                    op: op,
+                    target: inst.operand,
+                    taken: 0,
+                    not_taken: 0,
+                };
+            }
+        }
+        ii = ii + 1;
+    }
+    let consts = try chunk.constants catch [];
+    let ci = 0;
+    while ci < len(consts) {
+        let cv = consts[ci];
+        if is_map(cv) {
+            if map_has(cv, "chunk") and is_map(cv.chunk) {
+                _cov_seed_chunk(cov, cv.chunk, depth + 1);
+            }
+            if map_has(cv, "try_chunk") and is_map(cv.try_chunk) {
+                _cov_seed_chunk(cov, cv.try_chunk, depth + 1);
+            }
+            if map_has(cv, "catch_chunk") and is_map(cv.catch_chunk) {
+                _cov_seed_chunk(cov, cv.catch_chunk, depth + 1);
+            }
+        }
+        ci = ci + 1;
+    }
+}
+
+fn _cov_record_inst(cov, cid, ip, instr) {
+    cov.total_instructions = cov.total_instructions + 1;
+    let ikey = cid + ":" + str(ip);
+    if map_has(cov.instruction_hits, ikey) {
+        cov.instruction_hits[ikey] = cov.instruction_hits[ikey] + 1;
+    } else {
+        cov.instruction_hits[ikey] = 1;
+    }
+    if is_map(instr) and map_has(instr, "line") {
+        let ln = instr.line;
+        if is_number(ln) and ln > 0 {
+            let lkey = str(ln);
+            cov._defined_lines[lkey] = ln;
+            if map_has(cov.line_hits, lkey) {
+                cov.line_hits[lkey] = cov.line_hits[lkey] + 1;
+            } else {
+                cov.line_hits[lkey] = 1;
+            }
+        }
+    }
+}
+
+fn _cov_record_branch(cov, cid, ip, instr, taken) {
+    let bkey = cid + ":" + str(ip);
+    let entry: any = nil;
+    if map_has(cov.branches, bkey) {
+        entry = cov.branches[bkey];
+    } else {
+        let ln = if is_map(instr) and map_has(instr, "line") { instr.line } else { 0 };
+        entry = map{
+            chunk_id: cid,
+            ip: ip,
+            line: ln,
+            op: instr.op,
+            target: instr.operand,
+            taken: 0,
+            not_taken: 0,
+        };
+        cov.branches[bkey] = entry;
+    }
+    if taken {
+        entry.taken = entry.taken + 1;
+    } else {
+        entry.not_taken = entry.not_taken + 1;
+    }
+}
+
+fn finalize_coverage(cov) {
+    if cov == nil or not is_map(cov) { return cov; }
+    let line_nums = [];
+    for lk in map_keys(cov._defined_lines) {
+        array_push(line_nums, cov._defined_lines[lk]);
+    }
+    line_nums = array_sort(line_nums);
+    let covered = [];
+    let uncovered = [];
+    let li = 0;
+    while li < len(line_nums) {
+        let ln = line_nums[li];
+        let hits = if map_has(cov.line_hits, str(ln)) { cov.line_hits[str(ln)] } else { 0 };
+        if hits > 0 { array_push(covered, ln); }
+        else { array_push(uncovered, ln); }
+        li = li + 1;
+    }
+    cov.executable_lines = line_nums;
+    cov.covered_lines = covered;
+    cov.uncovered_lines = uncovered;
+    cov.lines_total = len(line_nums);
+    cov.lines_covered = len(covered);
+    cov.line_coverage_pct = if len(line_nums) > 0 { (len(covered) * 100) / len(line_nums) } else { 100 };
+
+    let bkeys = map_keys(cov.branches);
+    let b_total = len(bkeys);
+    let b_taken = 0;
+    let b_not_taken = 0;
+    let b_full = 0;
+    let outcomes_cov = 0;
+    let bi = 0;
+    while bi < b_total {
+        let b = cov.branches[bkeys[bi]];
+        if b.taken > 0 { b_taken = b_taken + 1; outcomes_cov = outcomes_cov + 1; }
+        if b.not_taken > 0 { b_not_taken = b_not_taken + 1; outcomes_cov = outcomes_cov + 1; }
+        if b.taken > 0 and b.not_taken > 0 { b_full = b_full + 1; }
+        bi = bi + 1;
+    }
+    cov.branches_total = b_total;
+    cov.branches_taken = b_taken;
+    cov.branches_not_taken = b_not_taken;
+    cov.branches_fully_covered = b_full;
+    cov.branch_outcomes_total = b_total * 2;
+    cov.branch_outcomes_covered = outcomes_cov;
+    cov.branch_coverage_pct = if b_total > 0 { (outcomes_cov * 100) / (b_total * 2) } else { 100 };
+    return cov;
+}
 
 fn _option(options, key, fallback) {
     if options != nil and is_map(options) and map_has(options, key) { return options[key]; }
@@ -1048,8 +1233,21 @@ fn _fill_defaults(fnc, args, runtime, execution) {
     }
 }
 
+fn _run_defers(defers, globals, out, runtime, depth, execution) {
+    if defers == nil { return; }
+    let di = len(defers) - 1;
+    while di >= 0 {
+        let th = defers[di];
+        _call_method(th, [], globals, out, runtime, depth, execution);
+        di = di - 1;
+    }
+}
+
 fn _call_method(callee, args, globals, out, runtime, depth, execution) {
     if is_map(callee) and map_has(callee, "__bi") { return _call_builtin(callee["__bi"], args, runtime, execution); }
+    if is_map(callee) and not map_has(callee, "__fn") and not map_has(callee, "chunk") and map_has(callee, "__call") and callee["__call"] != nil {
+        return _call_method(callee["__call"], args, globals, out, runtime, depth + 1, execution);
+    }
     let closure = is_map(callee) and map_has(callee, "__fn");
     let fnc = if closure { callee.__fn } else { callee };
     if not closure and not (is_map(fnc) and map_has(fnc, "chunk")) {
@@ -1291,6 +1489,9 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
     // enter exec again with their own handler count; memory can still appear
     // later in this frame, so its presence must remain a per-access check.
     let close_host_errors = execution.close_on_throw and execution.handlers == 0;
+    let cov = if is_map(execution) and map_has(execution, "coverage") { execution.coverage } else { nil };
+    let cov_cid = if cov != nil { _cov_chunk_id(cov, chunk) } else { "" };
+    let defers: any = nil;
     let ins = chunk.instructions;
     let consts = chunk.constants;
     let stack = [];
@@ -1325,10 +1526,12 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                 }
             }
         }
-        let instr = ins[ip];
+        let cur_ip = ip;
+        let instr = ins[cur_ip];
+        if cov != nil { _cov_record_inst(cov, cov_cid, cur_ip, instr); }
         let op = instr.op;
         let arg = instr.operand;
-        ip = ip + 1;
+        ip = cur_ip + 1;
 
         if op == OP_CONSTANT { array_push(stack, consts[arg]); }
         // Local access dominates compiled loops and recursive functions.
@@ -1364,10 +1567,26 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                     else { value = a + b; }
                     _set_slot(locals, arg.slot, value, runtime, execution);
                 }
-                else if op == OP_JUMP_IF_FALSE_PEEK { if not _truthy(stack[len(stack) - 1]) { ip = arg; } }
-                else if op == OP_JUMP_IF_TRUE_PEEK { if _truthy(stack[len(stack) - 1]) { ip = arg; } }
-                else if op == OP_JUMP_IF_NIL_PEEK { if stack[len(stack) - 1] == nil { ip = arg; } }
-                else if op == OP_JUMP_IF_NOT_NIL_PEEK { if stack[len(stack) - 1] != nil { ip = arg; } }
+                else if op == OP_JUMP_IF_FALSE_PEEK {
+                    let taken = not _truthy(stack[len(stack) - 1]);
+                    if cov != nil { _cov_record_branch(cov, cov_cid, cur_ip, instr, taken); }
+                    if taken { ip = arg; }
+                }
+                else if op == OP_JUMP_IF_TRUE_PEEK {
+                    let taken = _truthy(stack[len(stack) - 1]);
+                    if cov != nil { _cov_record_branch(cov, cov_cid, cur_ip, instr, taken); }
+                    if taken { ip = arg; }
+                }
+                else if op == OP_JUMP_IF_NIL_PEEK {
+                    let taken = stack[len(stack) - 1] == nil;
+                    if cov != nil { _cov_record_branch(cov, cov_cid, cur_ip, instr, taken); }
+                    if taken { ip = arg; }
+                }
+                else if op == OP_JUMP_IF_NOT_NIL_PEEK {
+                    let taken = stack[len(stack) - 1] != nil;
+                    if cov != nil { _cov_record_branch(cov, cov_cid, cur_ip, instr, taken); }
+                    if taken { ip = arg; }
+                }
                 else if op == OP_TRY {
                     // Run the body sub-chunk; on any raised error, fall back to the
                     // handler sub-chunk. Both share these locals/globals/upvalues.
@@ -1377,20 +1596,34 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                     // guest handler error propagates normally to the enclosing try.
                     let tc = consts[arg];
                     let outer_handlers = execution.handlers;
+                    let outer_err = execution.last_error;
                     execution.handlers = outer_handlers + 1;
+                    execution.last_error = nil;
                     let r = try exec(tc.try_chunk, locals, globals, out, upvalues, runtime, depth + 1, execution)
                         catch {
                             // This handler no longer protects its own catch body.
                             execution.handlers = outer_handlers;
+                            if map_has(tc, "catch_slot") and tc.catch_slot != nil {
+                                while len(locals) <= tc.catch_slot { array_push(locals, nil); }
+                                locals[tc.catch_slot] = if execution.last_error != nil { execution.last_error } else { "error" };
+                            };
                             exec(tc.catch_chunk, locals, globals, out, upvalues, runtime, depth + 1, execution)
                         };
                     execution.handlers = outer_handlers;
+                    execution.last_error = outer_err;
                     array_push(stack, r);
                 }
                 else if op == OP_THROW {
                     let original = array_pop(stack);
+                    execution.last_error = original;
+                    if defers != nil { _run_defers(defers, globals, out, runtime, depth + 1, execution); }
                     _close_on_escape(execution);
                     throw original;
+                }
+                else if op == OP_DEFER {
+                    let thunk = array_pop(stack);
+                    if defers == nil { defers = []; }
+                    array_push(defers, thunk);
                 }
             } else {
                 // Guest index operations on this host are synchronous and do not invoke guest
@@ -1654,6 +1887,8 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                             call_globals["__import_cache__"] = globals["__import_cache__"];
                         }
                         array_push(stack, exec(callee.__fn.chunk, callargs, call_globals, out, callee.__upvalues, runtime, depth + 1, execution));
+                    } else if is_map(callee) and not map_has(callee, "chunk") and map_has(callee, "__call") and callee["__call"] != nil {
+                        array_push(stack, _call_method(callee["__call"], callargs, globals, out, runtime, depth, execution));
                     } else {
                         // Raw function constants carry the same optional arity
                         // contract as closures; do not bypass it on this route.
@@ -1677,6 +1912,7 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
             }
             else if op == OP_RETURN {
                 let value = array_pop(stack);
+                if defers != nil { _run_defers(defers, globals, out, runtime, depth + 1, execution); }
                 // Keep bounded return admission without a helper call per return.
                 if runtime != nil {
                     if (is_array(value) or is_map(value) or (is_string(value) and type(value) == "string")) and len(value) > runtime.max_value_items {
@@ -1685,8 +1921,16 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                 }
                 return value;
             }            else if op == OP_JUMP { ip = arg; }
-            else if op == OP_JUMP_IF_FALSE { if not _truthy(array_pop(stack)) { ip = arg; } }
-            else if op == OP_JUMP_IF_TRUE { if _truthy(array_pop(stack)) { ip = arg; } }
+            else if op == OP_JUMP_IF_FALSE {
+                let taken = not _truthy(array_pop(stack));
+                if cov != nil { _cov_record_branch(cov, cov_cid, cur_ip, instr, taken); }
+                if taken { ip = arg; }
+            }
+            else if op == OP_JUMP_IF_TRUE {
+                let taken = _truthy(array_pop(stack));
+                if cov != nil { _cov_record_branch(cov, cov_cid, cur_ip, instr, taken); }
+                if taken { ip = arg; }
+            }
             else if op == OP_NOT { let a = array_pop(stack); array_push(stack, not _truthy(a)); }
         } else {
             if op == OP_ADD {
@@ -1770,6 +2014,7 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
             }
         }
     }
+    if defers != nil { _run_defers(defers, globals, out, runtime, depth + 1, execution); }
     if runtime != nil and len(stack) > runtime.max_stack { _trip(runtime, "stack limit exceeded", execution); }
     return nil;
 }
@@ -1814,8 +2059,36 @@ fn run_seeded_bounded(chunk, globals, options = nil, execution = nil) {
     return map{ output: out, locals: locals, globals: globals, value: value, runtime: runtime };
 }
 
+// Execute a compiled chunk with 100% pure-PBLang line & branch coverage tracking.
+// Zero C99 dependencies; zero overhead on normal `run`/`exec` calls where `coverage == nil`.
+fn run_with_coverage(chunk, args = nil, globals = nil) {
+    let g = if globals != nil and is_map(globals) { globals } else { map{} };
+    let locals = [];
+    if args != nil and is_array(args) {
+        let ai = 0;
+        while ai < len(args) { array_push(locals, args[ai]); ai = ai + 1; }
+    }
+    let out = [];
+    let cov = coverage_tracker();
+    _cov_seed_chunk(cov, chunk, 0);
+    let execution = execution_context(true);
+    execution.coverage = cov;
+    let value = exec(chunk, locals, g, out, [], nil, 0, execution);
+    close_execution(execution);
+    finalize_coverage(cov);
+    return map{
+        ok: true,
+        value: value,
+        output: out,
+        locals: locals,
+        globals: g,
+        coverage: cov,
+    };
+}
+
 export run, run_seeded, exec;
 export run_bounded, run_seeded_bounded, runtime_limits;
+export run_with_coverage, coverage_tracker, finalize_coverage;
 
 // Internal orchestration API: contexts must never be injected into guest data.
 export execution_context, close_execution;

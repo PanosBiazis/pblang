@@ -25,7 +25,7 @@
 #include <sys/stat.h>
 #endif
 
-#define ZR_SU_SEMVER "4.1.0"
+#define ZR_SU_SEMVER "4.2.0"
 #define ZR_SU_MAX_ENTRIES 10000
 #define ZR_SU_MAX_BYTES   (256ULL * 1024ULL * 1024ULL)
 
@@ -2138,12 +2138,43 @@ static bool zr_su_update_self(const ZrSuOpts *opts, ZrSuReceipt *rec, char *err)
     snprintf(dest_pblang, sizeof(dest_pblang), "%s/bin/pblang", rel_dir);
     snprintf(dest_std, sizeof(dest_std), "%s/stdlib", rel_dir);
 
-    char wrapper_txt[4600];
+    for (const char *p = inst_root; *p; p++) {
+        unsigned char uc = (unsigned char)*p;
+        if (uc < 0x20 || uc == 0x7f || *p == '"' || *p == '\'' || *p == '`' ||
+            *p == '$' || *p == '\\' || *p == ';' || *p == '&' || *p == '|') {
+            zr_su_elist_free(&std_files);
+            free(bin_bytes);
+            snprintf(err, 256, "unsafe character in install_root path rejected");
+            return false;
+        }
+    }
+
+    char wrapper_txt[5600];
     snprintf(wrapper_txt, sizeof(wrapper_txt),
              "#!/bin/sh\n"
-             "# Installed PBLang %s launcher\n"
+             "# Installed PBLang %s launcher (with Laptop OOM & 2.5 GiB RAM protection)\n"
              "REAL_PBLANG=\"${PBLANG_INSTALL_ROOT:-%s}/releases/%s/bin/pblang\"\n"
-             "exec \"$REAL_PBLANG\" \"$@\"\n",
+             "_pb_num() { case \"$1\" in ''|*[!0-9]*) echo \"$2\" ;; *) echo \"$1\" ;; esac; }\n"
+             "case \"$*\" in\n"
+             "    *serve*|*stdio*)\n"
+             "        if command -v prlimit >/dev/null 2>&1; then\n"
+             "            _lim=$(_pb_num \"${PBLANG_SERVE_MAX_AS:-}\" 1073741824)\n"
+             "            exec prlimit --as=\"$_lim\" -- \"$REAL_PBLANG\" \"$@\"\n"
+             "        fi\n"
+             "        exec \"$REAL_PBLANG\" \"$@\"\n"
+             "        ;;\n"
+             "    *)\n"
+             "        if [ -w /proc/self/oom_score_adj ]; then\n"
+             "            _adj=$(_pb_num \"${PBLANG_OOM_SCORE_ADJ:-}\" 850)\n"
+             "            echo \"$_adj\" > /proc/self/oom_score_adj 2>/dev/null || true\n"
+             "        fi\n"
+             "        if command -v prlimit >/dev/null 2>&1; then\n"
+             "            _lim=$(_pb_num \"${PBLANG_MAX_AS:-}\" 2684354560)\n"
+             "            exec prlimit --as=\"$_lim\" -- \"$REAL_PBLANG\" \"$@\"\n"
+             "        fi\n"
+             "        exec \"$REAL_PBLANG\" \"$@\"\n"
+             "        ;;\n"
+             "esac\n",
              ZR_SU_SEMVER, inst_root, ZR_SU_SEMVER);
 
     bool bin_same = false, std_same = false, lnch_same = false;

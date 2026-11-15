@@ -1,51 +1,96 @@
-// Database stdlib (future-proof driver-style API).
+// stdlib/db.sapp — Unified Sovereign & Enterprise Database Facade (v4.2.0).
 //
-// Today: SQLite backend.
-// Tomorrow: postgres/mysql can implement the same shape.
+// Backends:
+//   - db.sqlite      — Embedded SQLite engine (100% backward-compatible)
+//   - db.postgres    — Native PostgreSQL Wire Protocol v3.0 (SCRAM-SHA-256, Extended Query)
+//   - db.mssql       — Native MS SQL Server TDS 7.4 / 8.0 (PRELOGIN, LOGIN7, sp_executesql RPC)
+//   - db.mysql       — Native MySQL 8.0 / MariaDB v10 (caching_sha2_password, COM_STMT_EXECUTE)
+//   - db.memory      — Pure-PBLang Sovereign MVCC In-Memory / Encrypted-Snapshot SQL Engine
+//   - db.pool        — Thread-safe Connection Pool with health checks & auto-release
+//   - db.migrations  — Versioned Up/Down Schema Migrations with SHA-256 tamper detection
+//   - db.unified     — Unified DSN router (`postgres://`, `mssql://`, `mysql://`, `sqlite://`, `memory://`)
+//   - db.sql         — Parameterized SQL builders, identifier quoting & injection guards
 //
-// Usage:
-//   import "stdlib:db.sapp";
-//   let c = db.sqlite.open("app.db");
-//   c.exec("create table if not exists t(x int)", []);
-//   c.exec("insert into t(x) values (?)", [123]);
-//   print c.query("select x from t where x > ?", [0]);
-//   c.close();
-//
-// Design note: all closures in the connection map capture `c` (the map itself)
-// as a single-level upvalue.  This avoids the 2-level upvalue chain that the
-// current compiler cannot resolve (BlockExpr/IIFE inside a closure that itself
-// has upvalues).  Accessing c.kind / c.handle through the map bypasses the
-// limitation entirely.
+// Design notes:
+//   1. All closures on `_conn` capture `c` (the connection map) at 1-level depth.
+//   2. Optional-parameter functions are declared as named top-level `fn` definitions
+//      so both the Stage3 C runtime and the self-hosted compiler frontend parse
+//      and execute `stdlib:db.sapp` with 100% parity.
+//   3. Enterprise wire drivers are lazy-loaded via `_LAZY` on first invocation.
+
+let _LAZY = map{};
+
+fn _pg() {
+    if not map_has(_LAZY, "pg") {
+        _LAZY["pg"] = import("stdlib:db/postgres_wire_v3.sapp");
+    }
+    return _LAZY["pg"];
+}
+
+fn _ms() {
+    if not map_has(_LAZY, "ms") {
+        _LAZY["ms"] = import("stdlib:db/mssql_tds_driver.sapp");
+    }
+    return _LAZY["ms"];
+}
+
+fn _my() {
+    if not map_has(_LAZY, "my") {
+        _LAZY["my"] = import("stdlib:db/mysql_wire_driver.sapp");
+    }
+    return _LAZY["my"];
+}
+
+fn _pm() {
+    if not map_has(_LAZY, "pm") {
+        _LAZY["pm"] = import("stdlib:db/connection_pool_migrations.sapp");
+    }
+    return _LAZY["pm"];
+}
+
+fn _su() {
+    if not map_has(_LAZY, "su") {
+        _LAZY["su"] = import("stdlib:db/sovereign_unified_db.sapp");
+    }
+    return _LAZY["su"];
+}
 
 fn _conn(kind, handle) {
-    let c = map{ kind: kind, handle: handle };
+    let c = map{ kind: kind, handle: handle, open: true };
 
-    c.exec = fn(sql, params) {
+    c.exec = fn(sql_str, params) {
+        let p = params;
+        if p == nil { p = []; }
         if c.kind == "sqlite" {
-            return sqlite_exec(c.handle, sql, params);
+            return sqlite_exec(c.handle, sql_str, p);
         }
         return nil;
     };
 
-    c.query = fn(sql, params) {
+    c.query = fn(sql_str, params) {
+        let p = params;
+        if p == nil { p = []; }
         if c.kind == "sqlite" {
-            return sqlite_query(c.handle, sql, params);
+            return sqlite_query(c.handle, sql_str, p);
         }
         return [];
     };
 
-    c.prepare = fn(sql) {
-        // Capture kind/handle as locals so the inner closures stay 1-level deep.
+    c.prepare = fn(sql_str) {
         let k = c.kind;
         let h = c.handle;
         return map{
-            sql: sql,
+            sql: sql_str,
             exec: fn(params) {
-                if k == "sqlite" { return sqlite_exec(h, sql, params); }
+                let p = params;
+                if p == nil { p = []; }
+                if k == "sqlite" { return sqlite_exec(h, sql_str, p); }
                 return nil;
             },
             query: fn(params) {
-                if k == "sqlite" { return sqlite_query(h, sql, params); }
+                let p = params;
+                if p == nil { p = []; }
+                if k == "sqlite" { return sqlite_query(h, sql_str, p); }
                 return [];
             }
         };
@@ -58,12 +103,6 @@ fn _conn(kind, handle) {
         return nil;
     };
 
-    // transaction(f) — BEGIN; call f(c); COMMIT on success, ROLLBACK on error.
-    //
-    // Uses `try f(c) catch nil` (simple literal catch, no BlockExpr/IIFE) so that
-    // the upvalue for `c` is always reachable within this single closure level.
-    // A nil return from f is treated the same as an error (rollback). If your
-    // transaction legitimately returns nil, return a wrapper value instead.
     c.transaction = fn(f) {
         c.exec("BEGIN", []);
         let out = try f(c) catch nil;
@@ -75,10 +114,6 @@ fn _conn(kind, handle) {
         return out;
     };
 
-    // tx(f) — modern transaction: ONLY a thrown error rolls back; any return
-    // value (including nil) commits. Returns map{ ok: true, value } on commit
-    // or map{ ok: false } after rollback. Prefer this over transaction() —
-    // the nil-sentinel there silently rolls back legitimate nil results.
     c.tx = fn(f) {
         c.exec("BEGIN", []);
         let r = try map{ ok: true, value: f(c) } catch map{ ok: false };
@@ -86,10 +121,6 @@ fn _conn(kind, handle) {
         return r;
     };
 
-    // savepoint(name, f) — nested transaction scope via SQL SAVEPOINT. A throw
-    // inside f rolls back only this scope; the enclosing transaction survives.
-    // The name is quoted as an identifier (doubled quotes), so a hostile name
-    // cannot inject SQL. Returns the same map{ ok, value } shape as tx().
     c.savepoint = fn(name, f) {
         let q = "\"" + str_replace_all(str(name), "\"", "\"\"") + "\"";
         c.exec("SAVEPOINT " + q, []);
@@ -99,7 +130,18 @@ fn _conn(kind, handle) {
         return r;
     };
 
+    c.ping = fn() {
+        if not c.open { return false; }
+        if c.kind == "sqlite" {
+            let r = try sqlite_query(c.handle, "SELECT 1 AS ok", []) catch nil;
+            return r != nil;
+        }
+        return false;
+    };
+
     c.close = fn() {
+        if not c.open { return nil; }
+        c.open = false;
         if c.kind == "sqlite" { return sqlite_close(c.handle); }
         return nil;
     };
@@ -107,41 +149,67 @@ fn _conn(kind, handle) {
     return c;
 }
 
-let sqlite = map{
-    open: fn(path) {
-        let h = sqlite_open(path);
-        return _conn("sqlite", h);
+fn _validate_sqlite_path(path) {
+    if type(path) != "string" {
+        throw "db.sqlite.open: path must be a string";
     }
+    let bs = str_to_bytes(path);
+    let i = 0;
+    while i < len(bs) {
+        if bs[i] == 0 {
+            throw "db.sqlite.open: path must not contain NUL byte";
+        }
+        i = i + 1;
+    }
+}
+
+fn _sqlite_open(path, opts = nil) {
+    _validate_sqlite_path(path);
+    if opts != nil {
+        let cfg = map{ backend: "sqlite", path: path };
+        if is_map(opts) {
+            let ks = map_keys(opts);
+            let i = 0;
+            while i < len(ks) {
+                cfg[ks[i]] = opts[ks[i]];
+                i = i + 1;
+            }
+        }
+        return _su().open(cfg);
+    }
+    let h = sqlite_open(path);
+    return _conn("sqlite", h);
+}
+
+let sqlite = map{
+    open: _sqlite_open
 };
 
 // query_one(conn, sql, params) — first row of a query, or nil when empty.
-fn query_one(conn, sql, params) {
-    let rows = conn.query(sql, params);
+fn query_one(conn, sql_str, params = nil) {
+    let p = params;
+    if p == nil { p = []; }
+    let rows = conn.query(sql_str, p);
     if type(rows) != "array" or len(rows) == 0 { return nil; }
     return rows[0];
 }
 
-// query_value(conn, sql, params) — first column of the first row (a scalar),
-// or nil. Handy for COUNT(*) / single-aggregate queries.
-fn query_value(conn, sql, params) {
-    let row = query_one(conn, sql, params);
+// query_value(conn, sql, params) — first column of the first row (a scalar), or nil.
+fn query_value(conn, sql_str, params = nil) {
+    let row = query_one(conn, sql_str, params);
     if row == nil { return nil; }
     let ks = map_keys(row);
     if len(ks) == 0 { return nil; }
     return row[ks[0]];
 }
 
-// quote_ident(name) — safely quote a SQL identifier (table/column) for cases where
-// it must be interpolated (placeholders only protect *values*). Wraps in double
-// quotes and doubles any internal double-quote, per SQL standard identifier rules.
+// quote_ident(name) — safely quote a SQL identifier per SQL standard double-quote rules.
 fn quote_ident(name) {
     return "\"" + str_replace_all(str(name), "\"", "\"\"") + "\"";
 }
 
-// Helpers for SQL string building (minimal, safe defaults).
+// sql_placeholders(n) — n=3 -> "?,?,?" in O(log n) chunk doublings.
 fn sql_placeholders(n) {
-    // n=3 -> "?,?,?". Double identical chunks instead of copying each prefix.
-    // This is a materializing API: untrusted counts need a caller resource policy.
     if type(n) == "number" {
         if not (n <= 9007199254740991) { throw "db: placeholder count is not exactly representable"; }
         if n >= 0 and n == num_floor(n) {
@@ -157,7 +225,6 @@ fn sql_placeholders(n) {
             return out;
         }
     }
-    // Preserve legacy rounding and errors for fractional/negative/other inputs.
     let s = "";
     for i n {
         if i == 0 { s = "?"; } else { s = s + ",?"; }
@@ -166,7 +233,6 @@ fn sql_placeholders(n) {
 }
 
 fn _migs_sort(migs) {
-    // stable-ish O(n^2) sort by .version
     let i = 0;
     while i < len(migs) {
         let j = i + 1;
@@ -183,8 +249,28 @@ fn _migs_sort(migs) {
     return migs;
 }
 
-fn migrate(conn, migrations) {
-    // migrations: [ map{version: 1, up: "SQL"}, ... ]
+fn _uses_v42_migrations(conn, mig_list, opts) {
+    if opts != nil { return true; }
+    if is_map(conn) and map_has(conn, "format") and conn.format == "pblang.db.pool.v1" {
+        return true;
+    }
+    if type(mig_list) == "array" {
+        let i = 0;
+        while i < len(mig_list) {
+            let m = mig_list[i];
+            if is_map(m) and (map_has(m, "up_sql") or map_has(m, "down_sql")) {
+                return true;
+            }
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+fn migrate(conn, mig_list, opts = nil) {
+    if _uses_v42_migrations(conn, mig_list, opts) {
+        return _pm().run_migrations(conn, mig_list, opts);
+    }
     return conn.transaction(fn(c) {
         c.exec("CREATE TABLE IF NOT EXISTS __pblang_migrations (version INTEGER PRIMARY KEY, applied_at TEXT)", []);
         let rows = c.query("SELECT version FROM __pblang_migrations", []);
@@ -193,7 +279,7 @@ fn migrate(conn, migrations) {
             applied[str(rows[i].version)] = true;
         }
 
-        let migs = _migs_sort(migrations);
+        let migs = _migs_sort(mig_list);
         for j len(migs) {
             let m = migs[j];
             let k = str(m.version);
@@ -211,4 +297,125 @@ fn migrate(conn, migrations) {
     });
 }
 
-export sqlite, sql_placeholders, migrate, query_one, query_value, quote_ident;
+fn run_migrations(conn_or_pool, migrations_array, opts = nil) {
+    return _pm().run_migrations(conn_or_pool, migrations_array, opts);
+}
+
+fn rollback_migration(conn_or_pool, migrations_array, opts = nil) {
+    return _pm().rollback_migration(conn_or_pool, migrations_array, opts);
+}
+
+fn open(dsn_or_opts, opts = nil) {
+    return _su().open(dsn_or_opts, opts);
+}
+
+// ── Named Driver & Facade Entrypoints ────────────────────────────────────────
+
+fn _pg_open(opts) { return _pg().open(opts); }
+fn _pg_connect(opts) { return _pg().connect(opts); }
+fn _pg_bytes_param(b) { return _pg().bytes_param(b); }
+fn _pg_json_param(v, jsonb = true) { return _pg().json_param(v, jsonb); }
+fn _pg_norm_placeholders(s) { return _pg().normalize_pg_placeholders(s); }
+fn _pg_driver() { return _pg(); }
+
+let postgres = map{
+    open: _pg_open,
+    connect: _pg_connect,
+    bytes_param: _pg_bytes_param,
+    json_param: _pg_json_param,
+    normalize_placeholders: _pg_norm_placeholders,
+    driver: _pg_driver
+};
+
+fn _ms_open(opts) { return _ms().open(opts); }
+fn _ms_connect(opts) { return _ms().connect(opts); }
+fn _ms_bytes_param(b) { return _ms().bytes_param(b); }
+fn _ms_norm_placeholders(s) { return _ms().normalize_tds_placeholders(s); }
+fn _ms_driver() { return _ms(); }
+
+let mssql = map{
+    open: _ms_open,
+    connect: _ms_connect,
+    bytes_param: _ms_bytes_param,
+    normalize_placeholders: _ms_norm_placeholders,
+    driver: _ms_driver
+};
+
+fn _my_open(opts) { return _my().open(opts); }
+fn _my_connect(opts) { return _my().connect(opts); }
+fn _my_bytes_param(b) { return _my().bytes_param(b); }
+fn _my_driver() { return _my(); }
+
+let mysql = map{
+    open: _my_open,
+    connect: _my_connect,
+    bytes_param: _my_bytes_param,
+    driver: _my_driver
+};
+
+fn _mem_open(namespace = "default", opts = nil) { return _su().open_memory(namespace, opts); }
+fn _su_create_index(conn, table_name, col_name, opts = nil) { return _su().create_index(conn, table_name, col_name, opts); }
+fn _su_explain(conn, sql_str) { return _su().explain(conn, sql_str); }
+fn _su_stats(conn) { return _su().stats(conn); }
+fn _su_save_snap(conn, path, key_material, opts = nil) { return _su().save_encrypted_snapshot(conn, path, key_material, opts); }
+fn _su_load_snap(path, key_material, opts = nil) { return _su().load_encrypted_snapshot(path, key_material, opts); }
+fn _su_parse_dsn(dsn) { return _su().parse_dsn(dsn); }
+fn _su_redact_dsn(dsn) { return _su().redact_dsn(dsn); }
+fn _su_guard_sql(sql_str, params = nil, strict = true) { return _su().guard_parameterized_sql(sql_str, params, strict); }
+
+let memory = map{
+    open: _mem_open,
+    create_index: _su_create_index,
+    explain: _su_explain,
+    stats: _su_stats,
+    save_encrypted_snapshot: _su_save_snap,
+    load_encrypted_snapshot: _su_load_snap
+};
+
+fn _pool_create(dsn_or_opts, opts = nil) { return _pm().create_pool(dsn_or_opts, opts); }
+fn _pool_is_pool(v) { return _pm().is_pool(v); }
+fn _pool_with_conn(p, f) { return _pm().with_conn(p, f); }
+fn _pool_with_conn_result(p, f) { return _pm().with_conn_result(p, f); }
+fn _pool_stats(p) { return _pm().pool_stats(p); }
+fn _pool_close(p) { return _pm().close_pool(p); }
+
+let pool = map{
+    create: _pool_create,
+    create_pool: _pool_create,
+    is_pool: _pool_is_pool,
+    with_conn: _pool_with_conn,
+    with_conn_result: _pool_with_conn_result,
+    stats: _pool_stats,
+    close: _pool_close
+};
+
+let migrations = map{
+    run: run_migrations,
+    rollback: rollback_migration
+};
+
+let unified = map{
+    open: open,
+    open_memory: _mem_open,
+    parse_dsn: _su_parse_dsn,
+    redact_dsn: _su_redact_dsn,
+    create_index: _su_create_index,
+    explain: _su_explain,
+    stats: _su_stats,
+    save_encrypted_snapshot: _su_save_snap,
+    load_encrypted_snapshot: _su_load_snap
+};
+
+let sql = map{
+    placeholders: sql_placeholders,
+    quote_ident: quote_ident,
+    query_one: query_one,
+    query_value: query_value,
+    guard_parameterized: _su_guard_sql,
+    postgres_placeholders: _pg_norm_placeholders,
+    tds_placeholders: _ms_norm_placeholders
+};
+
+export sqlite, sql, postgres, mssql, mysql, memory, pool, migrations, unified,
+       open, migrate, run_migrations, rollback_migration,
+       sql_placeholders, query_one, query_value, quote_ident;

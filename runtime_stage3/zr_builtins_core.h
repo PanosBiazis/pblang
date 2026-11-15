@@ -5370,6 +5370,280 @@ static bool bi_pbck_shield_inspect(PbVM *vm, int argc, PbValue *argv, PbValue *o
     return true;
 }
 
+/* ---- v4.2.0 Algebraic Enum Pattern Matcher & VM Line/Branch Coverage Builtins ---- */
+
+static bool bi_pat_enum(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (argc != 4 || !is_obj_type(argv[1], OBJ_STR) || !is_obj_type(argv[2], OBJ_STR) || argv[3].tag != VAL_NUM) {
+        *out = val_bool(false);
+        return true;
+    }
+    if (!is_obj_type(argv[0], OBJ_MAP)) {
+        *out = val_bool(false);
+        return true;
+    }
+    PbMap *m = AS_MAP(argv[0]);
+    const char *enum_nm = AS_STR(argv[1])->chars;
+    const char *var_nm  = AS_STR(argv[2])->chars;
+    int exp_arity = (int)argv[3].as.num;
+
+    PbValue vv = val_nil();
+    if (pb_map_get_cstr(m, "__variant", &vv) && is_obj_type(vv, OBJ_STR)) {
+        if (strcmp(AS_STR(vv)->chars, var_nm) != 0) {
+            *out = val_bool(false);
+            return true;
+        }
+        if (enum_nm[0] != '\0') {
+            PbValue ev = val_nil(), tv = val_nil();
+            if (pb_map_get_cstr(m, "__enum", &ev) && is_obj_type(ev, OBJ_STR)) {
+                if (strcmp(AS_STR(ev)->chars, enum_nm) != 0) {
+                    *out = val_bool(false);
+                    return true;
+                }
+            } else if (pb_map_get_cstr(m, "__type", &tv) && is_obj_type(tv, OBJ_STR)) {
+                if (strcmp(AS_STR(tv)->chars, enum_nm) != 0) {
+                    *out = val_bool(false);
+                    return true;
+                }
+            } else {
+                bool builtin_adt =
+                    (strcmp(enum_nm, "Result") == 0 && (strcmp(var_nm, "Ok") == 0 || strcmp(var_nm, "Err") == 0)) ||
+                    (strcmp(enum_nm, "Option") == 0 && (strcmp(var_nm, "Some") == 0 || strcmp(var_nm, "None") == 0));
+                if (!builtin_adt) {
+                    *out = val_bool(false);
+                    return true;
+                }
+            }
+        }
+        PbValue vals_v = val_nil();
+        if (pb_map_get_cstr(m, "values", &vals_v) && is_obj_type(vals_v, OBJ_ARRAY)) {
+            PbArray *arr = AS_ARRAY(vals_v);
+            if (exp_arity < 0) {
+                *out = val_bool(arr->len == 0);
+                return true;
+            }
+            if (arr->len != (size_t)exp_arity) {
+                *out = val_bool(false);
+                return true;
+            }
+            *out = (exp_arity == 0) ? val_bool(true) : vals_v;
+            return true;
+        }
+        PbValue pv = val_nil();
+        bool has_single = false;
+        if (strcmp(var_nm, "Err") == 0) {
+            has_single = pb_map_get_cstr(m, "__error", &pv) || pb_map_get_cstr(m, "error", &pv);
+        } else if (strcmp(var_nm, "None") != 0) {
+            has_single = pb_map_get_cstr(m, "__value", &pv) || pb_map_get_cstr(m, "value", &pv);
+        }
+        if (!has_single) {
+            *out = val_bool(exp_arity <= 0);
+            return true;
+        }
+        if (exp_arity != 1) {
+            *out = val_bool(false);
+            return true;
+        }
+        PbArray *a = pb_array_new(vm, 1);
+        vm_push_root(vm, val_obj(a));
+        pb_array_push(vm, a, pv);
+        vm_pop_roots(vm, 1);
+        *out = val_obj(a);
+        return true;
+    }
+
+    if ((enum_nm[0] == '\0' || strcmp(enum_nm, "Result") == 0) && exp_arity == 1) {
+        PbValue okv = val_nil();
+        if (pb_map_get_cstr(m, "ok", &okv) && okv.tag == VAL_BOOL) {
+            if (okv.as.b && strcmp(var_nm, "Ok") == 0) {
+                PbValue pv = val_nil();
+                pb_map_get_cstr(m, "value", &pv);
+                PbArray *a = pb_array_new(vm, 1);
+                vm_push_root(vm, val_obj(a));
+                pb_array_push(vm, a, pv);
+                vm_pop_roots(vm, 1);
+                *out = val_obj(a);
+                return true;
+            }
+            if (!okv.as.b && strcmp(var_nm, "Err") == 0) {
+                PbValue ev = val_nil();
+                if (!pb_map_get_cstr(m, "error", &ev)) pb_map_get_cstr(m, "err", &ev);
+                PbArray *a = pb_array_new(vm, 1);
+                vm_push_root(vm, val_obj(a));
+                pb_array_push(vm, a, ev);
+                vm_pop_roots(vm, 1);
+                *out = val_obj(a);
+                return true;
+            }
+        }
+    }
+
+    *out = val_bool(false);
+    return true;
+}
+
+static void zr_cov_scan_vm_objects(PbVM *vm) {
+    if (!vm || !vm->cov_table) return;
+    for (PbObj *o = vm->objects; o; o = o->next) {
+        if (o->type == OBJ_FUNC) zr_cov_register_func(vm->cov_table, (const PbFunc *)o);
+    }
+    for (PbObj *o = vm->nursery_objects; o; o = o->next) {
+        if (o->type == OBJ_FUNC) zr_cov_register_func(vm->cov_table, (const PbFunc *)o);
+    }
+    for (size_t i = 0; i < vm->frame_count; i++) {
+        if (vm->frames[i].closure && vm->frames[i].closure->fn) {
+            zr_cov_register_func(vm->cov_table, vm->frames[i].closure->fn);
+        }
+    }
+}
+
+static bool bi_coverage_start(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    (void)argc; (void)argv;
+    if (!vm->cov_table) {
+        vm->cov_table = (ZrCovTable *)zr_xcalloc(1, sizeof(ZrCovTable));
+        zr_cov_table_init(vm->cov_table);
+        vm->cov_owns_table = true;
+    }
+    vm->cov_enabled = true;
+    zr_cov_scan_vm_objects(vm);
+    *out = val_bool(true);
+    return true;
+}
+
+static bool bi_coverage_stop(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    (void)argc; (void)argv;
+    vm->cov_enabled = false;
+    *out = val_bool(true);
+    return true;
+}
+
+static bool bi_coverage_reset(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    (void)argc; (void)argv;
+    if (vm->cov_table) {
+        zr_cov_table_reset(vm->cov_table);
+        if (vm->cov_enabled) zr_cov_scan_vm_objects(vm);
+    }
+    *out = val_bool(true);
+    return true;
+}
+
+static PbValue zr_build_coverage_snapshot_map(PbVM *vm, const ZrCovTable *tbl, bool enabled_flag) {
+    PbMap *root = pb_map_new_raw(vm, 16);
+    vm_push_root(vm, val_obj(root));
+
+    PbMap *files_map = pb_map_new_raw(vm, tbl ? (tbl->file_len + 4) : 4);
+    vm_push_root(vm, val_obj(files_map));
+
+    uint64_t total_lines = 0, covered_lines = 0;
+    uint64_t total_branches = 0, covered_branches = 0;
+
+    if (tbl) {
+        for (size_t fi = 0; fi < tbl->file_len; fi++) {
+            const ZrCovFile *cf = &tbl->files[fi];
+            if (!cf->path) continue;
+
+            PbMap *fm = pb_map_new_raw(vm, 12);
+            vm_push_root(vm, val_obj(fm));
+
+            PbArray *exec_arr = pb_array_new(vm, 32);
+            vm_push_root(vm, val_obj(exec_arr));
+
+            PbArray *cov_arr = pb_array_new(vm, 32);
+            vm_push_root(vm, val_obj(cov_arr));
+
+            PbMap *hits_map = pb_map_new_raw(vm, 32);
+            vm_push_root(vm, val_obj(hits_map));
+
+            uint64_t f_lines_tot = 0, f_lines_cov = 0;
+            for (size_t ln = 1; ln < cf->line_cap; ln++) {
+                uint64_t h = cf->line_hits[ln];
+                if (cf->line_exec[ln] || h > 0) {
+                    f_lines_tot++;
+                    pb_array_push(vm, exec_arr, val_num((double)ln));
+                    char lbuf[24];
+                    snprintf(lbuf, sizeof(lbuf), "%zu", ln);
+                    pb_map_set_cstr(vm, hits_map, lbuf, val_num((double)h));
+                    if (h > 0) {
+                        f_lines_cov++;
+                        pb_array_push(vm, cov_arr, val_num((double)ln));
+                    }
+                }
+            }
+
+            PbArray *br_arr = pb_array_new(vm, cf->branch_len + 1);
+            vm_push_root(vm, val_obj(br_arr));
+
+            uint64_t f_br_tot = (uint64_t)cf->branch_len * 2ULL;
+            uint64_t f_br_cov = 0;
+            for (size_t bi = 0; bi < cf->branch_len; bi++) {
+                const ZrCovBranch *br = &cf->branches[bi];
+                if (br->taken_hits > 0) f_br_cov++;
+                if (br->not_taken_hits > 0) f_br_cov++;
+
+                PbMap *bm = pb_map_new_raw(vm, 8);
+                vm_push_root(vm, val_obj(bm));
+                char bid_buf[48];
+                snprintf(bid_buf, sizeof(bid_buf), "B%u_%u", (unsigned)br->line, (unsigned)br->ip);
+                pb_map_set_cstr(vm, bm, "id", val_obj(pb_str_c(vm, bid_buf)));
+                pb_map_set_cstr(vm, bm, "line", val_num((double)br->line));
+                pb_map_set_cstr(vm, bm, "ip", val_num((double)br->ip));
+                pb_map_set_cstr(vm, bm, "taken_hits", val_num((double)br->taken_hits));
+                pb_map_set_cstr(vm, bm, "not_taken_hits", val_num((double)br->not_taken_hits));
+                pb_map_set_cstr(vm, bm, "true_hits", val_num((double)br->not_taken_hits));
+                pb_map_set_cstr(vm, bm, "false_hits", val_num((double)br->taken_hits));
+                pb_array_push(vm, br_arr, val_obj(bm));
+                vm_pop_roots(vm, 1); /* bm */
+            }
+
+            double f_lpct = f_lines_tot > 0 ? (100.0 * (double)f_lines_cov / (double)f_lines_tot) : 100.0;
+            double f_bpct = f_br_tot > 0 ? (100.0 * (double)f_br_cov / (double)f_br_tot) : 100.0;
+
+            pb_map_set_cstr(vm, fm, "executable_lines", val_obj(exec_arr));
+            pb_map_set_cstr(vm, fm, "covered_lines", val_obj(cov_arr));
+            pb_map_set_cstr(vm, fm, "line_hits", val_obj(hits_map));
+            pb_map_set_cstr(vm, fm, "lines_total", val_num((double)f_lines_tot));
+            pb_map_set_cstr(vm, fm, "lines_covered", val_num((double)f_lines_cov));
+            pb_map_set_cstr(vm, fm, "line_pct", val_num(f_lpct));
+            pb_map_set_cstr(vm, fm, "branches_total", val_num((double)f_br_tot));
+            pb_map_set_cstr(vm, fm, "branches_covered", val_num((double)f_br_cov));
+            pb_map_set_cstr(vm, fm, "branch_pct", val_num(f_bpct));
+            pb_map_set_cstr(vm, fm, "branch_details", val_obj(br_arr));
+            pb_map_set_cstr(vm, fm, "branches", val_obj(br_arr));
+
+            pb_map_set_cstr(vm, files_map, cf->path, val_obj(fm));
+            vm_pop_roots(vm, 5); /* br_arr, hits_map, cov_arr, exec_arr, fm */
+
+            total_lines += f_lines_tot;
+            covered_lines += f_lines_cov;
+            total_branches += f_br_tot;
+            covered_branches += f_br_cov;
+        }
+    }
+
+    double line_pct = total_lines > 0 ? (100.0 * (double)covered_lines / (double)total_lines) : 100.0;
+    double branch_pct = total_branches > 0 ? (100.0 * (double)covered_branches / (double)total_branches) : 100.0;
+
+    pb_map_set_cstr(vm, root, "enabled", val_bool(enabled_flag));
+    pb_map_set_cstr(vm, root, "lines_total", val_num((double)total_lines));
+    pb_map_set_cstr(vm, root, "lines_covered", val_num((double)covered_lines));
+    pb_map_set_cstr(vm, root, "line_pct", val_num(line_pct));
+    pb_map_set_cstr(vm, root, "branches_total", val_num((double)total_branches));
+    pb_map_set_cstr(vm, root, "branches_covered", val_num((double)covered_branches));
+    pb_map_set_cstr(vm, root, "branch_pct", val_num(branch_pct));
+    pb_map_set_cstr(vm, root, "files", val_obj(files_map));
+
+    vm_pop_roots(vm, 2); /* files_map, root */
+    return val_obj(root);
+}
+
+static bool bi_coverage_snapshot(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    (void)argc; (void)argv;
+    if (vm->cov_enabled && vm->cov_table) {
+        zr_cov_scan_vm_objects(vm);
+    }
+    *out = zr_build_coverage_snapshot_map(vm, vm->cov_table, vm->cov_enabled);
+    return true;
+}
+
 static void zr_register_all_builtins(PbVM *vm) {
     static const struct { const char *name; PbBuiltinFn fn; } table[] = {
         /* Console & Core */
@@ -5381,6 +5655,7 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"import_with_caps", bi_import_with_caps},
         {"assert", bi_assert},
         {"error", bi_error},
+        {"__pat_enum", bi_pat_enum},
 
         /* Type Predicates, Freeze, GC, JIT & Profiler */
         {"type", bi_type},
@@ -5402,6 +5677,9 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"gc_stats_map", bi_gc_stats_map},
         {"jit_compile", bi_jit_compile},
         {"jit_stats", bi_jit_stats},
+        {"jit_status", bi_jit_status},
+        {"jit_compile_arm64_bytes", bi_jit_compile_arm64_bytes},
+        {"jit_emulate_arm64", bi_jit_emulate_arm64},
         {"vm_set_prof", bi_vm_set_prof},
         {"vm_prof_stats", bi_vm_prof_stats},
 
@@ -5601,7 +5879,7 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"proc_spawn_wait", bi_proc_spawn_wait},
         {"hardware_probe", bi_hardware_probe},
 
-        /* TCP, TLS, HTTP/HTTPS, SSE & WebSocket */
+        /* TCP, TLS, HTTP/HTTPS, Streaming/Multipart, UDP, SSE & WebSocket */
         {"tcp_listen", bi_tcp_listen},
         {"tcp_connect", bi_tcp_connect},
         {"tcp_accept", bi_tcp_accept},
@@ -5619,10 +5897,19 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"http_get_auth", bi_http_get_auth},
         {"http_post_auth", bi_http_post_auth},
         {"http_request", bi_http_request},
+        {"http_stream_get", bi_http_stream_get},
+        {"http_stream_request", bi_http_stream_request},
+        {"http_upload_multipart", bi_http_upload_multipart},
         {"http_parse_request", bi_http_parse_request},
         {"http_response", bi_http_response},
         {"http_response_ct", bi_http_response_ct},
         {"http_response_json", bi_http_response_json},
+        {"udp_bind", bi_udp_bind},
+        {"udp_local_addr", bi_udp_local_addr},
+        {"udp_set_timeout", bi_udp_set_timeout},
+        {"udp_sendto", bi_udp_sendto},
+        {"udp_recvfrom", bi_udp_recvfrom},
+        {"udp_close", bi_udp_close},
         {"parse_sse_line", bi_parse_sse_line},
         {"websocket_accept_key", bi_websocket_accept_key},
         {"websocket_parse_frame", bi_ws_parse_frame},
@@ -5808,7 +6095,13 @@ static void zr_register_all_builtins(PbVM *vm) {
 
         /* v4.1.0 Polymorphic Bytecode Shield (`PBSH`) & Anti-Debug */
         {"pbck_shield_inspect", bi_pbck_shield_inspect},
-        {"security_is_debugger_present", bi_security_is_debugger_present}
+        {"security_is_debugger_present", bi_security_is_debugger_present},
+
+        /* v4.2.0 VM Line & Branch Coverage Engine */
+        {"coverage_start", bi_coverage_start},
+        {"coverage_stop", bi_coverage_stop},
+        {"coverage_reset", bi_coverage_reset},
+        {"coverage_snapshot", bi_coverage_snapshot}
     };
 
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {

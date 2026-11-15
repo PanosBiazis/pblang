@@ -535,6 +535,34 @@ typedef struct {
 #define ZR_MAX_BUILTINS   768
 #define ZR_MAX_TEMP_ROOTS 256
 
+/* ---- Zero-Overhead Line & Branch Coverage Table ---- */
+
+typedef struct {
+    uint32_t line;
+    uint32_t ip;
+    uint32_t fn_code_len;
+    uint64_t taken_hits;
+    uint64_t not_taken_hits;
+} ZrCovBranch;
+
+typedef struct {
+    char        *path;
+    size_t       path_len;
+    uint64_t    *line_hits;   /* 1-indexed by source line */
+    uint8_t     *line_exec;   /* 1 if line has executable bytecode */
+    size_t       line_cap;
+    ZrCovBranch *branches;
+    size_t       branch_len;
+    size_t       branch_cap;
+} ZrCovFile;
+
+typedef struct {
+    ZrCovFile   *files;
+    size_t       file_len;
+    size_t       file_cap;
+    int32_t      last_file_idx;
+} ZrCovTable;
+
 struct PbVM {
     PbValue     *stack;
     size_t       sp;
@@ -600,8 +628,11 @@ struct PbVM {
     size_t         flight_event_count;
     size_t         flight_replay_cursor;
 
-    /* Hotspot profiler */
+    /* Hotspot profiler & line/branch coverage */
     bool         prof_enabled;
+    bool         cov_enabled;
+    bool         cov_owns_table;
+    ZrCovTable  *cov_table;
 
     /* Paths & CLI arguments */
     union {
@@ -659,6 +690,152 @@ static inline void vm_push_root(PbVM *vm, PbValue v) {
 static inline void vm_pop_roots(PbVM *vm, size_t n) {
     if (n >= vm->temp_root_count) vm->temp_root_count = 0;
     else vm->temp_root_count -= n;
+}
+
+/* ---- Line & Branch Coverage Engine Helpers ---- */
+
+static inline void zr_cov_table_init(ZrCovTable *t) {
+    memset(t, 0, sizeof(*t));
+    t->last_file_idx = -1;
+}
+
+static inline void zr_cov_table_free(ZrCovTable *t) {
+    if (!t) return;
+    for (size_t i = 0; i < t->file_len; i++) {
+        free(t->files[i].path);
+        free(t->files[i].line_hits);
+        free(t->files[i].line_exec);
+        free(t->files[i].branches);
+    }
+    free(t->files);
+    memset(t, 0, sizeof(*t));
+    t->last_file_idx = -1;
+}
+
+static inline void zr_cov_table_reset(ZrCovTable *t) {
+    if (!t) return;
+    for (size_t i = 0; i < t->file_len; i++) {
+        ZrCovFile *cf = &t->files[i];
+        if (cf->line_cap > 0) memset(cf->line_hits, 0, cf->line_cap * sizeof(uint64_t));
+        for (size_t b = 0; b < cf->branch_len; b++) {
+            cf->branches[b].taken_hits = 0;
+            cf->branches[b].not_taken_hits = 0;
+        }
+    }
+}
+
+static inline bool zr_cov_should_track_source(const char *src) {
+    if (!src || src[0] == '\0') return false;
+    if (strcmp(src, "<comptime>") == 0 || strcmp(src, "<defer>") == 0) return false;
+    return true;
+}
+
+static ZrCovFile *zr_cov_get_file(ZrCovTable *t, const char *path) {
+    if (!t || !zr_cov_should_track_source(path)) return NULL;
+    size_t plen = strlen(path);
+    if (t->last_file_idx >= 0 && (size_t)t->last_file_idx < t->file_len) {
+        ZrCovFile *lf = &t->files[t->last_file_idx];
+        if (lf->path_len == plen && memcmp(lf->path, path, plen) == 0) return lf;
+    }
+    for (size_t i = 0; i < t->file_len; i++) {
+        if (t->files[i].path_len == plen && memcmp(t->files[i].path, path, plen) == 0) {
+            t->last_file_idx = (int32_t)i;
+            return &t->files[i];
+        }
+    }
+    if (t->file_len >= t->file_cap) {
+        t->file_cap = t->file_cap ? (t->file_cap * 2u) : 8u;
+        t->files = (ZrCovFile *)zr_xrealloc(t->files, t->file_cap * sizeof(ZrCovFile));
+    }
+    size_t idx = t->file_len++;
+    ZrCovFile *cf = &t->files[idx];
+    memset(cf, 0, sizeof(*cf));
+    cf->path = zr_xstrdup(path);
+    cf->path_len = plen;
+    t->last_file_idx = (int32_t)idx;
+    return cf;
+}
+
+static void zr_cov_ensure_line(ZrCovFile *cf, uint32_t line) {
+    if (!cf || line == 0 || line > 1048576u) return;
+    if ((size_t)line >= cf->line_cap) {
+        size_t ncap = cf->line_cap ? cf->line_cap : 64u;
+        while (ncap <= (size_t)line) ncap *= 2u;
+        cf->line_hits = (uint64_t *)zr_xrealloc(cf->line_hits, ncap * sizeof(uint64_t));
+        cf->line_exec = (uint8_t *)zr_xrealloc(cf->line_exec, ncap * sizeof(uint8_t));
+        memset(cf->line_hits + cf->line_cap, 0, (ncap - cf->line_cap) * sizeof(uint64_t));
+        memset(cf->line_exec + cf->line_cap, 0, (ncap - cf->line_cap) * sizeof(uint8_t));
+        cf->line_cap = ncap;
+    }
+}
+
+static ZrCovBranch *zr_cov_get_or_add_branch(ZrCovFile *cf, uint32_t line, uint32_t ip, uint32_t fn_code_len) {
+    if (!cf) return NULL;
+    for (size_t i = 0; i < cf->branch_len; i++) {
+        if (cf->branches[i].line == line &&
+            cf->branches[i].ip == ip &&
+            cf->branches[i].fn_code_len == fn_code_len) {
+            return &cf->branches[i];
+        }
+    }
+    if (cf->branch_len >= cf->branch_cap) {
+        cf->branch_cap = cf->branch_cap ? (cf->branch_cap * 2u) : 16u;
+        cf->branches = (ZrCovBranch *)zr_xrealloc(cf->branches, cf->branch_cap * sizeof(ZrCovBranch));
+    }
+    ZrCovBranch *br = &cf->branches[cf->branch_len++];
+    br->line = line;
+    br->ip = ip;
+    br->fn_code_len = fn_code_len;
+    br->taken_hits = 0;
+    br->not_taken_hits = 0;
+    return br;
+}
+
+static void zr_cov_register_func(ZrCovTable *t, const PbFunc *fn) {
+    if (!t || !fn) return;
+    const char *src = (fn->source_name && fn->source_name->len > 0) ? fn->source_name->chars : NULL;
+    if (zr_cov_should_track_source(src)) {
+        ZrCovFile *cf = zr_cov_get_file(t, src);
+        if (cf) {
+            for (uint32_t i = 0; i < fn->code_len; i++) {
+                uint32_t ln = fn->code[i].line;
+                if (ln > 0) {
+                    zr_cov_ensure_line(cf, ln);
+                    cf->line_exec[ln] = 1;
+                }
+                uint8_t op = fn->code[i].orig_op ? fn->code[i].orig_op : fn->code[i].op;
+                if ((op == OP_JUMP_IF_FALSE || op == OP_JUMP_IF_TRUE) && ln > 0) {
+                    (void)zr_cov_get_or_add_branch(cf, ln, i, fn->code_len);
+                }
+            }
+        }
+    }
+    for (uint32_t c = 0; c < fn->const_len; c++) {
+        if (is_obj_type(fn->consts[c], OBJ_FUNC)) {
+            zr_cov_register_func(t, AS_FUNC(fn->consts[c]));
+        }
+    }
+}
+
+static void zr_cov_hit_line(PbVM *vm, const PbFunc *fn, uint32_t line) {
+    if (!vm->cov_table || !fn || line == 0) return;
+    const char *src = (fn->source_name && fn->source_name->len > 0) ? fn->source_name->chars : NULL;
+    ZrCovFile *cf = zr_cov_get_file(vm->cov_table, src);
+    if (!cf) return;
+    zr_cov_ensure_line(cf, line);
+    cf->line_exec[line] = 1;
+    cf->line_hits[line]++;
+}
+
+static void zr_cov_hit_branch(PbVM *vm, const PbFunc *fn, uint32_t line, uint32_t ip, bool taken) {
+    if (!vm->cov_table || !fn || line == 0) return;
+    const char *src = (fn->source_name && fn->source_name->len > 0) ? fn->source_name->chars : NULL;
+    ZrCovFile *cf = zr_cov_get_file(vm->cov_table, src);
+    if (!cf) return;
+    ZrCovBranch *br = zr_cov_get_or_add_branch(cf, line, ip, fn->code_len);
+    if (!br) return;
+    if (taken) br->taken_hits++;
+    else br->not_taken_hits++;
 }
 
 static inline bool vm_root_cap_allowed(const PbVM *vm, uint32_t cap_bit) {
@@ -2150,10 +2327,10 @@ retry_call:;
     /* Tier-2 W^X Native JIT compilation trigger (at 32 calls) & fastpath execution */
     PbFunc *fn = cl->fn;
     fn->call_count++;
-    if (fn->call_count == 32 && !fn->jit_attempted) {
+    if (!ZR_UNLIKELY(vm->cov_enabled) && fn->call_count == 32 && !fn->jit_attempted) {
         zr_maybe_tier2_jit(vm, fn);
     }
-    if (fn->jit_fn != NULL && !fn->is_vararg && fn->arity <= 8) {
+    if (!ZR_UNLIKELY(vm->cov_enabled) && fn->jit_fn != NULL && !fn->is_vararg && fn->arity <= 8) {
         bool jit_ok = true;
         if (fn->jit_self_kind == 1) {
             PbMap *gmap = cl->module ? cl->module->globals : vm->globals;
@@ -2658,6 +2835,7 @@ static bool vm_execute_until(PbVM *vm, size_t stop_frame_depth, PbValue *out_ret
 #define ZR_DISPATCH() do { \
     if (__builtin_expect(frame->ip >= fn->code_len, 0)) goto frame_falloff; \
     ins = &fn->code[frame->ip++]; \
+    if (ZR_UNLIKELY(vm->cov_enabled)) zr_cov_hit_line(vm, fn, ins->line); \
     op = ins->op; \
     goto *disp_tab[op]; \
 } while (0)
@@ -2686,6 +2864,7 @@ next_iter:;
     }
     if (frame->ip >= fn->code_len) goto frame_falloff;
     ins = &fn->code[frame->ip++];
+    if (ZR_UNLIKELY(vm->cov_enabled)) zr_cov_hit_line(vm, fn, ins->line);
     op = ins->op;
     switch (op)
 #endif
@@ -2726,6 +2905,7 @@ next_iter:;
         /* ---- Peephole Superinstructions (48..=54) ---- */
 
         ZR_CASE(OP_INC_LOCAL_1) {
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_local;
             size_t slot = frame->base + 1 + (size_t)ins->arg;
             if (slot < vm->sp && vm->stack[slot].tag == VAL_NUM) {
                 double d = fn->consts[ins->arg2].as.num;
@@ -2736,6 +2916,7 @@ next_iter:;
             goto fallback_get_local;
         }
         ZR_CASE(OP_ADD_LOCAL_LOCAL) {
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_local;
             size_t s1 = frame->base + 1 + (size_t)ins->arg;
             size_t s2 = frame->base + 1 + (size_t)ins->arg2;
             if (s1 < vm->sp && s2 < vm->sp &&
@@ -2751,6 +2932,7 @@ next_iter:;
             goto fallback_get_local;
         }
         ZR_CASE(OP_SUB_LOCAL_CONST) {
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_local;
             size_t s1 = frame->base + 1 + (size_t)ins->arg;
             if (s1 < vm->sp && vm->stack[s1].tag == VAL_NUM) {
                 double c = fn->consts[ins->arg2].as.num;
@@ -2764,6 +2946,7 @@ next_iter:;
             goto fallback_get_local;
         }
         ZR_CASE(OP_LT_LOCAL_CONST_JMPF) {
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_local;
             size_t s1 = frame->base + 1 + (size_t)ins->arg;
             if (s1 < vm->sp && vm->stack[s1].tag == VAL_NUM) {
                 double lv = vm->stack[s1].as.num;
@@ -2782,6 +2965,7 @@ next_iter:;
             goto fallback_get_local;
         }
         ZR_CASE(OP_LT_LOCAL_LOCAL_JMPF) {
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_local;
             size_t s1 = frame->base + 1 + (size_t)ins->arg;
             size_t s2 = frame->base + 1 + (size_t)ins->arg2;
             if (s1 < vm->sp && s2 < vm->sp &&
@@ -2802,6 +2986,7 @@ next_iter:;
             goto fallback_get_local;
         }
         ZR_CASE(OP_INC_GLOBAL_1) {
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_global;
             PbStr *name = AS_STR(fn->consts[ins->arg]);
             PbMap *gmap = vm_frame_globals(vm, frame);
             if (gmap->bcap > 0 && ins->ic_bcap == gmap->bcap && (size_t)ins->ic_slot < gmap->used) {
@@ -2825,6 +3010,7 @@ next_iter:;
             goto fallback_get_global;
         }
         ZR_CASE(OP_LT_GLOBAL_CONST_JMPF) {
+            if (ZR_UNLIKELY(vm->cov_enabled)) goto fallback_get_global;
             PbStr *name = AS_STR(fn->consts[ins->arg]);
             PbMap *gmap = vm_frame_globals(vm, frame);
             PbMapEntry *hit = NULL;
@@ -3258,7 +3444,7 @@ next_iter:;
                 if (vm->gc_inhibit == 0 && vm->nursery_bytes >= vm->nursery_threshold) {
                     vm_collect_nursery(vm);
                 }
-                if (ins->ic_slot >= 0 && ++ins->ic_slot >= 32) {
+                if (!ZR_UNLIKELY(vm->cov_enabled) && ins->ic_slot >= 0 && ++ins->ic_slot >= 32) {
                     if (zr_try_osr_numeric_loop(vm, frame, fn, tgt, jump_ip)) {
                         ins->ic_slot = 0;
                         ZR_DISPATCH();
@@ -3270,11 +3456,19 @@ next_iter:;
             ZR_DISPATCH();
         }
         ZR_CASE(OP_JUMP_IF_FALSE) {
-            if (!val_truthy(vm->stack[vm->sp - 1])) frame->ip = ins->arg;
+            bool take_jmp = !val_truthy(vm->stack[vm->sp - 1]);
+            if (ZR_UNLIKELY(vm->cov_enabled)) {
+                zr_cov_hit_branch(vm, fn, ins->line, frame->ip - 1u, take_jmp);
+            }
+            if (take_jmp) frame->ip = ins->arg;
             ZR_DISPATCH();
         }
         ZR_CASE(OP_JUMP_IF_TRUE) {
-            if (val_truthy(vm->stack[vm->sp - 1])) frame->ip = ins->arg;
+            bool take_jmp = val_truthy(vm->stack[vm->sp - 1]);
+            if (ZR_UNLIKELY(vm->cov_enabled)) {
+                zr_cov_hit_branch(vm, fn, ins->line, frame->ip - 1u, take_jmp);
+            }
+            if (take_jmp) frame->ip = ins->arg;
             ZR_DISPATCH();
         }
 
@@ -3662,7 +3856,61 @@ next_iter:;
                         vm_push(vm, res_v);
                     }
                 } else {
-                    vm_push(vm, rv);
+                    PbValue var_v;
+                    if (pb_map_get_cstr(m, "__variant", &var_v) && is_obj_type(var_v, OBJ_STR)) {
+                        const char *vn = AS_STR(var_v)->chars;
+                        if (strcmp(vn, "Ok") == 0 || strcmp(vn, "Some") == 0) {
+                            PbValue vals_v;
+                            if (pb_map_get_cstr(m, "values", &vals_v) && is_obj_type(vals_v, OBJ_ARRAY) && AS_ARRAY(vals_v)->len > 0) {
+                                vm_push(vm, AS_ARRAY(vals_v)->items[0]);
+                            } else {
+                                PbValue vv = val_nil();
+                                pb_map_get_cstr(m, "__value", &vv);
+                                vm_push(vm, vv);
+                            }
+                        } else if (strcmp(vn, "Err") == 0 || strcmp(vn, "None") == 0) {
+                            bool has_local_try = (vm->handler_count > 0 &&
+                                                  vm->handlers[vm->handler_count - 1].frame_idx == vm->frame_count - 1);
+                            if (!has_local_try && vm->frame_count > 1) {
+                                vm_push_root(vm, rv);
+                                vm_run_frame_defers(vm, frame, 0);
+                                vm_prof_exit_frame(vm, frame, vm->frame_count - 1);
+                                size_t base = frame->base;
+                                vm_close_upvalues_from(vm, base + 1);
+                                vm->frame_count--;
+                                vm->sp = base;
+                                vm_pop_roots(vm, 1);
+                                if (vm->exited || vm->frame_count <= stop_frame_depth) {
+                                    if (out_ret) *out_ret = rv;
+                                    return true;
+                                }
+                                ZR_RELOAD_FRAME();
+                                vm_push(vm, rv);
+                                ZR_DISPATCH();
+                            }
+                            if (strcmp(vn, "None") == 0) {
+                                vm_error(vm, "? operator: unwrapped Option::None");
+                            } else {
+                                PbValue vals_v, ev;
+                                if (pb_map_get_cstr(m, "values", &vals_v) && is_obj_type(vals_v, OBJ_ARRAY) && AS_ARRAY(vals_v)->len > 0) {
+                                    char *es = vm_value_to_cstr(vm, AS_ARRAY(vals_v)->items[0], NULL);
+                                    vm_error(vm, "%s", es);
+                                    free(es);
+                                } else if (pb_map_get_cstr(m, "__error", &ev)) {
+                                    char *es = vm_value_to_cstr(vm, ev, NULL);
+                                    vm_error(vm, "%s", es);
+                                    free(es);
+                                } else {
+                                    vm_error(vm, "Err (from ? operator)");
+                                }
+                            }
+                            goto handle_exception;
+                        } else {
+                            vm_push(vm, rv);
+                        }
+                    } else {
+                        vm_push(vm, rv);
+                    }
                 }
             } else {
                 vm_push(vm, rv);
@@ -3790,6 +4038,9 @@ static bool vm_call_value_sync(PbVM *vm, PbValue callee, int argc, const PbValue
 
 static bool vm_run_root_func(PbVM *vm, PbFunc *root_fn, PbModule *mod, PbValue *out_ret) {
     if (!root_fn->peephole_done) zr_peephole_optimize_func(root_fn);
+    if (ZR_UNLIKELY(vm->cov_enabled) && vm->cov_table) {
+        zr_cov_register_func(vm->cov_table, root_fn);
+    }
     PbMap *target_g = mod ? mod->globals : vm->globals;
     zr_populate_polyglot_globals(vm, target_g, root_fn);
     PbClosure *cl = pb_closure_new(vm, root_fn, 0, mod);
@@ -3831,6 +4082,11 @@ static void vm_free(PbVM *vm) {
     vm->gc_inhibit = 1;
     zr_ffi_cleanup_vm(vm);
     zr_flight_cleanup_vm(vm);
+    if (vm->cov_owns_table && vm->cov_table) {
+        zr_cov_table_free(vm->cov_table);
+        free(vm->cov_table);
+        vm->cov_table = NULL;
+    }
     for (size_t i = 0; i < vm->frame_count; i++) {
         free(vm->frames[i].defers);
     }
@@ -3932,7 +4188,7 @@ static inline void vm_format_value(PbValue v, ZrBuf *b) {
     }
 }
 
-static int pb_map_entry_cmp(const void *a, const void *b) {
+static inline int pb_map_entry_cmp(const void *a, const void *b) {
     const PbMapEntry *ea = *(const PbMapEntry *const *)a;
     const PbMapEntry *eb = *(const PbMapEntry *const *)b;
     return zr_cmp_pbstr_ptr(&ea->key, &eb->key);

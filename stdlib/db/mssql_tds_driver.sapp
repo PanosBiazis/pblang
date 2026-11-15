@@ -1,0 +1,1282 @@
+// stdlib/db/mssql_tds_driver.sapp — Pure-PBLang MS SQL Server TDS 7.4 / 8.0 Driver
+//
+// Implements Microsoft Tabular Data Stream (MS-TDS) 7.4 and 8.0 (strict TLS)
+// directly over capability-gated TCP/TLS sockets without ODBC/FreeTDS/sqlcmd:
+//   - 8-byte TDS packet framing ([type:u8][status:u8][len_be:u16][spid:u16][pkt_id:u8][win:u8])
+//     with multi-packet fragmentation and EOM (0x01) reassembly.
+//   - PRELOGIN (0x12) negotiation + TDS 8.0 strict TLS mode.
+//   - Exact 94-byte MS-TDS LOGIN7 (0x10) header (version 0x74000004), privacy-redacted
+//     default client hostname ("pblang-client"), and TDS7 password obfuscation
+//     (((byte << 4) | (byte >> 4)) ^ 0xA5 on UTF-16LE bytes).
+//   - True parameterized RPC Request (0x03 -> sp_executesql ProcID = 10) with
+//     22-byte ALL_HEADERS TransactionDescriptor and SQL Batch (0x01).
+//   - Token stream parser for COLMETADATA (0x81), ROW (0xD1), NBCROW (0xD2),
+//     ENVCHANGE (0xE3), INFO (0xAB), ERROR (0xAA), LOGINACK (0xAD),
+//     RETURNSTATUS (0x79), and DONE / DONEPROC / DONEINPROC (0xFD/0xFE/0xFF).
+
+let TDS_PKT_SQL_BATCH = 1;       // 0x01
+let TDS_PKT_RPC_REQUEST = 3;     // 0x03
+let TDS_PKT_TABULAR_RESULT = 4;  // 0x04
+let TDS_PKT_ATTENTION = 6;       // 0x06
+let TDS_PKT_LOGIN7 = 16;         // 0x10
+let TDS_PKT_PRELOGIN = 18;       // 0x12
+
+let TDS_STATUS_NORMAL = 0;
+let TDS_STATUS_EOM = 1;
+
+let TDS_VERSION_74 = 1946157060; // 0x74000004
+let PROCID_SP_EXECUTESQL = 10;
+
+// TDS Token IDs
+let TOK_RETURNSTATUS = 121;      // 0x79
+let TOK_COLMETADATA = 129;       // 0x81
+let TOK_ERROR = 170;             // 0xAA
+let TOK_INFO = 171;              // 0xAB
+let TOK_LOGINACK = 173;          // 0xAD
+let TOK_ROW = 209;               // 0xD1
+let TOK_NBCROW = 210;            // 0xD2
+let TOK_ENVCHANGE = 227;         // 0xE3
+let TOK_DONE = 253;              // 0xFD
+let TOK_DONEPROC = 254;          // 0xFE
+let TOK_DONEINPROC = 255;        // 0xFF
+
+// TDS Column / Parameter Type IDs
+let TYPE_NULL = 31;              // 0x1F
+let TYPE_UNIQUEIDENTIFIER = 36;  // 0x24
+let TYPE_INTN = 38;              // 0x26
+let TYPE_INT1 = 48;              // 0x30
+let TYPE_BIT = 50;               // 0x32
+let TYPE_INT2 = 52;              // 0x34
+let TYPE_INT4 = 56;              // 0x38
+let TYPE_FLT4 = 59;              // 0x3B
+let TYPE_FLT8 = 62;              // 0x3E
+let TYPE_BITN = 104;             // 0x68
+let TYPE_DECIMALN = 106;         // 0x6A
+let TYPE_NUMERICN = 108;         // 0x6C
+let TYPE_FLTN = 109;             // 0x6D
+let TYPE_INT8 = 127;             // 0x7F
+let TYPE_BIGVARBINARY = 165;     // 0xA5
+let TYPE_BIGVARCHAR = 167;       // 0xA7
+let TYPE_BIGBINARY = 173;        // 0xAD
+let TYPE_BIGCHAR = 175;          // 0xAF
+let TYPE_NVARCHAR = 231;         // 0xE7
+let TYPE_NCHAR = 239;            // 0xEF
+
+let DEFAULT_COLLATION = [9, 4, 208, 0, 52]; // Latin1_General_CI_AS (0x0409, UTF-16 sort)
+let DEFAULT_PACKET_SIZE = 4096;
+let MAX_MESSAGE_BYTES = 67108864;
+
+fn _opt(opts, key, fallback) {
+    if is_map(opts) and map_has(opts, key) and opts[key] != nil {
+        return opts[key];
+    }
+    return fallback;
+}
+
+// ── Binary Endianness & UTF-16LE Helpers ─────────────────────────────────────
+
+fn _append_bytes(dst, src) {
+    let i = 0;
+    let n = len(src);
+    while i < n {
+        array_push(dst, src[i]);
+        i = i + 1;
+    }
+    return dst;
+}
+
+fn _push_u16_be(buf, val) {
+    let v = num_mod(num_floor(val), 65536);
+    if v < 0 { v = v + 65536; }
+    array_push(buf, bit_and(bit_shr(v, 8), 255));
+    array_push(buf, bit_and(v, 255));
+    return buf;
+}
+
+fn _read_u16_be(b, pos) {
+    return b[pos] * 256 + b[pos + 1];
+}
+
+fn _read_u32_be(b, pos) {
+    return ((b[pos] * 256 + b[pos + 1]) * 256 + b[pos + 2]) * 256 + b[pos + 3];
+}
+
+fn _push_u16_le(buf, val) {
+    let v = num_mod(num_floor(val), 65536);
+    if v < 0 { v = v + 65536; }
+    array_push(buf, bit_and(v, 255));
+    array_push(buf, bit_and(bit_shr(v, 8), 255));
+    return buf;
+}
+
+fn _push_u32_le(buf, val) {
+    let v = num_mod(num_floor(val), 4294967296);
+    if v < 0 { v = v + 4294967296; }
+    array_push(buf, bit_and(v, 255));
+    array_push(buf, bit_and(num_floor(v / 256), 255));
+    array_push(buf, bit_and(num_floor(v / 65536), 255));
+    array_push(buf, bit_and(num_floor(v / 16777216), 255));
+    return buf;
+}
+
+fn _push_i32_le(buf, val) {
+    let v = num_floor(val);
+    if v < 0 { v = 4294967296 + v; }
+    return _push_u32_le(buf, v);
+}
+
+fn _push_i64_le(buf, val) {
+    let v = num_floor(val);
+    if v >= 0 {
+        let hi = num_floor(v / 4294967296);
+        let lo = v - hi * 4294967296;
+        _push_u32_le(buf, lo);
+        _push_u32_le(buf, hi);
+    } else {
+        let pos = 0 - v - 1;
+        let hi_inv = num_floor(pos / 4294967296);
+        let lo_inv = pos - hi_inv * 4294967296;
+        _push_u32_le(buf, bit_xor(lo_inv, 4294967295));
+        _push_u32_le(buf, bit_xor(hi_inv, 4294967295));
+    }
+    return buf;
+}
+
+fn _read_u16_le(b, pos) {
+    return b[pos] + b[pos + 1] * 256;
+}
+
+fn _read_i16_le(b, pos) {
+    let u = _read_u16_le(b, pos);
+    if u >= 32768 { return u - 65536; }
+    return u;
+}
+
+fn _read_u32_le(b, pos) {
+    return b[pos] + b[pos + 1] * 256 + b[pos + 2] * 65536 + b[pos + 3] * 16777216;
+}
+
+fn _read_i32_le(b, pos) {
+    let u = _read_u32_le(b, pos);
+    if u >= 2147483648 { return u - 4294967296; }
+    return u;
+}
+
+fn _read_u64_le(b, pos) {
+    let lo = _read_u32_le(b, pos);
+    let hi = _read_u32_le(b, pos + 4);
+    return hi * 4294967296 + lo;
+}
+
+fn _read_i64_le(b, pos) {
+    let lo = _read_u32_le(b, pos);
+    let hi = _read_u32_le(b, pos + 4);
+    if hi < 2147483648 {
+        return hi * 4294967296 + lo;
+    }
+    let lo_inv = bit_xor(lo, 4294967295);
+    let hi_inv = bit_xor(hi, 4294967295);
+    return 0 - (hi_inv * 4294967296 + lo_inv + 1);
+}
+
+// UTF-8 <-> UTF-16LE codec (handles full Unicode BMP + supplementary planes)
+fn utf8_to_utf16le(text) {
+    let u8 = str_to_bytes(str(text));
+    let out = [];
+    let i = 0;
+    let n = len(u8);
+    while i < n {
+        let b0 = u8[i];
+        let cp = 0;
+        if b0 < 128 {
+            cp = b0;
+            i = i + 1;
+        } elif b0 < 224 and i + 1 < n {
+            cp = bit_shl(bit_and(b0, 31), 6) + bit_and(u8[i + 1], 63);
+            i = i + 2;
+        } elif b0 < 240 and i + 2 < n {
+            cp = bit_shl(bit_and(b0, 15), 12) + bit_shl(bit_and(u8[i + 1], 63), 6) + bit_and(u8[i + 2], 63);
+            i = i + 3;
+        } elif i + 3 < n {
+            cp = bit_shl(bit_and(b0, 7), 18) + bit_shl(bit_and(u8[i + 1], 63), 12) + bit_shl(bit_and(u8[i + 2], 63), 6) + bit_and(u8[i + 3], 63);
+            i = i + 4;
+        } else {
+            cp = 65533;
+            i = i + 1;
+        }
+        if cp <= 65535 {
+            _push_u16_le(out, cp);
+        } else {
+            let adj = cp - 65536;
+            let hi_sur = 55296 + bit_shr(adj, 10);
+            let lo_sur = 56320 + bit_and(adj, 1023);
+            _push_u16_le(out, hi_sur);
+            _push_u16_le(out, lo_sur);
+        }
+    }
+    return out;
+}
+
+fn utf16le_to_utf8(b, start = 0, byte_len = nil) {
+    if byte_len == nil { byte_len = len(b) - start; }
+    let end = start + byte_len;
+    let u8 = [];
+    let i = start;
+    while i + 1 < end {
+        let w1 = _read_u16_le(b, i);
+        i = i + 2;
+        let cp = w1;
+        if w1 >= 55296 and w1 <= 56319 and i + 1 < end {
+            let w2 = _read_u16_le(b, i);
+            if w2 >= 56320 and w2 <= 57343 {
+                cp = 65536 + bit_shl(w1 - 55296, 10) + (w2 - 56320);
+                i = i + 2;
+            }
+        }
+        if cp < 128 {
+            array_push(u8, cp);
+        } elif cp < 2048 {
+            array_push(u8, bit_or(192, bit_shr(cp, 6)));
+            array_push(u8, bit_or(128, bit_and(cp, 63)));
+        } elif cp < 65536 {
+            array_push(u8, bit_or(224, bit_shr(cp, 12)));
+            array_push(u8, bit_or(128, bit_and(bit_shr(cp, 6), 63)));
+            array_push(u8, bit_or(128, bit_and(cp, 63)));
+        } else {
+            array_push(u8, bit_or(240, bit_shr(cp, 18)));
+            array_push(u8, bit_or(128, bit_and(bit_shr(cp, 12), 63)));
+            array_push(u8, bit_or(128, bit_and(bit_shr(cp, 6), 63)));
+            array_push(u8, bit_or(128, bit_and(cp, 63)));
+        }
+    }
+    return bytes_to_str(u8);
+}
+
+// ── TDS7 Password Obfuscation (((byte << 4) | (byte >> 4)) ^ 0xA5) ───────────
+
+fn tds7_obfuscate_password(password) {
+    let u16 = utf8_to_utf16le(password);
+    let out = [];
+    let i = 0;
+    while i < len(u16) {
+        let b = u16[i];
+        let swapped = bit_or(bit_and(bit_shl(b, 4), 240), bit_and(bit_shr(b, 4), 15));
+        array_push(out, bit_xor(swapped, 165)); // 0xA5 = 165
+        i = i + 1;
+    }
+    return out;
+}
+
+fn tds7_deobfuscate_password(obf_bytes) {
+    let u16 = [];
+    let i = 0;
+    while i < len(obf_bytes) {
+        let x = bit_xor(obf_bytes[i], 165);
+        let orig = bit_or(bit_and(bit_shl(x, 4), 240), bit_and(bit_shr(x, 4), 15));
+        array_push(u16, orig);
+        i = i + 1;
+    }
+    return utf16le_to_utf8(u16, 0, len(u16));
+}
+
+// ── 8-Byte TDS Packet Framing & Multi-Packet I/O ─────────────────────────────
+
+fn build_tds_packets(pkt_type, payload, packet_size = 4096, spid = 0) {
+    let max_body = packet_size - 8;
+    if max_body < 64 { max_body = 4088; }
+    let packets = [];
+    let total = len(payload);
+    if total == 0 {
+        let hdr = [pkt_type, TDS_STATUS_EOM];
+        _push_u16_be(hdr, 8);
+        _push_u16_be(hdr, spid);
+        array_push(hdr, 1);
+        array_push(hdr, 0);
+        array_push(packets, hdr);
+        return packets;
+    }
+    let offset = 0;
+    let pkt_id = 1;
+    while offset < total {
+        let rem = total - offset;
+        let take = if rem > max_body { max_body } else { rem };
+        let is_last = (offset + take >= total);
+        let status = if is_last { TDS_STATUS_EOM } else { TDS_STATUS_NORMAL };
+        let pkt = [pkt_type, status];
+        _push_u16_be(pkt, 8 + take);
+        _push_u16_be(pkt, spid);
+        array_push(pkt, bit_and(pkt_id, 255));
+        array_push(pkt, 0);
+        _append_bytes(pkt, slice(payload, offset, offset + take));
+        array_push(packets, pkt);
+        offset = offset + take;
+        pkt_id = pkt_id + 1;
+    }
+    return packets;
+}
+
+fn build_tds_single_frame(pkt_type, payload, spid = 0) {
+    let pkt = [pkt_type, TDS_STATUS_EOM];
+    _push_u16_be(pkt, 8 + len(payload));
+    _push_u16_be(pkt, spid);
+    array_push(pkt, 1);
+    array_push(pkt, 0);
+    _append_bytes(pkt, payload);
+    return pkt;
+}
+
+fn _read_exact_str(handle, count) {
+    if count <= 0 { return ""; }
+    let out = [];
+    while len(out) < count {
+        let chunk = tcp_read(handle, count - len(out));
+        if chunk == nil or chunk == "" {
+            throw "mssql_tds_driver: unexpected EOF reading TDS frame";
+        }
+        let cb = str_to_bytes(chunk);
+        if len(cb) == 0 {
+            throw "mssql_tds_driver: unexpected EOF reading TDS frame";
+        }
+        _append_bytes(out, cb);
+    }
+    return bytes_to_str(out);
+}
+
+fn write_tds_message(handle, pkt_type, payload, packet_size = 4096) {
+    let pkts = build_tds_packets(pkt_type, payload, packet_size, 0);
+    let i = 0;
+    while i < len(pkts) {
+        tcp_write(handle, pkts[i]);
+        i = i + 1;
+    }
+    return len(pkts);
+}
+
+fn read_tds_message(handle) {
+    let assembled = [];
+    let first_type = 0;
+    let last_spid = 0;
+    while true {
+        let hdr = str_to_bytes(_read_exact_str(handle, 8));
+        let ptype = hdr[0];
+        let status = hdr[1];
+        let plen = _read_u16_be(hdr, 2);
+        last_spid = _read_u16_be(hdr, 4);
+        if first_type == 0 { first_type = ptype; }
+        if plen < 8 {
+            throw "mssql_tds_driver: invalid TDS packet length " + str(plen);
+        }
+        let body_len = plen - 8;
+        if len(assembled) + body_len > MAX_MESSAGE_BYTES {
+            throw "mssql_tds_driver: TDS message exceeds maximum size policy";
+        }
+        if body_len > 0 {
+            _append_bytes(assembled, str_to_bytes(_read_exact_str(handle, body_len)));
+        }
+        if bit_and(status, TDS_STATUS_EOM) == TDS_STATUS_EOM {
+            break;
+        }
+    }
+    return map{ packet_type: first_type, spid: last_spid, payload: assembled };
+}
+
+// ── PRELOGIN (0x12) & LOGIN7 (0x10) Builders & Parsers ───────────────────────
+
+fn build_prelogin_payload(encryption_mode = 2) {
+    // Option table: 5 options * 5 bytes + 1 terminator byte = 26 bytes header
+    //   0x00 VERSION     offset 26, len 6
+    //   0x01 ENCRYPTION  offset 32, len 1
+    //   0x02 INSTOPT     offset 33, len 1
+    //   0x03 THREADID    offset 34, len 4
+    //   0x04 MARS        offset 38, len 1
+    //   0xFF TERMINATOR
+    let out = [
+        0, 0, 26, 0, 6,
+        1, 0, 32, 0, 1,
+        2, 0, 33, 0, 1,
+        3, 0, 34, 0, 4,
+        4, 0, 38, 0, 1,
+        255,
+        16, 0, 0, 0, 0, 0,       // VERSION 16.0.0
+        bit_and(encryption_mode, 255),
+        0,                       // INSTOPT ""
+        0, 0, 3, 232,            // THREADID 1000
+        0                        // MARS off
+    ];
+    return out;
+}
+
+fn parse_prelogin_payload(payload) {
+    let out = map{ encryption: 2, mars: 0 };
+    let pos = 0;
+    while pos < len(payload) {
+        let tok = payload[pos];
+        if tok == 255 { break; }
+        if pos + 4 >= len(payload) { break; }
+        let val_off = _read_u16_be(payload, pos + 1);
+        let val_len = _read_u16_be(payload, pos + 3);
+        if val_off + val_len <= len(payload) and val_len >= 1 {
+            if tok == 1 { out.encryption = payload[val_off]; }
+            if tok == 4 { out.mars = payload[val_off]; }
+        }
+        pos = pos + 5;
+    }
+    return out;
+}
+
+fn build_login7_payload(opts) {
+    let hostname = str(_opt(opts, "client_hostname", "pblang-client"));
+    let username = str(_opt(opts, "user", "sa"));
+    let password = str(_opt(opts, "password", ""));
+    let app_name = str(_opt(opts, "app_name", "PBLang"));
+    let server_name = str(_opt(opts, "server_name", "tds-endpoint"));
+    let lib_name = "PBLang-TDS";
+    let database = str(_opt(opts, "database", "master"));
+    let packet_size = _opt(opts, "packet_size", DEFAULT_PACKET_SIZE);
+
+    let host_b = utf8_to_utf16le(hostname);
+    let user_b = utf8_to_utf16le(username);
+    let pass_b = tds7_obfuscate_password(password);
+    let app_b = utf8_to_utf16le(app_name);
+    let srv_b = utf8_to_utf16le(server_name);
+    let lib_b = utf8_to_utf16le(lib_name);
+    let db_b = utf8_to_utf16le(database);
+
+    let fixed_len = 94;
+    let off_host = fixed_len;
+    let off_user = off_host + len(host_b);
+    let off_pass = off_user + len(user_b);
+    let off_app = off_pass + len(pass_b);
+    let off_srv = off_app + len(app_b);
+    let off_lib = off_srv + len(srv_b);
+    let off_db = off_lib + len(lib_b);
+    let total_len = off_db + len(db_b);
+
+    let buf = [];
+    _push_u32_le(buf, total_len);
+    _push_u32_le(buf, TDS_VERSION_74);     // 0x74000004 -> [0x04, 0x00, 0x00, 0x74]
+    _push_u32_le(buf, packet_size);
+    _push_u32_le(buf, 67239936);           // ClientProgVer 0x04020000
+    _push_u32_le(buf, 1000);               // ClientPID (redacted constant)
+    _push_u32_le(buf, 0);                  // ConnectionID
+    array_push(buf, 224);                  // OptionFlags1 = 0xE0
+    array_push(buf, 3);                    // OptionFlags2 = 0x03
+    array_push(buf, 0);                    // TypeFlags = 0x00
+    array_push(buf, 0);                    // OptionFlags3 = 0x00
+    _push_i32_le(buf, 0);                  // ClientTimZone = UTC
+    _push_u32_le(buf, 1033);               // ClientLCID = 0x0409
+
+    // Offset / CharCount table (bytes 36..94)
+    _push_u16_le(buf, off_host); _push_u16_le(buf, num_floor(len(host_b) / 2));
+    _push_u16_le(buf, off_user); _push_u16_le(buf, num_floor(len(user_b) / 2));
+    _push_u16_le(buf, off_pass); _push_u16_le(buf, num_floor(len(pass_b) / 2));
+    _push_u16_le(buf, off_app);  _push_u16_le(buf, num_floor(len(app_b) / 2));
+    _push_u16_le(buf, off_srv);  _push_u16_le(buf, num_floor(len(srv_b) / 2));
+    _push_u16_le(buf, 0);        _push_u16_le(buf, 0); // Unused
+    _push_u16_le(buf, off_lib);  _push_u16_le(buf, num_floor(len(lib_b) / 2));
+    _push_u16_le(buf, 0);        _push_u16_le(buf, 0); // Language
+    _push_u16_le(buf, off_db);   _push_u16_le(buf, num_floor(len(db_b) / 2));
+    _append_bytes(buf, [0, 0, 0, 0, 0, 0]);            // ClientID (zeroed for OPSEC)
+    _push_u16_le(buf, 0);        _push_u16_le(buf, 0); // SSPI
+    _push_u16_le(buf, 0);        _push_u16_le(buf, 0); // AtchDBFile
+    _push_u16_le(buf, 0);        _push_u16_le(buf, 0); // ChangePassword
+    _push_u32_le(buf, 0);                              // cbSSPILong
+
+    _append_bytes(buf, host_b);
+    _append_bytes(buf, user_b);
+    _append_bytes(buf, pass_b);
+    _append_bytes(buf, app_b);
+    _append_bytes(buf, srv_b);
+    _append_bytes(buf, lib_b);
+    _append_bytes(buf, db_b);
+    return buf;
+}
+
+fn parse_login7_payload(b) {
+    if len(b) < 94 { throw "mssql_tds_driver: truncated LOGIN7 payload"; }
+    let total_len = _read_u32_le(b, 0);
+    let tds_ver = _read_u32_le(b, 4);
+    let pkt_size = _read_u32_le(b, 8);
+    let host_off = _read_u16_le(b, 36); let host_cch = _read_u16_le(b, 38);
+    let user_off = _read_u16_le(b, 40); let user_cch = _read_u16_le(b, 42);
+    let pass_off = _read_u16_le(b, 44); let pass_cch = _read_u16_le(b, 46);
+    let app_off  = _read_u16_le(b, 48); let app_cch  = _read_u16_le(b, 50);
+    let db_off   = _read_u16_le(b, 68); let db_cch   = _read_u16_le(b, 70);
+
+    let pass_obf = slice(b, pass_off, pass_off + pass_cch * 2);
+    return map{
+        total_length: total_len,
+        tds_version: tds_ver,
+        packet_size: pkt_size,
+        hostname: utf16le_to_utf8(b, host_off, host_cch * 2),
+        user: utf16le_to_utf8(b, user_off, user_cch * 2),
+        password: tds7_deobfuscate_password(pass_obf),
+        app_name: utf16le_to_utf8(b, app_off, app_cch * 2),
+        database: utf16le_to_utf8(b, db_off, db_cch * 2)
+    };
+}
+
+// ── ALL_HEADERS (22 Bytes) + RPC sp_executesql (0x03) + SQL Batch (0x01) ─────
+
+fn build_all_headers(tx_descriptor = nil) {
+    let txd = tx_descriptor;
+    if txd == nil or len(txd) != 8 {
+        txd = [0, 0, 0, 0, 0, 0, 0, 0];
+    }
+    let out = [];
+    _push_u32_le(out, 22); // TotalLength = 22
+    _push_u32_le(out, 18); // HeaderLength = 18
+    _push_u16_le(out, 2);  // HeaderType = 0x0002 (TransactionDescriptor)
+    _append_bytes(out, txd);
+    _push_u32_le(out, 1);  // OutstandingRequestCount = 1
+    return out;
+}
+
+fn normalize_tds_placeholders(sql) {
+    let s = str(sql);
+    if not str_contains(s, "?") { return s; }
+    let out = "";
+    let idx = 1;
+    let in_sq = false;
+    let in_dq = false;
+    let i = 0;
+    let n = len(s);
+    while i < n {
+        let ch = str_slice(s, i, i + 1);
+        if ch == "'" and not in_dq {
+            if in_sq and i + 1 < n and str_slice(s, i + 1, i + 2) == "'" {
+                out = out + "''";
+                i = i + 2;
+                continue;
+            }
+            in_sq = not in_sq;
+            out = out + ch;
+        } elif ch == "\"" and not in_sq {
+            in_dq = not in_dq;
+            out = out + ch;
+        } elif ch == "?" and not in_sq and not in_dq {
+            out = out + "@p" + str(idx);
+            idx = idx + 1;
+        } else {
+            out = out + ch;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn bytes_param(raw_bytes) {
+    return map{ __tds_varbinary: true, bytes: raw_bytes };
+}
+
+fn _push_rpc_param_name(buf, name) {
+    if name == "" {
+        array_push(buf, 0);
+        return buf;
+    }
+    let u16 = utf8_to_utf16le(name);
+    let cch = num_floor(len(u16) / 2);
+    array_push(buf, bit_and(cch, 255));
+    _append_bytes(buf, u16);
+    return buf;
+}
+
+fn _push_nvarchar_param(buf, param_name, text_or_nil) {
+    _push_rpc_param_name(buf, param_name);
+    array_push(buf, 0); // StatusFlags = 0
+    array_push(buf, TYPE_NVARCHAR);
+    if text_or_nil == nil {
+        _push_u16_le(buf, 8000);
+        _append_bytes(buf, DEFAULT_COLLATION);
+        _push_u16_le(buf, 65535); // 0xFFFF = NULL
+        return buf;
+    }
+    let u16 = utf8_to_utf16le(text_or_nil);
+    if len(u16) <= 8000 {
+        _push_u16_le(buf, 8000);
+        _append_bytes(buf, DEFAULT_COLLATION);
+        _push_u16_le(buf, len(u16));
+        _append_bytes(buf, u16);
+    } else {
+        // PLP (Partially Length-Prefixed) NVARCHAR(MAX)
+        _push_u16_le(buf, 65535);
+        _append_bytes(buf, DEFAULT_COLLATION);
+        _push_i64_le(buf, len(u16));
+        _push_u32_le(buf, len(u16));
+        _append_bytes(buf, u16);
+        _push_u32_le(buf, 0);
+    }
+    return buf;
+}
+
+fn _describe_and_append_rpc_param(buf, name, val) {
+    if val == nil {
+        _push_nvarchar_param(buf, name, nil);
+        return name + " nvarchar(4000)";
+    }
+    let kind = type(val);
+    if kind == "bool" {
+        _push_rpc_param_name(buf, name);
+        array_push(buf, 0);
+        array_push(buf, TYPE_BITN);
+        array_push(buf, 1);
+        array_push(buf, 1);
+        array_push(buf, if val { 1 } else { 0 });
+        return name + " bit";
+    }
+    if kind == "number" {
+        if val == num_floor(val) and val >= -9007199254740991 and val <= 9007199254740991 {
+            _push_rpc_param_name(buf, name);
+            array_push(buf, 0);
+            array_push(buf, TYPE_INTN);
+            array_push(buf, 8);
+            array_push(buf, 8);
+            _push_i64_le(buf, val);
+            return name + " bigint";
+        }
+        _push_rpc_param_name(buf, name);
+        array_push(buf, 0);
+        array_push(buf, TYPE_FLTN);
+        array_push(buf, 8);
+        array_push(buf, 8);
+        _append_bytes(buf, num_to_le_bytes(val));
+        return name + " float";
+    }
+    if kind == "map" and ((try val.__tds_varbinary catch false) == true or (try val.__bytes catch nil) != nil) {
+        let raw = if (try val.__tds_varbinary catch false) == true { val.bytes } else { val.__bytes };
+        _push_rpc_param_name(buf, name);
+        array_push(buf, 0);
+        array_push(buf, TYPE_BIGVARBINARY);
+        _push_u16_le(buf, 8000);
+        _push_u16_le(buf, len(raw));
+        _append_bytes(buf, raw);
+        return name + " varbinary(8000)";
+    }
+    if kind == "map" or kind == "array" {
+        let js = json_stringify(val);
+        _push_nvarchar_param(buf, name, js);
+        return name + " nvarchar(max)";
+    }
+    let s = str(val);
+    let u16_len = len(utf8_to_utf16le(s));
+    _push_nvarchar_param(buf, name, s);
+    if u16_len > 8000 { return name + " nvarchar(max)"; }
+    return name + " nvarchar(4000)";
+}
+
+fn build_sql_batch_payload(sql, tx_descriptor = nil) {
+    let out = build_all_headers(tx_descriptor);
+    _append_bytes(out, utf8_to_utf16le(sql));
+    return out;
+}
+
+fn build_rpc_sp_executesql(sql, params = nil, tx_descriptor = nil) {
+    if params == nil { params = []; }
+    let norm_sql = normalize_tds_placeholders(sql);
+    let out = build_all_headers(tx_descriptor);
+
+    // ProcIDSwitch = 0xFFFF, ProcID = 10 (sp_executesql), OptionFlags = 0x0000
+    _push_u16_le(out, 65535);
+    _push_u16_le(out, PROCID_SP_EXECUTESQL);
+    _push_u16_le(out, 0);
+
+    // Param 1: unnamed @stmt (NVARCHAR)
+    _push_nvarchar_param(out, "", norm_sql);
+
+    if len(params) > 0 {
+        let param_wire = [];
+        let decls = [];
+        let i = 0;
+        while i < len(params) {
+            let pname = "@p" + str(i + 1);
+            let decl = _describe_and_append_rpc_param(param_wire, pname, params[i]);
+            array_push(decls, decl);
+            i = i + 1;
+        }
+        // Param 2: unnamed @params declaration string (NVARCHAR)
+        _push_nvarchar_param(out, "", str_join(decls, ", "));
+        _append_bytes(out, param_wire);
+    }
+    return out;
+}
+
+// Helper for mock TDS servers & packet inspection tests
+fn parse_rpc_sp_executesql(payload) {
+    let hdr_total = _read_u32_le(payload, 0);
+    let pos = hdr_total;
+    let proc_switch = _read_u16_le(payload, pos);
+    let proc_id = _read_u16_le(payload, pos + 2);
+    pos = pos + 6; // switch(2) + proc_id(2) + opt_flags(2)
+
+    let decoded_params = [];
+    while pos < len(payload) {
+        let name_cch = payload[pos];
+        pos = pos + 1;
+        let pname = "";
+        if name_cch > 0 {
+            pname = utf16le_to_utf8(payload, pos, name_cch * 2);
+            pos = pos + name_cch * 2;
+        }
+        let _status = payload[pos];
+        let tcode = payload[pos + 1];
+        pos = pos + 2;
+
+        let val = nil;
+        if tcode == TYPE_NVARCHAR {
+            let max_len = _read_u16_le(payload, pos);
+            pos = pos + 7; // max_len(2) + collation(5)
+            if max_len == 65535 {
+                pos = pos + 8; // total PLP len
+                let chunks = [];
+                while true {
+                    let clen = _read_u32_le(payload, pos);
+                    pos = pos + 4;
+                    if clen == 0 { break; }
+                    _append_bytes(chunks, slice(payload, pos, pos + clen));
+                    pos = pos + clen;
+                }
+                val = utf16le_to_utf8(chunks, 0, len(chunks));
+            } else {
+                let blen = _read_u16_le(payload, pos);
+                pos = pos + 2;
+                if blen == 65535 { val = nil; }
+                else {
+                    val = utf16le_to_utf8(payload, pos, blen);
+                    pos = pos + blen;
+                }
+            }
+        } elif tcode == TYPE_INTN {
+            let _ml = payload[pos];
+            let alen = payload[pos + 1];
+            pos = pos + 2;
+            if alen == 0 { val = nil; }
+            elif alen == 1 { val = payload[pos]; pos = pos + 1; }
+            elif alen == 2 { val = _read_i16_le(payload, pos); pos = pos + 2; }
+            elif alen == 4 { val = _read_i32_le(payload, pos); pos = pos + 4; }
+            elif alen == 8 { val = _read_i64_le(payload, pos); pos = pos + 8; }
+        } elif tcode == TYPE_BITN {
+            let _ml2 = payload[pos];
+            let alen2 = payload[pos + 1];
+            pos = pos + 2;
+            if alen2 == 0 { val = nil; }
+            else { val = payload[pos] != 0; pos = pos + alen2; }
+        } elif tcode == TYPE_FLTN {
+            let _ml3 = payload[pos];
+            let alen3 = payload[pos + 1];
+            pos = pos + 2;
+            if alen3 == 0 { val = nil; }
+            elif alen3 == 8 { val = num_from_le_bytes(slice(payload, pos, pos + 8)); pos = pos + 8; }
+        } elif tcode == TYPE_BIGVARBINARY {
+            let _ml4 = _read_u16_le(payload, pos);
+            let blen2 = _read_u16_le(payload, pos + 2);
+            pos = pos + 4;
+            if blen2 == 65535 { val = nil; }
+            else { val = slice(payload, pos, pos + blen2); pos = pos + blen2; }
+        } else {
+            break;
+        }
+        array_push(decoded_params, map{ name: pname, type_id: tcode, value: val });
+    }
+
+    let sql_text = if len(decoded_params) > 0 { decoded_params[0].value } else { "" };
+    let param_decl = if len(decoded_params) > 1 { decoded_params[1].value } else { "" };
+    let bound = if len(decoded_params) > 2 { slice(decoded_params, 2, len(decoded_params)) } else { [] };
+    return map{
+        header_bytes: hdr_total,
+        proc_switch: proc_switch,
+        proc_id: proc_id,
+        sql: sql_text,
+        param_decl: param_decl,
+        params: bound
+    };
+}
+
+// ── TDS Token Stream Parser (0x81, 0xD1, 0xD2, 0xE3, 0xAA, 0xAB, 0xAD, 0xFD..FF)
+
+fn _decode_f32_le(b, pos) {
+    let bits = _read_u32_le(b, pos);
+    let sign = if bit_and(bit_shr(bits, 31), 1) == 1 { -1.0 } else { 1.0 };
+    let exp = bit_and(bit_shr(bits, 23), 255);
+    let frac = bit_and(bits, 8388607);
+    if exp == 0 and frac == 0 { return 0.0; }
+    if exp == 255 { return 0.0; }
+    if exp == 0 { return sign * (frac / 8388608.0) * num_pow(2.0, -126.0); }
+    return sign * (1.0 + (frac / 8388608.0)) * num_pow(2.0, exp - 127.0);
+}
+
+fn _parse_col_type_info(b, pos) {
+    let t = b[pos];
+    pos = pos + 1;
+    let max_len = 0;
+    let precision = 0;
+    let scale = 0;
+    if t == TYPE_INT1 or t == TYPE_BIT or t == TYPE_INT2 or t == TYPE_INT4 or t == TYPE_INT8 or t == TYPE_FLT4 or t == TYPE_FLT8 or t == TYPE_NULL {
+        return map{ type_id: t, max_len: 0, precision: 0, scale: 0, next: pos };
+    }
+    if t == TYPE_INTN or t == TYPE_BITN or t == TYPE_FLTN or t == TYPE_UNIQUEIDENTIFIER {
+        max_len = b[pos];
+        return map{ type_id: t, max_len: max_len, precision: 0, scale: 0, next: pos + 1 };
+    }
+    if t == TYPE_DECIMALN or t == TYPE_NUMERICN {
+        max_len = b[pos];
+        precision = b[pos + 1];
+        scale = b[pos + 2];
+        return map{ type_id: t, max_len: max_len, precision: precision, scale: scale, next: pos + 3 };
+    }
+    if t == TYPE_NVARCHAR or t == TYPE_NCHAR or t == TYPE_BIGVARCHAR or t == TYPE_BIGCHAR {
+        max_len = _read_u16_le(b, pos);
+        // 5-byte collation follows
+        return map{ type_id: t, max_len: max_len, precision: 0, scale: 0, next: pos + 7 };
+    }
+    if t == TYPE_BIGVARBINARY or t == TYPE_BIGBINARY {
+        max_len = _read_u16_le(b, pos);
+        return map{ type_id: t, max_len: max_len, precision: 0, scale: 0, next: pos + 2 };
+    }
+    throw "mssql_tds_driver: unsupported COLMETADATA type id " + str(t);
+}
+
+fn _read_col_value(b, pos, col) {
+    let t = col.type_id;
+    if t == TYPE_NULL { return map{ value: nil, next: pos }; }
+    if t == TYPE_INT1 { return map{ value: b[pos], next: pos + 1 }; }
+    if t == TYPE_BIT { return map{ value: b[pos] != 0, next: pos + 1 }; }
+    if t == TYPE_INT2 { return map{ value: _read_i16_le(b, pos), next: pos + 2 }; }
+    if t == TYPE_INT4 { return map{ value: _read_i32_le(b, pos), next: pos + 4 }; }
+    if t == TYPE_INT8 { return map{ value: _read_i64_le(b, pos), next: pos + 8 }; }
+    if t == TYPE_FLT4 { return map{ value: _decode_f32_le(b, pos), next: pos + 4 }; }
+    if t == TYPE_FLT8 { return map{ value: num_from_le_bytes(slice(b, pos, pos + 8)), next: pos + 8 }; }
+
+    if t == TYPE_INTN {
+        let l = b[pos]; pos = pos + 1;
+        if l == 0 { return map{ value: nil, next: pos }; }
+        if l == 1 { return map{ value: b[pos], next: pos + 1 }; }
+        if l == 2 { return map{ value: _read_i16_le(b, pos), next: pos + 2 }; }
+        if l == 4 { return map{ value: _read_i32_le(b, pos), next: pos + 4 }; }
+        if l == 8 { return map{ value: _read_i64_le(b, pos), next: pos + 8 }; }
+    }
+    if t == TYPE_BITN {
+        let l2 = b[pos]; pos = pos + 1;
+        if l2 == 0 { return map{ value: nil, next: pos }; }
+        return map{ value: b[pos] != 0, next: pos + l2 };
+    }
+    if t == TYPE_FLTN {
+        let l3 = b[pos]; pos = pos + 1;
+        if l3 == 0 { return map{ value: nil, next: pos }; }
+        if l3 == 4 { return map{ value: _decode_f32_le(b, pos), next: pos + 4 }; }
+        if l3 == 8 { return map{ value: num_from_le_bytes(slice(b, pos, pos + 8)), next: pos + 8 }; }
+    }
+    if t == TYPE_DECIMALN or t == TYPE_NUMERICN {
+        let l4 = b[pos]; pos = pos + 1;
+        if l4 == 0 { return map{ value: nil, next: pos }; }
+        let sign_byte = b[pos];
+        let mag = 0.0;
+        let k = l4 - 1;
+        while k >= 1 {
+            mag = mag * 256.0 + b[pos + k];
+            k = k - 1;
+        }
+        let scaled = mag / num_pow(10.0, col.scale);
+        if sign_byte == 0 { scaled = 0.0 - scaled; }
+        return map{ value: scaled, next: pos + l4 };
+    }
+    if t == TYPE_NVARCHAR or t == TYPE_NCHAR or t == TYPE_BIGVARCHAR or t == TYPE_BIGCHAR or t == TYPE_BIGVARBINARY or t == TYPE_BIGBINARY {
+        if col.max_len == 65535 {
+            // PLP format: 8-byte total_len (0xFFFFFFFFFFFFFFFF = NULL)
+            let plp_lo = _read_u32_le(b, pos);
+            let plp_hi = _read_u32_le(b, pos + 4);
+            pos = pos + 8;
+            if plp_lo == 4294967295 and plp_hi == 4294967295 {
+                return map{ value: nil, next: pos };
+            }
+            let acc = [];
+            while true {
+                let clen = _read_u32_le(b, pos);
+                pos = pos + 4;
+                if clen == 0 { break; }
+                _append_bytes(acc, slice(b, pos, pos + clen));
+                pos = pos + clen;
+            }
+            if t == TYPE_NVARCHAR or t == TYPE_NCHAR {
+                return map{ value: utf16le_to_utf8(acc, 0, len(acc)), next: pos };
+            }
+            if t == TYPE_BIGVARCHAR or t == TYPE_BIGCHAR {
+                return map{ value: bytes_to_str(acc), next: pos };
+            }
+            return map{ value: acc, next: pos };
+        }
+        let blen = _read_u16_le(b, pos);
+        pos = pos + 2;
+        if blen == 65535 {
+            return map{ value: nil, next: pos };
+        }
+        if t == TYPE_NVARCHAR or t == TYPE_NCHAR {
+            return map{ value: utf16le_to_utf8(b, pos, blen), next: pos + blen };
+        }
+        if t == TYPE_BIGVARCHAR or t == TYPE_BIGCHAR {
+            return map{ value: bytes_to_str(slice(b, pos, pos + blen)), next: pos + blen };
+        }
+        return map{ value: slice(b, pos, pos + blen), next: pos + blen };
+    }
+    if t == TYPE_UNIQUEIDENTIFIER {
+        let gl = b[pos]; pos = pos + 1;
+        if gl == 0 { return map{ value: nil, next: pos }; }
+        return map{ value: hex_encode(bytes_to_str(slice(b, pos, pos + gl))), next: pos + gl };
+    }
+    throw "mssql_tds_driver: unsupported row value type " + str(t);
+}
+
+fn parse_tds_tokens(payload, conn_state = nil) {
+    let cols = [];
+    let rows = [];
+    let errors = [];
+    let infos = [];
+    let login_ack = nil;
+    let affected_rows = 0;
+    let return_status = 0;
+    let pos = 0;
+    let n = len(payload);
+
+    while pos < n {
+        let tok = payload[pos];
+        pos = pos + 1;
+
+        if tok == TOK_COLMETADATA {
+            let count = _read_u16_le(payload, pos);
+            pos = pos + 2;
+            cols = [];
+            if count != 65535 {
+                let c = 0;
+                while c < count {
+                    let user_type = _read_u32_le(payload, pos);
+                    let flags = _read_u16_le(payload, pos + 4);
+                    pos = pos + 6;
+                    let tinfo = _parse_col_type_info(payload, pos);
+                    pos = tinfo.next;
+                    let name_cch = payload[pos];
+                    pos = pos + 1;
+                    let col_name = utf16le_to_utf8(payload, pos, name_cch * 2);
+                    pos = pos + name_cch * 2;
+                    if col_name == "" { col_name = "col_" + str(c); }
+                    array_push(cols, map{
+                        name: col_name,
+                        user_type: user_type,
+                        flags: flags,
+                        type_id: tinfo.type_id,
+                        max_len: tinfo.max_len,
+                        precision: tinfo.precision,
+                        scale: tinfo.scale
+                    });
+                    c = c + 1;
+                }
+            }
+        } elif tok == TOK_ROW {
+            let row = map{};
+            let c = 0;
+            while c < len(cols) {
+                let rv = _read_col_value(payload, pos, cols[c]);
+                pos = rv.next;
+                row[cols[c].name] = rv.value;
+                c = c + 1;
+            }
+            array_push(rows, row);
+        } elif tok == TOK_NBCROW {
+            let bm_bytes = num_floor((len(cols) + 7) / 8);
+            let bitmap = slice(payload, pos, pos + bm_bytes);
+            pos = pos + bm_bytes;
+            let row2 = map{};
+            let c2 = 0;
+            while c2 < len(cols) {
+                let byte_idx = num_floor(c2 / 8);
+                let bit_idx = c2 % 8;
+                let is_null = bit_and(bitmap[byte_idx], bit_shl(1, bit_idx)) != 0;
+                if is_null {
+                    row2[cols[c2].name] = nil;
+                } else {
+                    let rv2 = _read_col_value(payload, pos, cols[c2]);
+                    pos = rv2.next;
+                    row2[cols[c2].name] = rv2.value;
+                }
+                c2 = c2 + 1;
+            }
+            array_push(rows, row2);
+        } elif tok == TOK_ENVCHANGE {
+            let env_len = _read_u16_le(payload, pos);
+            let env_end = pos + 2 + env_len;
+            let env_type = payload[pos + 2];
+            if is_map(conn_state) {
+                if env_type == 1 {
+                    // Database changed: [new_cch:u8][utf16le][old_cch:u8][utf16le]
+                    let new_cch = payload[pos + 3];
+                    conn_state.database = utf16le_to_utf8(payload, pos + 4, new_cch * 2);
+                } elif env_type == 8 {
+                    // Begin Transaction: [new_len:u8 (8)][8-byte tx_descriptor][old_len:u8]
+                    let new_len = payload[pos + 3];
+                    if new_len == 8 {
+                        conn_state.tx_descriptor = slice(payload, pos + 4, pos + 12);
+                    }
+                } elif env_type == 9 or env_type == 10 {
+                    // Commit / Rollback Transaction -> reset tx_descriptor to 8 zero bytes
+                    conn_state.tx_descriptor = [0, 0, 0, 0, 0, 0, 0, 0];
+                }
+            }
+            pos = env_end;
+        } elif tok == TOK_LOGINACK {
+            let ack_len = _read_u16_le(payload, pos);
+            let ack_end = pos + 2 + ack_len;
+            let iface = payload[pos + 2];
+            let tds_v = _read_u32_be(payload, pos + 3);
+            let prog_cch = payload[pos + 7];
+            let prog_name = utf16le_to_utf8(payload, pos + 8, prog_cch * 2);
+            login_ack = map{ interface: iface, tds_version_be: tds_v, prog_name: prog_name };
+            pos = ack_end;
+        } elif tok == TOK_ERROR or tok == TOK_INFO {
+            let tlen = _read_u16_le(payload, pos);
+            let tend = pos + 2 + tlen;
+            let num = _read_i32_le(payload, pos + 2);
+            let st_code = payload[pos + 6];
+            let cls = payload[pos + 7];
+            let msg_cch = _read_u16_le(payload, pos + 8);
+            let msg_txt = utf16le_to_utf8(payload, pos + 10, msg_cch * 2);
+            let item = map{ number: num, state: st_code, severity: cls, message: msg_txt };
+            if tok == TOK_ERROR { array_push(errors, item); }
+            else { array_push(infos, item); }
+            pos = tend;
+        } elif tok == TOK_RETURNSTATUS {
+            return_status = _read_i32_le(payload, pos);
+            pos = pos + 4;
+        } elif tok == TOK_DONE or tok == TOK_DONEPROC or tok == TOK_DONEINPROC {
+            let done_status = _read_u16_le(payload, pos);
+            let _cur_cmd = _read_u16_le(payload, pos + 2);
+            let row_cnt = _read_u64_le(payload, pos + 4);
+            pos = pos + 12;
+            // DONE_COUNT = 0x0010
+            if bit_and(done_status, 16) != 0 {
+                affected_rows = affected_rows + row_cnt;
+            }
+        } else {
+            throw "mssql_tds_driver: unrecognized TDS token " + str(tok) + " at byte " + str(pos - 1);
+        }
+    }
+
+    return map{
+        columns: cols,
+        rows: rows,
+        errors: errors,
+        infos: infos,
+        login_ack: login_ack,
+        affected_rows: affected_rows,
+        return_status: return_status
+    };
+}
+
+// ── Connection Lifecycle & Public Driver API ─────────────────────────────────
+
+fn _exec_rpc(conn, sql, params = nil) {
+    if not conn.open { throw "mssql_tds_driver: connection is closed"; }
+    let rpc_payload = build_rpc_sp_executesql(sql, params, conn.tx_descriptor);
+    write_tds_message(conn.handle, TDS_PKT_RPC_REQUEST, rpc_payload, conn.packet_size);
+    let reply = read_tds_message(conn.handle);
+    conn.queries_run = conn.queries_run + 1;
+    let parsed = parse_tds_tokens(reply.payload, conn);
+    if len(parsed.errors) > 0 {
+        let e0 = parsed.errors[0];
+        throw "mssql_tds_driver [" + str(e0.number) + "]: " + e0.message;
+    }
+    return parsed;
+}
+
+fn _exec_batch(conn, sql) {
+    if not conn.open { throw "mssql_tds_driver: connection is closed"; }
+    let batch_payload = build_sql_batch_payload(sql, conn.tx_descriptor);
+    write_tds_message(conn.handle, TDS_PKT_SQL_BATCH, batch_payload, conn.packet_size);
+    let reply = read_tds_message(conn.handle);
+    conn.queries_run = conn.queries_run + 1;
+    let parsed = parse_tds_tokens(reply.payload, conn);
+    if len(parsed.errors) > 0 {
+        let e0 = parsed.errors[0];
+        throw "mssql_tds_driver [" + str(e0.number) + "]: " + e0.message;
+    }
+    return parsed;
+}
+
+fn _attach_methods(conn) {
+    conn.exec = fn(sql, params = nil) {
+        if params == nil or len(params) == 0 {
+            let upper = str_upper(str_trim(sql));
+            if upper == "BEGIN" or upper == "BEGIN TRAN" or upper == "BEGIN TRANSACTION" {
+                _exec_batch(conn, "BEGIN TRANSACTION");
+                return 0;
+            }
+            if upper == "COMMIT" or upper == "COMMIT TRAN" or upper == "COMMIT TRANSACTION" {
+                _exec_batch(conn, "COMMIT TRANSACTION");
+                return 0;
+            }
+            if upper == "ROLLBACK" or upper == "ROLLBACK TRAN" or upper == "ROLLBACK TRANSACTION" {
+                _exec_batch(conn, "ROLLBACK TRANSACTION");
+                return 0;
+            }
+        }
+        let res = _exec_rpc(conn, sql, params);
+        return res.affected_rows;
+    };
+
+    conn.query = fn(sql, params = nil) {
+        let res = _exec_rpc(conn, sql, params);
+        return res.rows;
+    };
+
+    conn.query_full = fn(sql, params = nil) {
+        return _exec_rpc(conn, sql, params);
+    };
+
+    conn.exec_batch = fn(sql) {
+        return _exec_batch(conn, sql);
+    };
+
+    conn.prepare = fn(sql) {
+        let norm = normalize_tds_placeholders(sql);
+        return map{
+            sql: norm,
+            exec: fn(params = nil) { return _exec_rpc(conn, norm, params).affected_rows; },
+            query: fn(params = nil) { return _exec_rpc(conn, norm, params).rows; }
+        };
+    };
+
+    conn.transaction = fn(body_fn) {
+        _exec_batch(conn, "BEGIN TRANSACTION");
+        let out = try body_fn(conn) catch nil;
+        if out == nil {
+            try _exec_batch(conn, "ROLLBACK TRANSACTION") catch nil;
+            return nil;
+        }
+        _exec_batch(conn, "COMMIT TRANSACTION");
+        return out;
+    };
+
+    conn.tx = fn(body_fn) {
+        _exec_batch(conn, "BEGIN TRANSACTION");
+        let r = try map{ ok: true, value: body_fn(conn) } catch map{ ok: false };
+        if r.ok {
+            _exec_batch(conn, "COMMIT TRANSACTION");
+        } else {
+            try _exec_batch(conn, "ROLLBACK TRANSACTION") catch nil;
+        }
+        return r;
+    };
+
+    conn.savepoint = fn(name, body_fn) {
+        let safe = str_replace_all(str(name), "]", "]]");
+        _exec_batch(conn, "SAVE TRANSACTION [" + safe + "]");
+        let r = try map{ ok: true, value: body_fn(conn) } catch map{ ok: false };
+        if not r.ok {
+            try _exec_batch(conn, "ROLLBACK TRANSACTION [" + safe + "]") catch nil;
+        }
+        return r;
+    };
+
+    conn.ping = fn() {
+        return try { _exec_batch(conn, "SELECT 1 AS ok"); true } catch false;
+    };
+
+    conn.last_insert_rowid = fn() { return nil; };
+
+    conn.close = fn() {
+        if not conn.open { return false; }
+        try tcp_close(conn.handle) catch nil;
+        conn.open = false;
+        return true;
+    };
+
+    return conn;
+}
+
+fn open(opts) {
+    if not is_map(opts) { throw "mssql_tds_driver.open: options map required"; }
+    let host = str(_opt(opts, "host", "127.0.0.1"));
+    let port = _opt(opts, "port", 1433);
+    let strict_tls = _opt(opts, "strict_tls", false) == true or str(_opt(opts, "tds_version", "7.4")) == "8.0" or _opt(opts, "tls", false) == true;
+    let pkt_size = _opt(opts, "packet_size", DEFAULT_PACKET_SIZE);
+
+    let handle = nil;
+    if strict_tls {
+        handle = tcp_connect_tls(host, port);
+    } else {
+        let addr = if str_contains(host, ":") and not str_starts_with(host, "[") {
+            "[" + host + "]:" + str(port)
+        } else {
+            host + ":" + str(port)
+        };
+        handle = tcp_connect(addr);
+    }
+
+    let conn = map{
+        format: "pblang.db.mssql.tds74",
+        kind: "mssql",
+        handle: handle,
+        open: true,
+        tls: strict_tls,
+        tds_mode: if strict_tls { "8.0" } else { "7.4" },
+        host: host,
+        port: port,
+        database: str(_opt(opts, "database", "master")),
+        packet_size: pkt_size,
+        tx_descriptor: [0, 0, 0, 0, 0, 0, 0, 0],
+        login_ack: nil,
+        queries_run: 0
+    };
+
+    let hs_res = try {
+        // Step 1: PRELOGIN (0x12) negotiation
+        if not (_opt(opts, "skip_prelogin", false) == true) {
+            let enc_flag = if strict_tls { 1 } else { 2 };
+            write_tds_message(handle, TDS_PKT_PRELOGIN, build_prelogin_payload(enc_flag), pkt_size);
+            let pre_resp = read_tds_message(handle);
+            conn.prelogin = parse_prelogin_payload(pre_resp.payload);
+        }
+
+        // Step 2: LOGIN7 (0x10) authentication
+        let login_payload = build_login7_payload(opts);
+        write_tds_message(handle, TDS_PKT_LOGIN7, login_payload, pkt_size);
+        let login_resp = read_tds_message(handle);
+        let login_tokens = parse_tds_tokens(login_resp.payload, conn);
+        if len(login_tokens.errors) > 0 {
+            let e0 = login_tokens.errors[0];
+            throw "mssql_tds_driver login failed [" + str(e0.number) + "]: " + e0.message;
+        }
+        if login_tokens.login_ack == nil {
+            throw "mssql_tds_driver: missing LOGINACK token from server";
+        }
+        conn.login_ack = login_tokens.login_ack;
+        map{ ok: true }
+    } catch err {
+        map{ ok: false, error: err }
+    };
+    if not hs_res.ok {
+        try tcp_close(handle) catch nil;
+        conn.open = false;
+        throw hs_res.error;
+    }
+    return _attach_methods(conn);
+}
+
+fn connect(opts) {
+    return try map{ ok: true, conn: open(opts) } catch map{ ok: false, error: "MSSQL TDS connection failed" };
+}
+
+export TDS_PKT_SQL_BATCH, TDS_PKT_RPC_REQUEST, TDS_PKT_TABULAR_RESULT,
+       TDS_PKT_LOGIN7, TDS_PKT_PRELOGIN, TDS_STATUS_NORMAL, TDS_STATUS_EOM,
+       TDS_VERSION_74, PROCID_SP_EXECUTESQL,
+       TOK_RETURNSTATUS, TOK_COLMETADATA, TOK_ERROR, TOK_INFO, TOK_LOGINACK,
+       TOK_ROW, TOK_NBCROW, TOK_ENVCHANGE, TOK_DONE, TOK_DONEPROC, TOK_DONEINPROC,
+       TYPE_INTN, TYPE_INT1, TYPE_BIT, TYPE_INT2, TYPE_INT4, TYPE_INT8,
+       TYPE_FLT4, TYPE_FLT8, TYPE_BITN, TYPE_DECIMALN, TYPE_NUMERICN, TYPE_FLTN,
+       TYPE_BIGVARBINARY, TYPE_BIGVARCHAR, TYPE_NVARCHAR,
+       open, connect, bytes_param,
+       utf8_to_utf16le, utf16le_to_utf8,
+       tds7_obfuscate_password, tds7_deobfuscate_password,
+       build_tds_packets, build_tds_single_frame, write_tds_message, read_tds_message,
+       build_prelogin_payload, parse_prelogin_payload,
+       build_login7_payload, parse_login7_payload,
+       build_all_headers, normalize_tds_placeholders,
+       build_sql_batch_payload, build_rpc_sp_executesql, parse_rpc_sp_executesql,
+       parse_tds_tokens;

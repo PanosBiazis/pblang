@@ -1,0 +1,2232 @@
+// stdlib/db/sovereign_unified_db.sapp — Unified Sovereign DB Engine & Wire Router
+//
+// Unifies all PBLang v4.2.0 database backends under one secure, consistent API:
+//   - memory:// & pblangdb:// : Pure-PBLang Sovereign Relational Engine featuring:
+//       * Multi-Version Concurrency Control (MVCC Snapshot Isolation: xmin/xmax
+//         version chains, snapshot read views, read-your-own-writes, write-write
+//         conflict detection, instant atomic ROLLBACK & nested SAVEPOINTs)
+//       * Secondary Indexes: Hash O(1) equality index + Sorted B-Tree O(log N)
+//         range scan index (>, >=, <, <=, BETWEEN)
+//       * Prepared Query Plan LRU Cache (bounded, deterministic eviction)
+//       * AEAD Encrypted-At-Rest Persistence (AES-256-GCM & ChaCha20-HMAC-SHA256
+//         binary envelope "PBSDB042" with AAD — zero plaintext on disk)
+//       * Parameterized Query Guard (strict_params defense-in-depth)
+//   - sqlite://   : Native embedded SQLite engine
+//   - postgres:// : Pure-PBLang PostgreSQL Wire Protocol v3.0 (SCRAM-SHA-256)
+//   - mssql://    : Pure-PBLang MS SQL Server TDS 7.4 / 8.0 (sp_executesql RPC)
+//   - mysql://    : Pure-PBLang MySQL 8.0 / MariaDB Protocol v10 (binary stmts)
+
+let AES_GCM = import("stdlib:aes_gcm.sapp");
+let CRYPTO = import("stdlib:crypto.sapp");
+let PG_DRV = import("stdlib:db/postgres_wire_v3.sapp");
+let TDS_DRV = import("stdlib:db/mssql_tds_driver.sapp");
+let MY_DRV = import("stdlib:db/mysql_wire_driver.sapp");
+
+let SNAPSHOT_MAGIC = [80, 66, 83, 68, 66, 48, 52, 50]; // "PBSDB042"
+let CIPHER_AES_256_GCM = 1;
+let CIPHER_CHACHA20_HMAC = 2;
+
+let _SHARED_ENGINES = map{};
+let _REGISTRY_MTX = mutex_new();
+
+fn _opt(opts, key, fallback) {
+    if is_map(opts) and map_has(opts, key) and opts[key] != nil {
+        return opts[key];
+    }
+    return fallback;
+}
+
+fn _append_bytes(dst, src) {
+    let i = 0;
+    let n = len(src);
+    while i < n {
+        array_push(dst, src[i]);
+        i = i + 1;
+    }
+    return dst;
+}
+
+fn _copy_map(m) {
+    let out = map{};
+    if not is_map(m) { return out; }
+    let ks = map_keys(m);
+    let i = 0;
+    while i < len(ks) {
+        let k = ks[i];
+        out[k] = m[k];
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _copy_array(a) {
+    let out = [];
+    let i = 0;
+    while i < len(a) {
+        array_push(out, a[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── DSN Parser & Secret Redaction ────────────────────────────────────────────
+
+fn _parse_query_params(qs) {
+    let out = map{};
+    if qs == nil or qs == "" { return out; }
+    let parts = str_split(qs, "&");
+    let i = 0;
+    while i < len(parts) {
+        let p = parts[i];
+        if p != "" {
+            let eq = str_index_of(p, "=");
+            if eq >= 0 {
+                let k = url_decode(str_slice(p, 0, eq));
+                let v = url_decode(str_slice(p, eq + 1, len(p)));
+                out[k] = v;
+            } else {
+                out[url_decode(p)] = "true";
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn parse_dsn(dsn) {
+    if type(dsn) != "string" or len(str_trim(dsn)) == 0 {
+        throw "sovereign_unified_db: DSN must be a non-empty string";
+    }
+    let s = str_trim(dsn);
+    let sep = str_index_of(s, "://");
+    if sep < 0 {
+        // Treat bare path or ":memory:" as sqlite
+        return map{
+            scheme: "sqlite",
+            backend: "sqlite",
+            path: s,
+            host: "",
+            port: 0,
+            user: "",
+            password: "",
+            database: s,
+            query: map{}
+        };
+    }
+
+    let raw_scheme = str_lower(str_slice(s, 0, sep));
+    let rest = str_slice(s, sep + 3, len(s));
+    let qs = "";
+    let qpos = str_index_of(rest, "?");
+    if qpos >= 0 {
+        qs = str_slice(rest, qpos + 1, len(rest));
+        rest = str_slice(rest, 0, qpos);
+    }
+    let qmap = _parse_query_params(qs);
+
+    if raw_scheme == "sqlite" or raw_scheme == "sqlite3" {
+        let spath = if rest == "" or rest == ":memory:" { ":memory:" } else { rest };
+        return map{
+            scheme: raw_scheme,
+            backend: "sqlite",
+            path: spath,
+            host: "",
+            port: 0,
+            user: "",
+            password: "",
+            database: spath,
+            query: qmap
+        };
+    }
+
+    if raw_scheme == "memory" or raw_scheme == "pblangdb" {
+        let ns = str_replace_all(rest, "/", "");
+        if ns == "" { ns = "default"; }
+        return map{
+            scheme: raw_scheme,
+            backend: "memory",
+            namespace: ns,
+            path: ns,
+            host: "",
+            port: 0,
+            user: "",
+            password: "",
+            database: ns,
+            query: qmap
+        };
+    }
+
+    let backend = "";
+    let def_port = 0;
+    if raw_scheme == "postgres" or raw_scheme == "postgresql" or raw_scheme == "pg" {
+        backend = "postgres";
+        def_port = 5432;
+    } elif raw_scheme == "mssql" or raw_scheme == "sqlserver" or raw_scheme == "tds" {
+        backend = "mssql";
+        def_port = 1433;
+    } elif raw_scheme == "mysql" or raw_scheme == "mariadb" {
+        backend = "mysql";
+        def_port = 3306;
+    } else {
+        throw "sovereign_unified_db: unsupported DSN scheme '" + raw_scheme + "'";
+    }
+
+    let authority = rest;
+    let db_name = "";
+    let slash = str_index_of(rest, "/");
+    if slash >= 0 {
+        authority = str_slice(rest, 0, slash);
+        db_name = url_decode(str_slice(rest, slash + 1, len(rest)));
+    }
+
+    let user = "";
+    let password = "";
+    let hostport = authority;
+    let at_pos = str_index_of(authority, "@");
+    if at_pos >= 0 {
+        let userinfo = str_slice(authority, 0, at_pos);
+        hostport = str_slice(authority, at_pos + 1, len(authority));
+        let cpos = str_index_of(userinfo, ":");
+        if cpos >= 0 {
+            user = url_decode(str_slice(userinfo, 0, cpos));
+            password = url_decode(str_slice(userinfo, cpos + 1, len(userinfo)));
+        } else {
+            user = url_decode(userinfo);
+        }
+    }
+
+    let host = hostport;
+    let port = def_port;
+    if str_starts_with(hostport, "[") {
+        let rb = str_index_of(hostport, "]");
+        if rb >= 0 {
+            host = str_slice(hostport, 1, rb);
+            let after = str_slice(hostport, rb + 1, len(hostport));
+            if str_starts_with(after, ":") {
+                let pnum = try parse_number(str_slice(after, 1, len(after))) catch nil;
+                if pnum != nil { port = pnum; }
+            }
+        }
+    } else {
+        let cpos2 = str_index_of(hostport, ":");
+        if cpos2 >= 0 {
+            host = str_slice(hostport, 0, cpos2);
+            let pnum2 = try parse_number(str_slice(hostport, cpos2 + 1, len(hostport))) catch nil;
+            if pnum2 != nil { port = pnum2; }
+        }
+    }
+    if host == "" { host = "127.0.0.1"; }
+
+    return map{
+        scheme: raw_scheme,
+        backend: backend,
+        host: host,
+        port: port,
+        user: user,
+        password: password,
+        database: db_name,
+        path: db_name,
+        query: qmap
+    };
+}
+
+fn redact_dsn(dsn) {
+    if type(dsn) != "string" { return "[INVALID_DSN]"; }
+    let parsed = try parse_dsn(dsn) catch nil;
+    if parsed == nil { return "[REDACTED_DSN]"; }
+    if parsed.backend == "sqlite" { return "sqlite://" + parsed.path; }
+    if parsed.backend == "memory" { return parsed.scheme + "://" + parsed.namespace; }
+    let auth = "";
+    if parsed.user != "" {
+        auth = parsed.user;
+        if parsed.password != "" { auth = auth + ":[REDACTED]"; }
+        auth = auth + "@";
+    } elif parsed.password != "" {
+        auth = ":[REDACTED]@";
+    }
+    let db_part = if parsed.database != "" { "/" + parsed.database } else { "" };
+    return parsed.scheme + "://" + auth + parsed.host + ":" + str(parsed.port) + db_part;
+}
+
+// ── Defense-in-Depth Parameterized Query Guard ───────────────────────────────
+
+fn guard_parameterized_sql(sql, params = nil, strict_mode = true) {
+    if type(sql) != "string" {
+        throw "sovereign_unified_db: SQL query must be a string";
+    }
+    if str_contains(sql, "\x00") {
+        throw "sovereign_unified_db: SQL query contains NUL byte";
+    }
+    if not strict_mode { return true; }
+
+    // Scan outside identifiers: in strict_params mode, reject SQL comments (-- or /*),
+    // stacked statements (; followed by tokens), and raw single-quoted string literals
+    // in DML/DQL so callers must bind values via ?, $1, or @p1 parameters!
+    let trim_up = str_upper(str_trim(sql));
+    let is_ddl_or_tx = str_starts_with(trim_up, "CREATE ") or
+                       str_starts_with(trim_up, "DROP ") or
+                       str_starts_with(trim_up, "ALTER ") or
+                       trim_up == "BEGIN" or trim_up == "BEGIN TRANSACTION" or
+                       trim_up == "COMMIT" or trim_up == "COMMIT TRANSACTION" or
+                       trim_up == "ROLLBACK" or trim_up == "ROLLBACK TRANSACTION" or
+                       str_starts_with(trim_up, "SAVEPOINT ") or
+                       str_starts_with(trim_up, "RELEASE ") or
+                       str_starts_with(trim_up, "ROLLBACK TO ");
+
+    let in_sq = false;
+    let in_dq = false;
+    let saw_sq_literal = false;
+    let i = 0;
+    let n = len(sql);
+    while i < n {
+        let ch = str_slice(sql, i, i + 1);
+        if not in_sq and not in_dq {
+            if ch == "-" and i + 1 < n and str_slice(sql, i + 1, i + 2) == "-" {
+                throw "sovereign_unified_db: SQL line comment blocked by strict_params guard";
+            }
+            if ch == "/" and i + 1 < n and str_slice(sql, i + 1, i + 2) == "*" {
+                throw "sovereign_unified_db: SQL block comment blocked by strict_params guard";
+            }
+            if ch == ";" {
+                let tail = str_trim(str_slice(sql, i + 1, n));
+                if tail != "" {
+                    throw "sovereign_unified_db: stacked multi-statement SQL blocked by strict_params guard";
+                }
+            }
+            if ch == "'" {
+                in_sq = true;
+                saw_sq_literal = true;
+            } elif ch == "\"" {
+                in_dq = true;
+            }
+        } elif in_sq {
+            if ch == "'" {
+                if i + 1 < n and str_slice(sql, i + 1, i + 2) == "'" {
+                    i = i + 2;
+                    continue;
+                }
+                in_sq = false;
+            }
+        } elif in_dq {
+            if ch == "\"" { in_dq = false; }
+        }
+        i = i + 1;
+    }
+
+    if in_sq or in_dq {
+        throw "sovereign_unified_db: unterminated quote in SQL blocked by strict_params guard";
+    }
+    if saw_sq_literal and not is_ddl_or_tx {
+        throw "sovereign_unified_db: inline string literal rejected by strict_params guard; use bound parameters";
+    }
+    return true;
+}
+
+// ── Sovereign Relational SQL Tokenizer & LRU Query Plan Cache ────────────────
+
+fn _is_ident_start(c) {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95;
+}
+
+fn _is_ident_part(c) {
+    return _is_ident_start(c) or (c >= 48 and c <= 57);
+}
+
+fn _is_digit_code(c) {
+    return c >= 48 and c <= 57;
+}
+
+fn _tokenize_sql(sql) {
+    let toks = [];
+    let i = 0;
+    let n = len(sql);
+    while i < n {
+        let c = strcharcodeat(sql, i);
+        if c <= 32 {
+            i = i + 1;
+            continue;
+        }
+        let ch = str_slice(sql, i, i + 1);
+        if ch == "-" and i + 1 < n and str_slice(sql, i + 1, i + 2) == "-" {
+            while i < n and str_slice(sql, i, i + 1) != "\n" { i = i + 1; }
+            continue;
+        }
+        if ch == "'" {
+            let s_val = "";
+            i = i + 1;
+            while i < n {
+                let sc = str_slice(sql, i, i + 1);
+                if sc == "'" {
+                    if i + 1 < n and str_slice(sql, i + 1, i + 2) == "'" {
+                        s_val = s_val + "'";
+                        i = i + 2;
+                        continue;
+                    }
+                    i = i + 1;
+                    break;
+                }
+                s_val = s_val + sc;
+                i = i + 1;
+            }
+            array_push(toks, map{ kind: "str", val: s_val });
+            continue;
+        }
+        if ch == "\"" or ch == "`" or ch == "[" {
+            let end_q = if ch == "[" { "]" } else { ch };
+            let id_val = "";
+            i = i + 1;
+            while i < n {
+                let ic = str_slice(sql, i, i + 1);
+                if ic == end_q {
+                    if i + 1 < n and str_slice(sql, i + 1, i + 2) == end_q {
+                        id_val = id_val + end_q;
+                        i = i + 2;
+                        continue;
+                    }
+                    i = i + 1;
+                    break;
+                }
+                id_val = id_val + ic;
+                i = i + 1;
+            }
+            array_push(toks, map{ kind: "ident", val: id_val, upper: str_upper(id_val) });
+            continue;
+        }
+        if ch == "?" {
+            array_push(toks, map{ kind: "param", idx: 0 });
+            i = i + 1;
+            continue;
+        }
+        if (ch == "$" or ch == "@") and i + 1 < n {
+            let j = i + 1;
+            if ch == "@" and j < n and (str_slice(sql, j, j + 1) == "p" or str_slice(sql, j, j + 1) == "P") {
+                j = j + 1;
+            }
+            let num_s = "";
+            while j < n and _is_digit_code(strcharcodeat(sql, j)) {
+                num_s = num_s + str_slice(sql, j, j + 1);
+                j = j + 1;
+            }
+            if num_s != "" {
+                array_push(toks, map{ kind: "param", idx: parse_number(num_s) });
+                i = j;
+                continue;
+            }
+        }
+        if _is_digit_code(c) or (ch == "-" and i + 1 < n and _is_digit_code(strcharcodeat(sql, i + 1))) {
+            let ns = ch;
+            i = i + 1;
+            let saw_dot = false;
+            while i < n {
+                let nc = strcharcodeat(sql, i);
+                let nch = str_slice(sql, i, i + 1);
+                if _is_digit_code(nc) {
+                    ns = ns + nch;
+                    i = i + 1;
+                } elif nch == "." and not saw_dot {
+                    saw_dot = true;
+                    ns = ns + ".";
+                    i = i + 1;
+                } else {
+                    break;
+                }
+            }
+            array_push(toks, map{ kind: "num", val: parse_number(ns) });
+            continue;
+        }
+        if _is_ident_start(c) {
+            let w = ch;
+            i = i + 1;
+            while i < n and _is_ident_part(strcharcodeat(sql, i)) {
+                w = w + str_slice(sql, i, i + 1);
+                i = i + 1;
+            }
+            let up = str_upper(w);
+            if up == "NULL" {
+                array_push(toks, map{ kind: "null", val: nil, upper: "NULL" });
+            } elif up == "TRUE" {
+                array_push(toks, map{ kind: "bool", val: true, upper: "TRUE" });
+            } elif up == "FALSE" {
+                array_push(toks, map{ kind: "bool", val: false, upper: "FALSE" });
+            } else {
+                array_push(toks, map{ kind: "ident", val: w, upper: up });
+            }
+            continue;
+        }
+        if i + 1 < n {
+            let two = str_slice(sql, i, i + 2);
+            if two == "<=" or two == ">=" or two == "<>" or two == "!=" {
+                array_push(toks, map{ kind: "sym", val: if two == "!=" { "<>" } else { two } });
+                i = i + 2;
+                continue;
+            }
+        }
+        array_push(toks, map{ kind: "sym", val: ch });
+        i = i + 1;
+    }
+    return toks;
+}
+
+fn _split_sql_statements(toks) {
+    let stmts = [];
+    let cur = [];
+    let i = 0;
+    while i < len(toks) {
+        if toks[i].kind == "sym" and toks[i].val == ";" {
+            if len(cur) > 0 { array_push(stmts, cur); cur = []; }
+        } else {
+            array_push(cur, toks[i]);
+        }
+        i = i + 1;
+    }
+    if len(cur) > 0 { array_push(stmts, cur); }
+    return stmts;
+}
+
+fn _tok_is_kw(tok, kw) {
+    return tok.kind == "ident" and tok.upper == kw;
+}
+
+fn _tok_is_sym(tok, sym) {
+    return tok.kind == "sym" and tok.val == sym;
+}
+
+fn _parse_value_expr(toks, pos, pcounter) {
+    let t = toks[pos];
+    if t.kind == "param" {
+        let p_idx = t.idx;
+        if p_idx <= 0 {
+            pcounter.n = pcounter.n + 1;
+            p_idx = pcounter.n;
+        }
+        return map{ expr: map{ kind: "param", idx: p_idx - 1 }, next: pos + 1 };
+    }
+    if t.kind == "num" or t.kind == "str" or t.kind == "bool" or t.kind == "null" {
+        return map{ expr: map{ kind: "lit", val: t.val }, next: pos + 1 };
+    }
+    if t.kind == "ident" {
+        return map{ expr: map{ kind: "col", name: t.val }, next: pos + 1 };
+    }
+    throw "sovereign_unified_db: unexpected expression token";
+}
+
+fn _parse_where_clause(toks, pos, pcounter) {
+    let preds = [];
+    while pos < len(toks) {
+        if _tok_is_kw(toks[pos], "ORDER") or _tok_is_kw(toks[pos], "LIMIT") or _tok_is_kw(toks[pos], "OFFSET") {
+            break;
+        }
+        // Optional wrapping parens
+        let wrapped = false;
+        if _tok_is_sym(toks[pos], "(") {
+            wrapped = true;
+            pos = pos + 1;
+        }
+        let col_name = toks[pos].val;
+        pos = pos + 1;
+
+        if pos < len(toks) and _tok_is_kw(toks[pos], "IS") {
+            pos = pos + 1;
+            let neg = false;
+            if pos < len(toks) and _tok_is_kw(toks[pos], "NOT") {
+                neg = true;
+                pos = pos + 1;
+            }
+            // Expect NULL
+            pos = pos + 1;
+            array_push(preds, map{ col: col_name, op: if neg { "IS_NOT_NULL" } else { "IS_NULL" }, rhs: nil, rhs2: nil });
+        } elif pos < len(toks) and _tok_is_kw(toks[pos], "BETWEEN") {
+            pos = pos + 1;
+            let lo_e = _parse_value_expr(toks, pos, pcounter);
+            pos = lo_e.next;
+            if pos < len(toks) and _tok_is_kw(toks[pos], "AND") { pos = pos + 1; }
+            let hi_e = _parse_value_expr(toks, pos, pcounter);
+            pos = hi_e.next;
+            array_push(preds, map{ col: col_name, op: "BETWEEN", rhs: lo_e.expr, rhs2: hi_e.expr });
+        } elif pos < len(toks) and _tok_is_kw(toks[pos], "LIKE") {
+            pos = pos + 1;
+            let lk_e = _parse_value_expr(toks, pos, pcounter);
+            pos = lk_e.next;
+            array_push(preds, map{ col: col_name, op: "LIKE", rhs: lk_e.expr, rhs2: nil });
+        } else {
+            let op = toks[pos].val;
+            pos = pos + 1;
+            let rhs_e = _parse_value_expr(toks, pos, pcounter);
+            pos = rhs_e.next;
+            array_push(preds, map{ col: col_name, op: op, rhs: rhs_e.expr, rhs2: nil });
+        }
+
+        if wrapped and pos < len(toks) and _tok_is_sym(toks[pos], ")") {
+            pos = pos + 1;
+        }
+        if pos < len(toks) and _tok_is_kw(toks[pos], "AND") {
+            pos = pos + 1;
+        } else {
+            break;
+        }
+    }
+    return map{ preds: preds, next: pos };
+}
+
+fn _compile_single_stmt(toks) {
+    let pcounter = map{ n: 0 };
+    let head = if toks[0].kind == "ident" { toks[0].upper } else { "" };
+
+    if head == "BEGIN" or head == "START" {
+        return map{ op: "BEGIN" };
+    }
+    if head == "COMMIT" {
+        return map{ op: "COMMIT" };
+    }
+    if head == "ROLLBACK" {
+        if len(toks) >= 3 and _tok_is_kw(toks[1], "TO") {
+            let sp_idx = if _tok_is_kw(toks[2], "SAVEPOINT") { 3 } else { 2 };
+            return map{ op: "ROLLBACK_TO", name: toks[sp_idx].val };
+        }
+        return map{ op: "ROLLBACK" };
+    }
+    if head == "SAVEPOINT" {
+        return map{ op: "SAVEPOINT", name: toks[1].val };
+    }
+    if head == "RELEASE" {
+        let sp_idx2 = if _tok_is_kw(toks[1], "SAVEPOINT") { 2 } else { 1 };
+        return map{ op: "RELEASE_SAVEPOINT", name: toks[sp_idx2].val };
+    }
+
+    if head == "DROP" and len(toks) >= 3 and _tok_is_kw(toks[1], "TABLE") {
+        let if_exists = false;
+        let pos = 2;
+        if pos + 1 < len(toks) and _tok_is_kw(toks[pos], "IF") and _tok_is_kw(toks[pos + 1], "EXISTS") {
+            if_exists = true;
+            pos = pos + 2;
+        }
+        return map{ op: "DROP_TABLE", table: toks[pos].val, if_exists: if_exists };
+    }
+
+    if head == "CREATE" {
+        let pos = 1;
+        let is_unique = false;
+        if _tok_is_kw(toks[pos], "UNIQUE") {
+            is_unique = true;
+            pos = pos + 1;
+        }
+        if _tok_is_kw(toks[pos], "INDEX") {
+            pos = pos + 1;
+            let if_not_exists = false;
+            if pos + 2 < len(toks) and _tok_is_kw(toks[pos], "IF") and _tok_is_kw(toks[pos + 1], "NOT") and _tok_is_kw(toks[pos + 2], "EXISTS") {
+                if_not_exists = true;
+                pos = pos + 3;
+            }
+            let idx_name = toks[pos].val;
+            pos = pos + 1;
+            if _tok_is_kw(toks[pos], "ON") { pos = pos + 1; }
+            let tbl_name = toks[pos].val;
+            pos = pos + 1;
+            if _tok_is_sym(toks[pos], "(") { pos = pos + 1; }
+            let col_name = toks[pos].val;
+            return map{
+                op: "CREATE_INDEX",
+                index_name: idx_name,
+                table: tbl_name,
+                column: col_name,
+                unique: is_unique,
+                if_not_exists: if_not_exists
+            };
+        }
+        if _tok_is_kw(toks[pos], "TABLE") {
+            pos = pos + 1;
+            let if_ne = false;
+            if pos + 2 < len(toks) and _tok_is_kw(toks[pos], "IF") and _tok_is_kw(toks[pos + 1], "NOT") and _tok_is_kw(toks[pos + 2], "EXISTS") {
+                if_ne = true;
+                pos = pos + 3;
+            }
+            let tbl = toks[pos].val;
+            pos = pos + 1;
+            if _tok_is_sym(toks[pos], "(") { pos = pos + 1; }
+            let cols = [];
+            let pk_col = nil;
+            while pos < len(toks) and not _tok_is_sym(toks[pos], ")") {
+                if _tok_is_kw(toks[pos], "PRIMARY") {
+                    // Table-level PRIMARY KEY (col)
+                    while pos < len(toks) and not _tok_is_sym(toks[pos], "(") { pos = pos + 1; }
+                    if pos + 1 < len(toks) { pk_col = toks[pos + 1].val; }
+                    while pos < len(toks) and not _tok_is_sym(toks[pos], ")") { pos = pos + 1; }
+                    if pos < len(toks) and _tok_is_sym(toks[pos], ")") { pos = pos + 1; }
+                    if pos < len(toks) and _tok_is_sym(toks[pos], ",") { pos = pos + 1; }
+                    continue;
+                }
+                let cname = toks[pos].val;
+                pos = pos + 1;
+                let ctype = "ANY";
+                if pos < len(toks) and toks[pos].kind == "ident" and not _tok_is_kw(toks[pos], "PRIMARY") and not _tok_is_kw(toks[pos], "NOT") and not _tok_is_kw(toks[pos], "UNIQUE") {
+                    ctype = toks[pos].upper;
+                    pos = pos + 1;
+                }
+                let is_pk = false;
+                while pos < len(toks) and not _tok_is_sym(toks[pos], ",") and not _tok_is_sym(toks[pos], ")") {
+                    if _tok_is_kw(toks[pos], "PRIMARY") {
+                        is_pk = true;
+                        pk_col = cname;
+                    }
+                    pos = pos + 1;
+                }
+                array_push(cols, map{ name: cname, data_type: ctype, primary_key: is_pk });
+                if pos < len(toks) and _tok_is_sym(toks[pos], ",") { pos = pos + 1; }
+            }
+            return map{ op: "CREATE_TABLE", table: tbl, if_not_exists: if_ne, columns: cols, primary_key: pk_col };
+        }
+    }
+
+    if head == "INSERT" {
+        let pos = 1;
+        if _tok_is_kw(toks[pos], "INTO") { pos = pos + 1; }
+        let tbl = toks[pos].val;
+        pos = pos + 1;
+        let col_names = nil;
+        if pos < len(toks) and _tok_is_sym(toks[pos], "(") {
+            col_names = [];
+            pos = pos + 1;
+            while pos < len(toks) and not _tok_is_sym(toks[pos], ")") {
+                array_push(col_names, toks[pos].val);
+                pos = pos + 1;
+                if pos < len(toks) and _tok_is_sym(toks[pos], ",") { pos = pos + 1; }
+            }
+            if pos < len(toks) and _tok_is_sym(toks[pos], ")") { pos = pos + 1; }
+        }
+        if pos < len(toks) and _tok_is_kw(toks[pos], "VALUES") { pos = pos + 1; }
+        let rows_exprs = [];
+        while pos < len(toks) and _tok_is_sym(toks[pos], "(") {
+            pos = pos + 1;
+            let row_e = [];
+            while pos < len(toks) and not _tok_is_sym(toks[pos], ")") {
+                let ve = _parse_value_expr(toks, pos, pcounter);
+                array_push(row_e, ve.expr);
+                pos = ve.next;
+                if pos < len(toks) and _tok_is_sym(toks[pos], ",") { pos = pos + 1; }
+            }
+            if pos < len(toks) and _tok_is_sym(toks[pos], ")") { pos = pos + 1; }
+            array_push(rows_exprs, row_e);
+            if pos < len(toks) and _tok_is_sym(toks[pos], ",") { pos = pos + 1; }
+        }
+        return map{ op: "INSERT", table: tbl, columns: col_names, rows: rows_exprs };
+    }
+
+    if head == "UPDATE" {
+        let tbl = toks[1].val;
+        let pos = 2;
+        if _tok_is_kw(toks[pos], "SET") { pos = pos + 1; }
+        let assigns = [];
+        while pos < len(toks) and not _tok_is_kw(toks[pos], "WHERE") {
+            let cname = toks[pos].val;
+            pos = pos + 1;
+            if _tok_is_sym(toks[pos], "=") { pos = pos + 1; }
+            let ve = _parse_value_expr(toks, pos, pcounter);
+            pos = ve.next;
+            array_push(assigns, map{ col: cname, expr: ve.expr });
+            if pos < len(toks) and _tok_is_sym(toks[pos], ",") { pos = pos + 1; }
+        }
+        let preds = [];
+        if pos < len(toks) and _tok_is_kw(toks[pos], "WHERE") {
+            let wc = _parse_where_clause(toks, pos + 1, pcounter);
+            preds = wc.preds;
+        }
+        return map{ op: "UPDATE", table: tbl, assigns: assigns, where: preds };
+    }
+
+    if head == "DELETE" {
+        let pos = 1;
+        if _tok_is_kw(toks[pos], "FROM") { pos = pos + 1; }
+        let tbl = toks[pos].val;
+        pos = pos + 1;
+        let preds = [];
+        if pos < len(toks) and _tok_is_kw(toks[pos], "WHERE") {
+            let wc = _parse_where_clause(toks, pos + 1, pcounter);
+            preds = wc.preds;
+        }
+        return map{ op: "DELETE", table: tbl, where: preds };
+    }
+
+    if head == "SELECT" {
+        let pos = 1;
+        let items = [];
+        while pos < len(toks) and not _tok_is_kw(toks[pos], "FROM") {
+            if _tok_is_sym(toks[pos], "*") {
+                array_push(items, map{ kind: "star", alias: "*" });
+                pos = pos + 1;
+            } elif toks[pos].kind == "ident" and pos + 1 < len(toks) and _tok_is_sym(toks[pos + 1], "(") {
+                let fn_name = toks[pos].upper;
+                pos = pos + 2;
+                let arg_col = "*";
+                if not _tok_is_sym(toks[pos], "*") {
+                    arg_col = toks[pos].val;
+                }
+                pos = pos + 1;
+                if pos < len(toks) and _tok_is_sym(toks[pos], ")") { pos = pos + 1; }
+                let alias = str_lower(fn_name);
+                if fn_name == "COUNT" and arg_col == "*" { alias = "count(*)"; }
+                if pos < len(toks) and _tok_is_kw(toks[pos], "AS") {
+                    alias = toks[pos + 1].val;
+                    pos = pos + 2;
+                }
+                array_push(items, map{ kind: "agg", func: fn_name, col: arg_col, alias: alias });
+            } else {
+                let ve = _parse_value_expr(toks, pos, pcounter);
+                pos = ve.next;
+                let alias2 = if ve.expr.kind == "col" { ve.expr.name } else { "col_" + str(len(items)) };
+                if pos < len(toks) and _tok_is_kw(toks[pos], "AS") {
+                    alias2 = toks[pos + 1].val;
+                    pos = pos + 2;
+                }
+                array_push(items, map{ kind: "expr", expr: ve.expr, alias: alias2 });
+            }
+            if pos < len(toks) and _tok_is_sym(toks[pos], ",") { pos = pos + 1; }
+        }
+
+        if pos >= len(toks) {
+            return map{ op: "SELECT_CONST", items: items };
+        }
+        if _tok_is_kw(toks[pos], "FROM") { pos = pos + 1; }
+        let tbl = toks[pos].val;
+        pos = pos + 1;
+
+        let preds = [];
+        if pos < len(toks) and _tok_is_kw(toks[pos], "WHERE") {
+            let wc = _parse_where_clause(toks, pos + 1, pcounter);
+            preds = wc.preds;
+            pos = wc.next;
+        }
+        let order_col = nil;
+        let order_desc = false;
+        if pos + 1 < len(toks) and _tok_is_kw(toks[pos], "ORDER") and _tok_is_kw(toks[pos + 1], "BY") {
+            pos = pos + 2;
+            order_col = toks[pos].val;
+            pos = pos + 1;
+            if pos < len(toks) and (_tok_is_kw(toks[pos], "ASC") or _tok_is_kw(toks[pos], "DESC")) {
+                order_desc = _tok_is_kw(toks[pos], "DESC");
+                pos = pos + 1;
+            }
+        }
+        let limit_expr = nil;
+        if pos < len(toks) and _tok_is_kw(toks[pos], "LIMIT") {
+            let le = _parse_value_expr(toks, pos + 1, pcounter);
+            limit_expr = le.expr;
+            pos = le.next;
+        }
+        let offset_expr = nil;
+        if pos < len(toks) and _tok_is_kw(toks[pos], "OFFSET") {
+            let oe = _parse_value_expr(toks, pos + 1, pcounter);
+            offset_expr = oe.expr;
+            pos = oe.next;
+        }
+        return map{
+            op: "SELECT",
+            table: tbl,
+            items: items,
+            where: preds,
+            order_col: order_col,
+            order_desc: order_desc,
+            limit_expr: limit_expr,
+            offset_expr: offset_expr
+        };
+    }
+
+    throw "sovereign_unified_db: unsupported SQL command '" + head + "'";
+}
+
+fn _get_cached_plan(engine, sql) {
+    if map_has(engine.plan_cache, sql) {
+        engine.plan_cache_hits = engine.plan_cache_hits + 1;
+        // Move to MRU end
+        let new_order = [];
+        let i = 0;
+        while i < len(engine.plan_order) {
+            if engine.plan_order[i] != sql {
+                array_push(new_order, engine.plan_order[i]);
+            }
+            i = i + 1;
+        }
+        array_push(new_order, sql);
+        engine.plan_order = new_order;
+        return engine.plan_cache[sql];
+    }
+
+    engine.plan_cache_misses = engine.plan_cache_misses + 1;
+    let toks = _tokenize_sql(sql);
+    let raw_stmts = _split_sql_statements(toks);
+    let compiled = [];
+    let j = 0;
+    while j < len(raw_stmts) {
+        array_push(compiled, _compile_single_stmt(raw_stmts[j]));
+        j = j + 1;
+    }
+
+    if len(engine.plan_order) >= engine.max_plans {
+        let oldest = engine.plan_order[0];
+        engine.plan_order = slice(engine.plan_order, 1, len(engine.plan_order));
+        map_remove(engine.plan_cache, oldest);
+    }
+    engine.plan_cache[sql] = compiled;
+    array_push(engine.plan_order, sql);
+    return compiled;
+}
+
+// ── Secondary Indexes: O(1) Hash + O(log N) Sorted B-Tree ────────────────────
+
+fn _idx_hash_key(val) {
+    if val == nil { return "N:"; }
+    let t = type(val);
+    if t == "number" { return "F:" + str(val); }
+    if t == "bool" { return "B:" + str(val); }
+    return "S:" + str(val);
+}
+
+fn _cmp_sql_val(a, b) {
+    if a == b { return 0; }
+    if a == nil { return -1; }
+    if b == nil { return 1; }
+    let ta = type(a);
+    let tb = type(b);
+    if ta == "number" and tb == "number" {
+        return if a < b { -1 } else { 1 };
+    }
+    let sa = str(a);
+    let sb = str(b);
+    if sa < sb { return -1; }
+    return 1;
+}
+
+fn _btree_lower_bound(entries, target_val) {
+    let lo = 0;
+    let hi = len(entries);
+    while lo < hi {
+        let mid = num_floor((lo + hi) / 2);
+        if _cmp_sql_val(entries[mid].key, target_val) < 0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+fn _btree_upper_bound(entries, target_val) {
+    let lo = 0;
+    let hi = len(entries);
+    while lo < hi {
+        let mid = num_floor((lo + hi) / 2);
+        if _cmp_sql_val(entries[mid].key, target_val) <= 0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+fn _new_secondary_index(idx_name, col_name, is_unique, kind = "hybrid") {
+    return map{
+        name: idx_name,
+        column: col_name,
+        unique: is_unique,
+        kind: kind,
+        buckets: map{},
+        entries: []
+    };
+}
+
+fn _index_insert(idx, val, row_id) {
+    if val == nil { return; }
+    let hk = _idx_hash_key(val);
+    let bucket = if map_has(idx.buckets, hk) { idx.buckets[hk] } else { [] };
+    array_push(bucket, row_id);
+    idx.buckets[hk] = bucket;
+
+    let pos = _btree_upper_bound(idx.entries, val);
+    let next_entries = slice(idx.entries, 0, pos);
+    array_push(next_entries, map{ key: val, row_id: row_id });
+    _append_bytes(next_entries, slice(idx.entries, pos, len(idx.entries)));
+    idx.entries = next_entries;
+}
+
+fn _index_remove(idx, val, row_id) {
+    if val == nil { return; }
+    let hk = _idx_hash_key(val);
+    if map_has(idx.buckets, hk) {
+        let old_b = idx.buckets[hk];
+        let new_b = [];
+        let i = 0;
+        while i < len(old_b) {
+            if old_b[i] != row_id { array_push(new_b, old_b[i]); }
+            i = i + 1;
+        }
+        if len(new_b) == 0 { map_remove(idx.buckets, hk); }
+        else { idx.buckets[hk] = new_b; }
+    }
+
+    let lo = _btree_lower_bound(idx.entries, val);
+    let k = lo;
+    while k < len(idx.entries) and _cmp_sql_val(idx.entries[k].key, val) == 0 {
+        if idx.entries[k].row_id == row_id {
+            let trimmed = slice(idx.entries, 0, k);
+            _append_bytes(trimmed, slice(idx.entries, k + 1, len(idx.entries)));
+            idx.entries = trimmed;
+            break;
+        }
+        k = k + 1;
+    }
+}
+
+fn _rebuild_index_from_committed(tbl, idx, snap_seq) {
+    idx.buckets = map{};
+    idx.entries = [];
+    let i = 0;
+    while i < len(tbl.row_ids) {
+        let rid = tbl.row_ids[i];
+        let chain = tbl.versions[str(rid)];
+        let j = len(chain) - 1;
+        while j >= 0 {
+            let ver = chain[j];
+            if ver.xmin <= snap_seq and (ver.xmax == 0 or ver.xmax > snap_seq) {
+                let v = try ver.data[idx.column] catch nil;
+                _index_insert(idx, v, rid);
+                break;
+            }
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+// ── MVCC Visibility, Predicate Evaluation & Execution ────────────────────────
+
+fn _eval_expr(expr, params, row_or_nil) {
+    if expr.kind == "lit" { return expr.val; }
+    if expr.kind == "param" {
+        if params == nil or expr.idx < 0 or expr.idx >= len(params) {
+            throw "sovereign_unified_db: missing bound parameter at index " + str(expr.idx);
+        }
+        return params[expr.idx];
+    }
+    if expr.kind == "col" {
+        if row_or_nil == nil { return nil; }
+        return try row_or_nil[expr.name] catch nil;
+    }
+    return nil;
+}
+
+fn _like_match(val_str, pat_str) {
+    // Simple SQL LIKE (% and _) matcher
+    let m = len(val_str);
+    let p = len(pat_str);
+    let vi = 0;
+    let pi = 0;
+    let star_pi = -1;
+    let star_vi = 0;
+    while vi < m {
+        if pi < p and (str_slice(pat_str, pi, pi + 1) == "_" or str_slice(pat_str, pi, pi + 1) == str_slice(val_str, vi, vi + 1)) {
+            vi = vi + 1;
+            pi = pi + 1;
+        } elif pi < p and str_slice(pat_str, pi, pi + 1) == "%" {
+            star_pi = pi;
+            pi = pi + 1;
+            star_vi = vi;
+        } elif star_pi >= 0 {
+            pi = star_pi + 1;
+            star_vi = star_vi + 1;
+            vi = star_vi;
+        } else {
+            return false;
+        }
+    }
+    while pi < p and str_slice(pat_str, pi, pi + 1) == "%" { pi = pi + 1; }
+    return pi == p;
+}
+
+fn _row_matches_where(row, preds, params) {
+    let i = 0;
+    while i < len(preds) {
+        let pr = preds[i];
+        let lhs = try row[pr.col] catch nil;
+        let op = pr.op;
+        if op == "IS_NULL" {
+            if lhs != nil { return false; }
+        } elif op == "IS_NOT_NULL" {
+            if lhs == nil { return false; }
+        } elif op == "BETWEEN" {
+            let lo = _eval_expr(pr.rhs, params, row);
+            let hi = _eval_expr(pr.rhs2, params, row);
+            if lhs == nil or _cmp_sql_val(lhs, lo) < 0 or _cmp_sql_val(lhs, hi) > 0 { return false; }
+        } elif op == "LIKE" {
+            let pat = _eval_expr(pr.rhs, params, row);
+            if lhs == nil or pat == nil or not _like_match(str(lhs), str(pat)) { return false; }
+        } else {
+            let rhs = _eval_expr(pr.rhs, params, row);
+            if lhs == nil or rhs == nil { return false; }
+            let cmp = _cmp_sql_val(lhs, rhs);
+            if op == "=" and cmp != 0 { return false; }
+            if op == "<>" and cmp == 0 { return false; }
+            if op == "<" and not (cmp < 0) { return false; }
+            if op == "<=" and not (cmp <= 0) { return false; }
+            if op == ">" and not (cmp > 0) { return false; }
+            if op == ">=" and not (cmp >= 0) { return false; }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _visible_row_at(tbl, rid, snap_seq, tx_ctx) {
+    let rid_k = str(rid);
+    if tx_ctx != nil and tx_ctx.active {
+        if map_has(tx_ctx.overlay, tbl.name) {
+            let t_ov = tx_ctx.overlay[tbl.name];
+            if map_has(t_ov, rid_k) {
+                let entry = t_ov[rid_k];
+                if entry.deleted { return nil; }
+                return entry.data;
+            }
+        }
+    }
+    if not map_has(tbl.versions, rid_k) { return nil; }
+    let chain = tbl.versions[rid_k];
+    let i = len(chain) - 1;
+    while i >= 0 {
+        let ver = chain[i];
+        if ver.xmin <= snap_seq and (ver.xmax == 0 or ver.xmax > snap_seq) {
+            return ver.data;
+        }
+        i = i - 1;
+    }
+    return nil;
+}
+
+fn _candidate_row_ids(engine, tbl, preds, params, tx_ctx) {
+    // Check if any predicate hits a secondary Hash or B-Tree index!
+    let i = 0;
+    while i < len(preds) {
+        let pr = preds[i];
+        if map_has(tbl.indexes, pr.col) {
+            let idx = tbl.indexes[pr.col];
+            let cand = nil;
+            if pr.op == "=" {
+                let val = _eval_expr(pr.rhs, params, nil);
+                let hk = _idx_hash_key(val);
+                cand = if map_has(idx.buckets, hk) { _copy_array(idx.buckets[hk]) } else { [] };
+                engine.index_hits = engine.index_hits + 1;
+            } elif pr.op == ">" or pr.op == ">=" or pr.op == "<" or pr.op == "<=" or pr.op == "BETWEEN" {
+                cand = [];
+                let entries = idx.entries;
+                let start_i = 0;
+                let end_i = len(entries);
+                if pr.op == ">" {
+                    let v1 = _eval_expr(pr.rhs, params, nil);
+                    start_i = _btree_upper_bound(entries, v1);
+                } elif pr.op == ">=" {
+                    let v2 = _eval_expr(pr.rhs, params, nil);
+                    start_i = _btree_lower_bound(entries, v2);
+                } elif pr.op == "<" {
+                    let v3 = _eval_expr(pr.rhs, params, nil);
+                    end_i = _btree_lower_bound(entries, v3);
+                } elif pr.op == "<=" {
+                    let v4 = _eval_expr(pr.rhs, params, nil);
+                    end_i = _btree_upper_bound(entries, v4);
+                } elif pr.op == "BETWEEN" {
+                    let vlo = _eval_expr(pr.rhs, params, nil);
+                    let vhi = _eval_expr(pr.rhs2, params, nil);
+                    start_i = _btree_lower_bound(entries, vlo);
+                    end_i = _btree_upper_bound(entries, vhi);
+                }
+                let k = start_i;
+                while k < end_i {
+                    array_push(cand, entries[k].row_id);
+                    k = k + 1;
+                }
+                engine.index_hits = engine.index_hits + 1;
+            }
+
+            if cand != nil {
+                // Include uncommitted tx overlay row_ids so read-your-own-writes stays exact
+                if tx_ctx != nil and tx_ctx.active and map_has(tx_ctx.overlay, tbl.name) {
+                    let ov_keys = map_keys(tx_ctx.overlay[tbl.name]);
+                    let m = 0;
+                    while m < len(ov_keys) {
+                        array_push(cand, parse_number(ov_keys[m]));
+                        m = m + 1;
+                    }
+                }
+                return array_unique(cand);
+            }
+        }
+        i = i + 1;
+    }
+
+    engine.full_scans = engine.full_scans + 1;
+    let all_ids = _copy_array(tbl.row_ids);
+    if tx_ctx != nil and tx_ctx.active and map_has(tx_ctx.overlay, tbl.name) {
+        let ov_keys2 = map_keys(tx_ctx.overlay[tbl.name]);
+        let m2 = 0;
+        while m2 < len(ov_keys2) {
+            array_push(all_ids, parse_number(ov_keys2[m2]));
+            m2 = m2 + 1;
+        }
+        return array_unique(all_ids);
+    }
+    return all_ids;
+}
+
+fn _clone_tx_overlay(ov) {
+    let out = map{};
+    let tks = map_keys(ov);
+    let i = 0;
+    while i < len(tks) {
+        let tn = tks[i];
+        let sub = map{};
+        let rks = map_keys(ov[tn]);
+        let j = 0;
+        while j < len(rks) {
+            let rk = rks[j];
+            let ent = ov[tn][rk];
+            sub[rk] = map{
+                row_id: ent.row_id,
+                is_new: ent.is_new,
+                deleted: ent.deleted,
+                data: if ent.data == nil { nil } else { _copy_map(ent.data) }
+            };
+            j = j + 1;
+        }
+        out[tn] = sub;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _commit_tx_locked(engine, tx_ctx) {
+    let snap = tx_ctx.snapshot_seq;
+    let tnames = map_keys(tx_ctx.overlay);
+
+    // Phase 1: Validate write-write MVCC conflicts & UNIQUE/PK constraints
+    let ti = 0;
+    while ti < len(tnames) {
+        let tname = tnames[ti];
+        if not map_has(engine.tables, tname) {
+            throw "sovereign_unified_db: table '" + tname + "' dropped before commit";
+        }
+        let tbl = engine.tables[tname];
+        let t_ov = tx_ctx.overlay[tname];
+        let rks = map_keys(t_ov);
+        let ri = 0;
+        while ri < len(rks) {
+            let rk = rks[ri];
+            let ent = t_ov[rk];
+            if not ent.is_new and map_has(tbl.versions, rk) {
+                let chain = tbl.versions[rk];
+                let latest = chain[len(chain) - 1];
+                if latest.xmin > snap or (latest.xmax != 0 and latest.xmax > snap) {
+                    throw "sovereign_unified_db: MVCC serialization failure (write-write conflict)";
+                }
+            }
+            if not ent.deleted and ent.data != nil {
+                // Verify UNIQUE / PRIMARY KEY indexes against current committed state
+                let iks = map_keys(tbl.indexes);
+                let ii = 0;
+                while ii < len(iks) {
+                    let idx = tbl.indexes[iks[ii]];
+                    if idx.unique {
+                        let cval = try ent.data[idx.column] catch nil;
+                        if cval != nil {
+                            let hk = _idx_hash_key(cval);
+                            if map_has(idx.buckets, hk) {
+                                let bucket = idx.buckets[hk];
+                                let bi = 0;
+                                while bi < len(bucket) {
+                                    let other_rid = bucket[bi];
+                                    if other_rid != ent.row_id {
+                                        // Check if other_rid wasn't deleted in this same tx
+                                        let other_del = map_has(t_ov, str(other_rid)) and t_ov[str(other_rid)].deleted;
+                                        if not other_del {
+                                            throw "sovereign_unified_db: UNIQUE constraint failed: " + tname + "." + idx.column;
+                                        }
+                                    }
+                                    bi = bi + 1;
+                                }
+                            }
+                        }
+                    }
+                    ii = ii + 1;
+                }
+            }
+            ri = ri + 1;
+        }
+        ti = ti + 1;
+    }
+
+    // Phase 2: Publish atomic MVCC version commit & update secondary indexes
+    engine.commit_seq = engine.commit_seq + 1;
+    let new_seq = engine.commit_seq;
+
+    ti = 0;
+    while ti < len(tnames) {
+        let tname2 = tnames[ti];
+        let tbl2 = engine.tables[tname2];
+        let t_ov2 = tx_ctx.overlay[tname2];
+        let rks2 = map_keys(t_ov2);
+        let ri2 = 0;
+        while ri2 < len(rks2) {
+            let rk2 = rks2[ri2];
+            let ent2 = t_ov2[rk2];
+            let old_data = nil;
+            if map_has(tbl2.versions, rk2) {
+                let chain2 = tbl2.versions[rk2];
+                let last_v = chain2[len(chain2) - 1];
+                if last_v.xmax == 0 {
+                    old_data = last_v.data;
+                    last_v.xmax = new_seq;
+                }
+            } else {
+                tbl2.versions[rk2] = [];
+                array_push(tbl2.row_ids, ent2.row_id);
+            }
+
+            // Update secondary indexes
+            let iks2 = map_keys(tbl2.indexes);
+            let ii2 = 0;
+            while ii2 < len(iks2) {
+                let idx2 = tbl2.indexes[iks2[ii2]];
+                if old_data != nil {
+                    _index_remove(idx2, try old_data[idx2.column] catch nil, ent2.row_id);
+                }
+                if not ent2.deleted and ent2.data != nil {
+                    _index_insert(idx2, try ent2.data[idx2.column] catch nil, ent2.row_id);
+                }
+                ii2 = ii2 + 1;
+            }
+
+            if not ent2.deleted and ent2.data != nil {
+                array_push(tbl2.versions[rk2], map{
+                    row_id: ent2.row_id,
+                    xmin: new_seq,
+                    xmax: 0,
+                    data: _copy_map(ent2.data)
+                });
+            }
+            ri2 = ri2 + 1;
+        }
+        ti = ti + 1;
+    }
+    return new_seq;
+}
+
+fn _sort_rows(rows, col, desc) {
+    let out = _copy_array(rows);
+    let n = len(out);
+    let i = 0;
+    while i < n {
+        let j = i + 1;
+        while j < n {
+            let va = try out[i][col] catch nil;
+            let vb = try out[j][col] catch nil;
+            let cmp = _cmp_sql_val(va, vb);
+            let swap = if desc { cmp < 0 } else { cmp > 0 };
+            if swap {
+                let tmp = out[i];
+                out[i] = out[j];
+                out[j] = tmp;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _exec_single_plan_locked(conn, stmt, params) {
+    let engine = conn.engine;
+    let tx_ctx = conn.tx_ctx;
+    let op = stmt.op;
+
+    if op == "BEGIN" {
+        tx_ctx.active = true;
+        engine.tx_counter = engine.tx_counter + 1;
+        tx_ctx.tx_id = engine.tx_counter;
+        tx_ctx.snapshot_seq = engine.commit_seq;
+        tx_ctx.overlay = map{};
+        tx_ctx.savepoints = map{};
+        return map{ rows: [], affected_rows: 0 };
+    }
+    if op == "COMMIT" {
+        if tx_ctx.active {
+            let ok_c = try map{ ok: true, seq: _commit_tx_locked(engine, tx_ctx) } catch map{ ok: false, seq: 0 };
+            tx_ctx.active = false;
+            tx_ctx.overlay = map{};
+            tx_ctx.savepoints = map{};
+            if not ok_c.ok {
+                throw "sovereign_unified_db: COMMIT failed (constraint or MVCC conflict)";
+            }
+        }
+        return map{ rows: [], affected_rows: 0 };
+    }
+    if op == "ROLLBACK" {
+        tx_ctx.active = false;
+        tx_ctx.overlay = map{};
+        tx_ctx.savepoints = map{};
+        return map{ rows: [], affected_rows: 0 };
+    }
+    if op == "SAVEPOINT" {
+        if not tx_ctx.active {
+            tx_ctx.active = true;
+            engine.tx_counter = engine.tx_counter + 1;
+            tx_ctx.tx_id = engine.tx_counter;
+            tx_ctx.snapshot_seq = engine.commit_seq;
+            tx_ctx.overlay = map{};
+            tx_ctx.savepoints = map{};
+        }
+        tx_ctx.savepoints[stmt.name] = _clone_tx_overlay(tx_ctx.overlay);
+        return map{ rows: [], affected_rows: 0 };
+    }
+    if op == "ROLLBACK_TO" {
+        if tx_ctx.active and map_has(tx_ctx.savepoints, stmt.name) {
+            tx_ctx.overlay = _clone_tx_overlay(tx_ctx.savepoints[stmt.name]);
+        }
+        return map{ rows: [], affected_rows: 0 };
+    }
+    if op == "RELEASE_SAVEPOINT" {
+        if tx_ctx.active and map_has(tx_ctx.savepoints, stmt.name) {
+            map_remove(tx_ctx.savepoints, stmt.name);
+        }
+        return map{ rows: [], affected_rows: 0 };
+    }
+
+    if op == "CREATE_TABLE" {
+        if map_has(engine.tables, stmt.table) {
+            if stmt.if_not_exists { return map{ rows: [], affected_rows: 0 }; }
+            throw "sovereign_unified_db: table already exists: " + stmt.table;
+        }
+        let tbl = map{
+            name: stmt.table,
+            columns: stmt.columns,
+            primary_key: stmt.primary_key,
+            next_rowid: 1,
+            row_ids: [],
+            versions: map{},
+            indexes: map{}
+        };
+        if stmt.primary_key != nil {
+            tbl.indexes[stmt.primary_key] = _new_secondary_index("pk_" + stmt.table + "_" + stmt.primary_key, stmt.primary_key, true, "hybrid");
+        }
+        engine.tables[stmt.table] = tbl;
+        return map{ rows: [], affected_rows: 0 };
+    }
+
+    if op == "DROP_TABLE" {
+        if map_has(engine.tables, stmt.table) {
+            map_remove(engine.tables, stmt.table);
+            if tx_ctx.active and map_has(tx_ctx.overlay, stmt.table) {
+                map_remove(tx_ctx.overlay, stmt.table);
+            }
+            return map{ rows: [], affected_rows: 0 };
+        }
+        if stmt.if_exists { return map{ rows: [], affected_rows: 0 }; }
+        throw "sovereign_unified_db: no such table: " + stmt.table;
+    }
+
+    if op == "CREATE_INDEX" {
+        if not map_has(engine.tables, stmt.table) {
+            throw "sovereign_unified_db: no such table: " + stmt.table;
+        }
+        let tbl_i = engine.tables[stmt.table];
+        if map_has(tbl_i.indexes, stmt.column) and stmt.if_not_exists {
+            return map{ rows: [], affected_rows: 0 };
+        }
+        let idx = _new_secondary_index(stmt.index_name, stmt.column, stmt.unique, "hybrid");
+        _rebuild_index_from_committed(tbl_i, idx, engine.commit_seq);
+        tbl_i.indexes[stmt.column] = idx;
+        return map{ rows: [], affected_rows: 0 };
+    }
+
+    if op == "SELECT_CONST" {
+        let r0 = map{};
+        let c = 0;
+        while c < len(stmt.items) {
+            let it = stmt.items[c];
+            r0[it.alias] = _eval_expr(it.expr, params, nil);
+            c = c + 1;
+        }
+        return map{ rows: [r0], affected_rows: 0 };
+    }
+
+    if not map_has(engine.tables, stmt.table) {
+        throw "sovereign_unified_db: no such table: " + stmt.table;
+    }
+    let tbl = engine.tables[stmt.table];
+    let snap = if tx_ctx.active { tx_ctx.snapshot_seq } else { engine.commit_seq };
+
+    // Auto-wrap single DML statement in ephemeral MVCC tx when in autocommit mode
+    let auto_tx = false;
+    if (op == "INSERT" or op == "UPDATE" or op == "DELETE") and not tx_ctx.active {
+        auto_tx = true;
+        tx_ctx.active = true;
+        engine.tx_counter = engine.tx_counter + 1;
+        tx_ctx.tx_id = engine.tx_counter;
+        tx_ctx.snapshot_seq = engine.commit_seq;
+        tx_ctx.overlay = map{};
+        snap = tx_ctx.snapshot_seq;
+    }
+
+    if op == "INSERT" {
+        if not map_has(tx_ctx.overlay, tbl.name) { tx_ctx.overlay[tbl.name] = map{}; }
+        let t_ov = tx_ctx.overlay[tbl.name];
+        let inserted = 0;
+        let r = 0;
+        while r < len(stmt.rows) {
+            let rexprs = stmt.rows[r];
+            let rid = tbl.next_rowid;
+            tbl.next_rowid = tbl.next_rowid + 1;
+            let row_data = map{};
+            // Initialize schema columns to nil
+            let sc = 0;
+            while sc < len(tbl.columns) {
+                row_data[tbl.columns[sc].name] = nil;
+                sc = sc + 1;
+            }
+            let target_cols = stmt.columns;
+            if target_cols == nil {
+                target_cols = [];
+                let sc2 = 0;
+                while sc2 < len(tbl.columns) {
+                    array_push(target_cols, tbl.columns[sc2].name);
+                    sc2 = sc2 + 1;
+                }
+            }
+            let ci = 0;
+            while ci < len(rexprs) and ci < len(target_cols) {
+                row_data[target_cols[ci]] = _eval_expr(rexprs[ci], params, nil);
+                ci = ci + 1;
+            }
+            // Auto-assign INTEGER PRIMARY KEY if omitted/nil
+            if tbl.primary_key != nil and (try row_data[tbl.primary_key] catch nil) == nil {
+                row_data[tbl.primary_key] = rid;
+            }
+            t_ov[str(rid)] = map{ row_id: rid, is_new: true, deleted: false, data: row_data };
+            conn.last_rowid = if tbl.primary_key != nil and type(row_data[tbl.primary_key]) == "number" { row_data[tbl.primary_key] } else { rid };
+            inserted = inserted + 1;
+            r = r + 1;
+        }
+        if auto_tx {
+            let ok_i = try map{ ok: true, seq: _commit_tx_locked(engine, tx_ctx) } catch map{ ok: false };
+            tx_ctx.active = false;
+            tx_ctx.overlay = map{};
+            if not ok_i.ok { throw "sovereign_unified_db: INSERT constraint violation"; }
+        }
+        return map{ rows: [], affected_rows: inserted };
+    }
+
+    if op == "UPDATE" {
+        if not map_has(tx_ctx.overlay, tbl.name) { tx_ctx.overlay[tbl.name] = map{}; }
+        let t_ov = tx_ctx.overlay[tbl.name];
+        let cands = _candidate_row_ids(engine, tbl, stmt.where, params, tx_ctx);
+        let updated = 0;
+        let i = 0;
+        while i < len(cands) {
+            let rid = cands[i];
+            let cur = _visible_row_at(tbl, rid, snap, tx_ctx);
+            if cur != nil and _row_matches_where(cur, stmt.where, params) {
+                let next_d = _copy_map(cur);
+                let a = 0;
+                while a < len(stmt.assigns) {
+                    let asg = stmt.assigns[a];
+                    next_d[asg.col] = _eval_expr(asg.expr, params, cur);
+                    a = a + 1;
+                }
+                let was_new = map_has(t_ov, str(rid)) and t_ov[str(rid)].is_new;
+                t_ov[str(rid)] = map{ row_id: rid, is_new: was_new, deleted: false, data: next_d };
+                updated = updated + 1;
+            }
+            i = i + 1;
+        }
+        if auto_tx {
+            let ok_u = try map{ ok: true, seq: _commit_tx_locked(engine, tx_ctx) } catch map{ ok: false };
+            tx_ctx.active = false;
+            tx_ctx.overlay = map{};
+            if not ok_u.ok { throw "sovereign_unified_db: UPDATE constraint or MVCC conflict"; }
+        }
+        return map{ rows: [], affected_rows: updated };
+    }
+
+    if op == "DELETE" {
+        if not map_has(tx_ctx.overlay, tbl.name) { tx_ctx.overlay[tbl.name] = map{}; }
+        let t_ov = tx_ctx.overlay[tbl.name];
+        let cands = _candidate_row_ids(engine, tbl, stmt.where, params, tx_ctx);
+        let deleted = 0;
+        let i = 0;
+        while i < len(cands) {
+            let rid = cands[i];
+            let cur = _visible_row_at(tbl, rid, snap, tx_ctx);
+            if cur != nil and _row_matches_where(cur, stmt.where, params) {
+                let was_new = map_has(t_ov, str(rid)) and t_ov[str(rid)].is_new;
+                t_ov[str(rid)] = map{ row_id: rid, is_new: was_new, deleted: true, data: nil };
+                deleted = deleted + 1;
+            }
+            i = i + 1;
+        }
+        if auto_tx {
+            _commit_tx_locked(engine, tx_ctx);
+            tx_ctx.active = false;
+            tx_ctx.overlay = map{};
+        }
+        return map{ rows: [], affected_rows: deleted };
+    }
+
+    if op == "SELECT" {
+        let cands = _candidate_row_ids(engine, tbl, stmt.where, params, tx_ctx);
+        let matched = [];
+        let i = 0;
+        while i < len(cands) {
+            let rid = cands[i];
+            let cur = _visible_row_at(tbl, rid, snap, tx_ctx);
+            if cur != nil and _row_matches_where(cur, stmt.where, params) {
+                array_push(matched, cur);
+            }
+            i = i + 1;
+        }
+
+        // Check if query contains aggregates
+        let has_agg = false;
+        let k = 0;
+        while k < len(stmt.items) {
+            if stmt.items[k].kind == "agg" { has_agg = true; }
+            k = k + 1;
+        }
+        if has_agg {
+            let agg_row = map{};
+            let m = 0;
+            while m < len(stmt.items) {
+                let it = stmt.items[m];
+                if it.kind == "agg" {
+                    let fn_n = it.func;
+                    if fn_n == "COUNT" {
+                        if it.col == "*" { agg_row[it.alias] = len(matched); }
+                        else {
+                            let cnt = 0;
+                            let r = 0;
+                            while r < len(matched) {
+                                if (try matched[r][it.col] catch nil) != nil { cnt = cnt + 1; }
+                                r = r + 1;
+                            }
+                            agg_row[it.alias] = cnt;
+                        }
+                    } elif fn_n == "SUM" or fn_n == "AVG" {
+                        let s = 0;
+                        let cnt2 = 0;
+                        let r2 = 0;
+                        while r2 < len(matched) {
+                            let v = try matched[r2][it.col] catch nil;
+                            if type(v) == "number" { s = s + v; cnt2 = cnt2 + 1; }
+                            r2 = r2 + 1;
+                        }
+                        if cnt2 == 0 { agg_row[it.alias] = nil; }
+                        elif fn_n == "SUM" { agg_row[it.alias] = s; }
+                        else { agg_row[it.alias] = s / cnt2; }
+                    } elif fn_n == "MIN" or fn_n == "MAX" {
+                        let best = nil;
+                        let r3 = 0;
+                        while r3 < len(matched) {
+                            let v3 = try matched[r3][it.col] catch nil;
+                            if v3 != nil {
+                                if best == nil { best = v3; }
+                                elif fn_n == "MIN" and _cmp_sql_val(v3, best) < 0 { best = v3; }
+                                elif fn_n == "MAX" and _cmp_sql_val(v3, best) > 0 { best = v3; }
+                            }
+                            r3 = r3 + 1;
+                        }
+                        agg_row[it.alias] = best;
+                    }
+                }
+                m = m + 1;
+            }
+            return map{ rows: [agg_row], affected_rows: 0 };
+        }
+
+        if stmt.order_col != nil {
+            matched = _sort_rows(matched, stmt.order_col, stmt.order_desc);
+        }
+        let off = 0;
+        if stmt.offset_expr != nil {
+            off = _eval_expr(stmt.offset_expr, params, nil);
+            if off < 0 { off = 0; }
+        }
+        let lim = len(matched);
+        if stmt.limit_expr != nil {
+            lim = _eval_expr(stmt.limit_expr, params, nil);
+            if lim < 0 { lim = 0; }
+        }
+
+        let out_rows = [];
+        let idx_r = off;
+        while idx_r < len(matched) and len(out_rows) < lim {
+            let src = matched[idx_r];
+            let proj = map{};
+            let p = 0;
+            while p < len(stmt.items) {
+                let pit = stmt.items[p];
+                if pit.kind == "star" {
+                    let ks = map_keys(src);
+                    let q = 0;
+                    while q < len(ks) { proj[ks[q]] = src[ks[q]]; q = q + 1; }
+                } else {
+                    proj[pit.alias] = _eval_expr(pit.expr, params, src);
+                }
+                p = p + 1;
+            }
+            array_push(out_rows, proj);
+            idx_r = idx_r + 1;
+        }
+        return map{ rows: out_rows, affected_rows: 0 };
+    }
+
+    throw "sovereign_unified_db: unhandled plan operation " + op;
+}
+
+fn _run_memory_sql(conn, sql, params = nil) {
+    if not conn.open { throw "sovereign_unified_db: memory connection is closed"; }
+    guard_parameterized_sql(sql, params, conn.strict_params);
+    let engine = conn.engine;
+    mutex_lock(engine.mtx);
+    let outcome = try map{
+        ok: true,
+        res: fn() {
+            let plans = _get_cached_plan(engine, sql);
+            let last = map{ rows: [], affected_rows: 0 };
+            let total_aff = 0;
+            let i = 0;
+            while i < len(plans) {
+                last = _exec_single_plan_locked(conn, plans[i], params);
+                total_aff = total_aff + last.affected_rows;
+                i = i + 1;
+            }
+            last.affected_rows = total_aff;
+            return last;
+        }()
+    } catch map{ ok: false, res: nil };
+    mutex_unlock(engine.mtx);
+    if not outcome.ok {
+        throw "sovereign_unified_db: query execution failed";
+    }
+    return outcome.res;
+}
+
+// ── Public Secondary Index & Explain Helpers ─────────────────────────────────
+
+fn create_index(db_conn, table_name, col_name, opts = nil) {
+    let unique = _opt(opts, "unique", false) == true;
+    let idx_name = str(_opt(opts, "name", "idx_" + str(table_name) + "_" + str(col_name)));
+    let uq_sql = if unique { "UNIQUE " } else { "" };
+    let q_idx = "\"" + str_replace_all(idx_name, "\"", "\"\"") + "\"";
+    let q_tbl = "\"" + str_replace_all(str(table_name), "\"", "\"\"") + "\"";
+    let q_col = "\"" + str_replace_all(str(col_name), "\"", "\"\"") + "\"";
+    db_conn.exec("CREATE " + uq_sql + "INDEX IF NOT EXISTS " + q_idx + " ON " + q_tbl + "(" + q_col + ")", []);
+    return map{ ok: true, index: idx_name, table: table_name, column: col_name, unique: unique };
+}
+
+fn explain(db_conn, sql) {
+    if (try db_conn.kind catch "") != "memory" {
+        return map{ backend: try db_conn.kind catch "unknown", plan: "remote_driver_plan" };
+    }
+    let engine = db_conn.engine;
+    let plans = _get_cached_plan(engine, sql);
+    let p0 = plans[0];
+    let strategy = "full_scan";
+    if p0.op == "SELECT" or p0.op == "UPDATE" or p0.op == "DELETE" {
+        if map_has(engine.tables, p0.table) {
+            let tbl = engine.tables[p0.table];
+            let i = 0;
+            while i < len(p0.where) {
+                let pr = p0.where[i];
+                if map_has(tbl.indexes, pr.col) {
+                    if pr.op == "=" { strategy = "hash_index_o1:" + pr.col; break; }
+                    if pr.op == ">" or pr.op == ">=" or pr.op == "<" or pr.op == "<=" or pr.op == "BETWEEN" {
+                        strategy = "btree_index_ologn:" + pr.col; break;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+    }
+    return map{ backend: "memory", op: p0.op, strategy: strategy };
+}
+
+fn stats(db_conn) {
+    if (try db_conn.kind catch "") == "memory" {
+        let e = db_conn.engine;
+        return map{
+            format: "pblang.db.sovereign.stats.v1",
+            backend: "memory",
+            namespace: e.namespace,
+            commit_seq: e.commit_seq,
+            tables: len(map_keys(e.tables)),
+            index_hits: e.index_hits,
+            full_scans: e.full_scans,
+            plan_cache_size: len(e.plan_order),
+            plan_cache_hits: e.plan_cache_hits,
+            plan_cache_misses: e.plan_cache_misses
+        };
+    }
+    return map{ format: "pblang.db.sovereign.stats.v1", backend: try db_conn.kind catch "unknown" };
+}
+
+// ── AEAD Encrypted-At-Rest Snapshot / WAL Persistence ("PBSDB042") ───────────
+
+fn _normalize_key32(key_material) {
+    if is_array(key_material) {
+        if len(key_material) != 32 {
+            throw "sovereign_unified_db: encryption key byte array must be exactly 32 bytes";
+        }
+        return key_material;
+    }
+    if type(key_material) == "string" {
+        let raw = str_to_bytes(key_material);
+        if len(raw) == 32 { return raw; }
+        return str_to_bytes(hex_decode(sha256(key_material)));
+    }
+    throw "sovereign_unified_db: 32-byte key or passphrase required";
+}
+
+fn _serialize_engine_snapshot(engine) {
+    mutex_lock(engine.mtx);
+    let snap = engine.commit_seq;
+    let out_tables = map{};
+    let tnames = map_keys(engine.tables);
+    let i = 0;
+    while i < len(tnames) {
+        let tn = tnames[i];
+        let tbl = engine.tables[tn];
+        let committed_rows = [];
+        let j = 0;
+        while j < len(tbl.row_ids) {
+            let rid = tbl.row_ids[j];
+            let v = _visible_row_at(tbl, rid, snap, nil);
+            if v != nil {
+                array_push(committed_rows, map{ row_id: rid, data: v });
+            }
+            j = j + 1;
+        }
+        let idx_specs = [];
+        let iks = map_keys(tbl.indexes);
+        let m = 0;
+        while m < len(iks) {
+            let idx = tbl.indexes[iks[m]];
+            array_push(idx_specs, map{ name: idx.name, column: idx.column, unique: idx.unique });
+            m = m + 1;
+        }
+        out_tables[tn] = map{
+            columns: tbl.columns,
+            primary_key: tbl.primary_key,
+            next_rowid: tbl.next_rowid,
+            rows: committed_rows,
+            indexes: idx_specs
+        };
+        i = i + 1;
+    }
+    mutex_unlock(engine.mtx);
+    return json_stringify(map{
+        format: "pblang.sovereign_db.snapshot.v1",
+        commit_seq: snap,
+        tables: out_tables
+    });
+}
+
+fn save_encrypted_snapshot(db_conn, path, key_material, opts = nil) {
+    if (try db_conn.kind catch "") != "memory" {
+        throw "sovereign_unified_db: encrypted snapshot requires a Sovereign memory:// engine";
+    }
+    let key32 = _normalize_key32(key_material);
+    let cipher_name = str_lower(str(_opt(opts, "cipher", "aes-256-gcm")));
+    let nonce12 = random_bytes(12);
+    let plain_bytes = str_to_bytes(_serialize_engine_snapshot(db_conn.engine));
+
+    let cipher_id = CIPHER_AES_256_GCM;
+    if cipher_name == "chacha20" or cipher_name == "chacha20-poly1305" or cipher_name == "chacha20-hmac-sha256" {
+        cipher_id = CIPHER_CHACHA20_HMAC;
+    }
+
+    // Envelope Header (AAD): [8B "PBSDB042"][1B cipher_id][12B nonce] = 21 bytes
+    let header_aad = [];
+    _append_bytes(header_aad, SNAPSHOT_MAGIC);
+    array_push(header_aad, cipher_id);
+    _append_bytes(header_aad, nonce12);
+
+    let out_blob = [];
+    _append_bytes(out_blob, header_aad);
+
+    if cipher_id == CIPHER_AES_256_GCM {
+        let enc = AES_GCM.aes256_gcm_encrypt_bytes_with_aad(plain_bytes, key32, nonce12, header_aad);
+        _append_bytes(out_blob, enc.tag);        // 16-byte GCM authentication tag
+        _append_bytes(out_blob, enc.ciphertext); // encrypted payload
+    } else {
+        let ct = CRYPTO.chacha20_encrypt(plain_bytes, key32, nonce12);
+        let mac_in = [];
+        _append_bytes(mac_in, header_aad);
+        _append_bytes(mac_in, ct);
+        let tag32 = str_to_bytes(hex_decode(hmac_sha256(bytes_to_str(mac_in), bytes_to_str(key32))));
+        _append_bytes(out_blob, tag32);          // 32-byte HMAC-SHA256 tag over AAD || ciphertext
+        _append_bytes(out_blob, ct);
+    }
+
+    fs_write_bytes(path, out_blob);
+    return map{
+        ok: true,
+        path: path,
+        bytes_written: len(out_blob),
+        cipher: if cipher_id == CIPHER_AES_256_GCM { "aes-256-gcm" } else { "chacha20-hmac-sha256" }
+    };
+}
+
+fn load_encrypted_snapshot(path, key_material, opts = nil) {
+    let key32 = _normalize_key32(key_material);
+    let raw = fs_read_bytes(path);
+    if len(raw) < 38 {
+        throw "sovereign_unified_db: encrypted snapshot truncated or invalid";
+    }
+    let m = 0;
+    while m < 8 {
+        if raw[m] != SNAPSHOT_MAGIC[m] {
+            throw "sovereign_unified_db: invalid snapshot magic header";
+        }
+        m = m + 1;
+    }
+    let cipher_id = raw[8];
+    let nonce12 = slice(raw, 9, 21);
+    let header_aad = slice(raw, 0, 21);
+    let plain_bytes = nil;
+
+    if cipher_id == CIPHER_AES_256_GCM {
+        let tag16 = slice(raw, 21, 37);
+        let ct = slice(raw, 37, len(raw));
+        let dec = AES_GCM.aes256_gcm_decrypt_bytes_with_aad(ct, key32, nonce12, tag16, header_aad);
+        if not dec.ok {
+            throw "sovereign_unified_db: AES-256-GCM snapshot authentication failed (wrong key or tampered file)";
+        }
+        plain_bytes = dec.plaintext;
+    } elif cipher_id == CIPHER_CHACHA20_HMAC {
+        if len(raw) < 53 { throw "sovereign_unified_db: truncated ChaCha20 snapshot"; }
+        let tag32 = slice(raw, 21, 53);
+        let ct2 = slice(raw, 53, len(raw));
+        let mac_in = [];
+        _append_bytes(mac_in, header_aad);
+        _append_bytes(mac_in, ct2);
+        let expected32 = str_to_bytes(hex_decode(hmac_sha256(bytes_to_str(mac_in), bytes_to_str(key32))));
+        if not CRYPTO.ct_equal_bytes(tag32, expected32) {
+            throw "sovereign_unified_db: ChaCha20-HMAC snapshot authentication failed";
+        }
+        plain_bytes = CRYPTO.chacha20_decrypt(ct2, key32, nonce12);
+    } else {
+        throw "sovereign_unified_db: unsupported snapshot cipher id " + str(cipher_id);
+    }
+
+    let doc = json_parse(bytes_to_str(plain_bytes));
+    let ns = str(_opt(opts, "namespace", "restored_" + str(now_ms()) + "_" + str(random_bytes(2)[0])));
+    let db_conn = open_memory(ns, opts);
+    let eng = db_conn.engine;
+
+    mutex_lock(eng.mtx);
+    eng.commit_seq = _opt(doc, "commit_seq", 1);
+    if eng.commit_seq < 1 { eng.commit_seq = 1; }
+    let tmap = doc.tables;
+    let tnames = map_keys(tmap);
+    let i = 0;
+    while i < len(tnames) {
+        let tn = tnames[i];
+        let spec = tmap[tn];
+        let tbl = map{
+            name: tn,
+            columns: spec.columns,
+            primary_key: spec.primary_key,
+            next_rowid: spec.next_rowid,
+            row_ids: [],
+            versions: map{},
+            indexes: map{}
+        };
+        let rlist = spec.rows;
+        let j = 0;
+        while j < len(rlist) {
+            let r_item = rlist[j];
+            let rid = r_item.row_id;
+            array_push(tbl.row_ids, rid);
+            tbl.versions[str(rid)] = [map{
+                row_id: rid,
+                xmin: eng.commit_seq,
+                xmax: 0,
+                data: r_item.data
+            }];
+            j = j + 1;
+        }
+        let ispecs = spec.indexes;
+        let k = 0;
+        while k < len(ispecs) {
+            let isp = ispecs[k];
+            let idx = _new_secondary_index(isp.name, isp.column, isp.unique, "hybrid");
+            _rebuild_index_from_committed(tbl, idx, eng.commit_seq);
+            tbl.indexes[isp.column] = idx;
+            k = k + 1;
+        }
+        eng.tables[tn] = tbl;
+        i = i + 1;
+    }
+    mutex_unlock(eng.mtx);
+    return db_conn;
+}
+
+// ── Engine Registry & Unified Connection Constructors ────────────────────────
+
+fn _get_or_create_engine(namespace, max_plans = 128) {
+    mutex_lock(_REGISTRY_MTX);
+    if not map_has(_SHARED_ENGINES, namespace) {
+        _SHARED_ENGINES[namespace] = map{
+            namespace: namespace,
+            mtx: mutex_new(),
+            commit_seq: 1,
+            tx_counter: 0,
+            tables: map{},
+            max_plans: max_plans,
+            plan_cache: map{},
+            plan_order: [],
+            plan_cache_hits: 0,
+            plan_cache_misses: 0,
+            index_hits: 0,
+            full_scans: 0
+        };
+    }
+    let eng = _SHARED_ENGINES[namespace];
+    mutex_unlock(_REGISTRY_MTX);
+    return eng;
+}
+
+fn open_memory(namespace = "default", opts = nil) {
+    let ns = str(if namespace == nil or namespace == "" { "default" } else { namespace });
+    let shared = _opt(opts, "shared", true) == true;
+    let max_plans = _opt(opts, "max_plans", 128);
+    let strict_params = _opt(opts, "strict_params", false) == true;
+
+    let engine = nil;
+    if shared {
+        engine = _get_or_create_engine(ns, max_plans);
+    } else {
+        engine = map{
+            namespace: ns,
+            mtx: mutex_new(),
+            commit_seq: 1,
+            tx_counter: 0,
+            tables: map{},
+            max_plans: max_plans,
+            plan_cache: map{},
+            plan_order: [],
+            plan_cache_hits: 0,
+            plan_cache_misses: 0,
+            index_hits: 0,
+            full_scans: 0
+        };
+    }
+
+    let conn = map{
+        format: "pblang.db.sovereign.memory.v1",
+        kind: "memory",
+        namespace: ns,
+        engine: engine,
+        open: true,
+        strict_params: strict_params,
+        last_rowid: 0,
+        tx_ctx: map{ active: false, tx_id: 0, snapshot_seq: 0, overlay: map{}, savepoints: map{} }
+    };
+
+    conn.exec = fn(sql, params = nil) {
+        return _run_memory_sql(conn, sql, params).affected_rows;
+    };
+
+    conn.query = fn(sql, params = nil) {
+        return _run_memory_sql(conn, sql, params).rows;
+    };
+
+    conn.prepare = fn(sql) {
+        _get_cached_plan(conn.engine, sql);
+        return map{
+            sql: sql,
+            exec: fn(params = nil) { return _run_memory_sql(conn, sql, params).affected_rows; },
+            query: fn(params = nil) { return _run_memory_sql(conn, sql, params).rows; }
+        };
+    };
+
+    conn.last_insert_rowid = fn() { return conn.last_rowid; };
+
+    conn.transaction = fn(body_fn) {
+        _run_memory_sql(conn, "BEGIN", []);
+        let out = try body_fn(conn) catch nil;
+        if out == nil {
+            try _run_memory_sql(conn, "ROLLBACK", []) catch nil;
+            return nil;
+        }
+        _run_memory_sql(conn, "COMMIT", []);
+        return out;
+    };
+
+    conn.tx = fn(body_fn) {
+        _run_memory_sql(conn, "BEGIN", []);
+        let r = try map{ ok: true, value: body_fn(conn) } catch map{ ok: false };
+        if r.ok {
+            let cok = try { _run_memory_sql(conn, "COMMIT", []); true } catch false;
+            if not cok { return map{ ok: false }; }
+        } else {
+            try _run_memory_sql(conn, "ROLLBACK", []) catch nil;
+        }
+        return r;
+    };
+
+    conn.savepoint = fn(name, body_fn) {
+        let q = "\"" + str_replace_all(str(name), "\"", "\"\"") + "\"";
+        _run_memory_sql(conn, "SAVEPOINT " + q, []);
+        let r = try map{ ok: true, value: body_fn(conn) } catch map{ ok: false };
+        if not r.ok {
+            try _run_memory_sql(conn, "ROLLBACK TO SAVEPOINT " + q, []) catch nil;
+        }
+        _run_memory_sql(conn, "RELEASE SAVEPOINT " + q, []);
+        return r;
+    };
+
+    conn.create_index = fn(table_name, col_name, idx_opts = nil) {
+        return create_index(conn, table_name, col_name, idx_opts);
+    };
+
+    conn.explain = fn(sql) { return explain(conn, sql); };
+    conn.stats = fn() { return stats(conn); };
+
+    conn.ping = fn() { return conn.open; };
+
+    conn.close = fn() {
+        if not conn.open { return false; }
+        if conn.tx_ctx.active {
+            try _run_memory_sql(conn, "ROLLBACK", []) catch nil;
+        }
+        conn.open = false;
+        return true;
+    };
+
+    return conn;
+}
+
+fn _open_sqlite_wrapped(path, opts = nil) {
+    if type(path) != "string" { throw "sovereign_unified_db: sqlite path must be a string"; }
+    let pbs = str_to_bytes(path);
+    let pi = 0;
+    while pi < len(pbs) {
+        if pbs[pi] == 0 { throw "sovereign_unified_db: sqlite path contains NUL byte"; }
+        pi = pi + 1;
+    }
+    let strict_params = _opt(opts, "strict_params", false) == true;
+    let h = sqlite_open(path);
+    let c = map{ kind: "sqlite", handle: h, open: true, path: path, strict_params: strict_params };
+
+    c.exec = fn(sql, params = nil) {
+        if params == nil { params = []; }
+        guard_parameterized_sql(sql, params, c.strict_params);
+        return sqlite_exec(c.handle, sql, params);
+    };
+    c.query = fn(sql, params = nil) {
+        if params == nil { params = []; }
+        guard_parameterized_sql(sql, params, c.strict_params);
+        return sqlite_query(c.handle, sql, params);
+    };
+    c.prepare = fn(sql) {
+        return map{
+            sql: sql,
+            exec: fn(params = nil) { return c.exec(sql, params); },
+            query: fn(params = nil) { return c.query(sql, params); }
+        };
+    };
+    c.last_insert_rowid = fn() { return sqlite_last_insert_rowid(c.handle); };
+    c.transaction = fn(body_fn) {
+        c.exec("BEGIN", []);
+        let out = try body_fn(c) catch nil;
+        if out == nil { c.exec("ROLLBACK", []); return nil; }
+        c.exec("COMMIT", []);
+        return out;
+    };
+    c.tx = fn(body_fn) {
+        c.exec("BEGIN", []);
+        let r = try map{ ok: true, value: body_fn(c) } catch map{ ok: false };
+        if r.ok { c.exec("COMMIT", []); } else { c.exec("ROLLBACK", []); }
+        return r;
+    };
+    c.savepoint = fn(name, body_fn) {
+        let q = "\"" + str_replace_all(str(name), "\"", "\"\"") + "\"";
+        c.exec("SAVEPOINT " + q, []);
+        let r = try map{ ok: true, value: body_fn(c) } catch map{ ok: false };
+        if not r.ok { c.exec("ROLLBACK TO SAVEPOINT " + q, []); }
+        c.exec("RELEASE SAVEPOINT " + q, []);
+        return r;
+    };
+    c.ping = fn() {
+        return try { sqlite_query(c.handle, "SELECT 1 AS ok", []); true } catch false;
+    };
+    c.close = fn() {
+        if not c.open { return false; }
+        c.open = false;
+        sqlite_close(c.handle);
+        return true;
+    };
+    return c;
+}
+
+fn open(dsn_or_opts, opts = nil) {
+    if is_map(dsn_or_opts) {
+        let merged = _copy_map(dsn_or_opts);
+        if is_map(opts) {
+            let ks = map_keys(opts);
+            let i = 0;
+            while i < len(ks) { merged[ks[i]] = opts[ks[i]]; i = i + 1; }
+        }
+        let b = str_lower(str(_opt(merged, "backend", _opt(merged, "driver", "memory"))));
+        if b == "memory" or b == "pblangdb" { return open_memory(_opt(merged, "namespace", "default"), merged); }
+        if b == "sqlite" { return _open_sqlite_wrapped(_opt(merged, "path", ":memory:"), merged); }
+        if b == "postgres" or b == "postgresql" { return PG_DRV.open(merged); }
+        if b == "mssql" or b == "sqlserver" or b == "tds" { return TDS_DRV.open(merged); }
+        if b == "mysql" or b == "mariadb" { return MY_DRV.open(merged); }
+        throw "sovereign_unified_db.open: unsupported backend '" + b + "'";
+    }
+
+    let parsed = parse_dsn(dsn_or_opts);
+    let cfg = _copy_map(opts);
+    cfg.host = _opt(cfg, "host", parsed.host);
+    cfg.port = _opt(cfg, "port", parsed.port);
+    cfg.user = _opt(cfg, "user", parsed.user);
+    cfg.password = _opt(cfg, "password", parsed.password);
+    cfg.database = _opt(cfg, "database", parsed.database);
+    if map_has(parsed.query, "sslmode") and not map_has(cfg, "sslmode") {
+        cfg.sslmode = parsed.query.sslmode;
+    }
+    if map_has(parsed.query, "tls") and not map_has(cfg, "tls") {
+        cfg.tls = parsed.query.tls == "true" or parsed.query.tls == "1";
+    }
+    if map_has(parsed.query, "strict_params") and not map_has(cfg, "strict_params") {
+        cfg.strict_params = parsed.query.strict_params == "true" or parsed.query.strict_params == "1";
+    }
+
+    if parsed.backend == "memory" {
+        return open_memory(parsed.namespace, cfg);
+    }
+    if parsed.backend == "sqlite" {
+        return _open_sqlite_wrapped(parsed.path, cfg);
+    }
+    if parsed.backend == "postgres" {
+        return PG_DRV.open(cfg);
+    }
+    if parsed.backend == "mssql" {
+        return TDS_DRV.open(cfg);
+    }
+    if parsed.backend == "mysql" {
+        return MY_DRV.open(cfg);
+    }
+    throw "sovereign_unified_db.open: unsupported DSN backend '" + parsed.backend + "'";
+}
+
+export open, open_memory, parse_dsn, redact_dsn,
+       guard_parameterized_sql, create_index, explain, stats,
+       save_encrypted_snapshot, load_encrypted_snapshot,
+       CIPHER_AES_256_GCM, CIPHER_CHACHA20_HMAC;

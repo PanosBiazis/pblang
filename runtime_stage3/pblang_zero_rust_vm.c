@@ -1,29 +1,32 @@
 /* ============================================================================
- * pblang Sovereign Zero-Rust Native Runtime & Compiler — v4.1.0
+ * pblang Sovereign Zero-Rust Native Runtime & Compiler — v4.2.0
  *
  * 100% Rust-independent cross-platform & multi-device C99 implementation of:
  *   - Native `.sapp -> .pbck` v1 / `PBSH` v1 preprocessor, Unicode lexer, parser,
  *     SI unit annotations, `requires`/`ensures` contracts, `@nogc`/`@packed`
- *     attributes, sandboxed `comptime`, AST desugarer, bytecode compiler &
+ *     attributes, sandboxed `comptime`, AST desugarer, N-level lexical upvalues,
+ *     algebraic `enum`/`match`/`Generics`/`trait`, bytecode compiler &
  *     zero-overhead polymorphic encrypted/stripped serializer & deserializer
  *   - Computed-Goto threaded VM, peephole superinstructions, monomorphic ICs,
- *     W^X `x86_64` SSE2 native JIT, two-generation nursery GC, zero-copy
- *     `OBJ_BYTES`/`OBJ_F64BUF` + unboxed `OBJ_STRUCT_BUF` tables, CSR graph
+ *     W^X `x86_64` SSE2 + `ARM64` (`A64`) native JIT, two-generation nursery GC,
+ *     zero-copy `OBJ_BYTES`/`OBJ_F64BUF` + unboxed `OBJ_STRUCT_BUF` tables,
+ *     HTTP/1.1 Keep-Alive/chunked/streaming/multipart + UDP sockets, CSR graph
  *     kernels, 3D PBR rasterizer, per-module call-stack capabilities, VM taint
- *     tracking, deterministic `.pbrec` flight-recorder/replay, unrestricted
- *     10-arg FFI + C callbacks, OS anti-screenshot shield & 320+ host builtins
- *   - Unified native CLI: `run`, `repl`, `test`, `check`, `fmt`, `doc`, `lsp`,
- *     `debug`, `prof`, `replay`, `shield-inspect`, `build` (`--aot-native`,
- *     `--freestanding`, `--target baremetal-x64|baremetal-x86`, `--bundle-exe`)
+ *     tracking, deterministic `.pbrec` flight-recorder/replay, zero-overhead
+ *     line/branch coverage engine, unrestricted 10-arg FFI + C callbacks,
+ *     OS anti-screenshot shield & 335+ host builtins
+ *   - Unified native CLI: `run`, `repl`, `test` (`--coverage`), `fuzz`, `check`,
+ *     `fmt`, `doc`, `lsp` (workspace v4.2), `debug`, `prof`, `replay`,
+ *     `shield-inspect`, `build` (`--aot-native`, `--freestanding`, `--bundle-exe`)
  *
  * Linux build:
  *   gcc -std=c99 -O3 -Wall -Wextra -Wno-unused-parameter \
  *       runtime_stage3/pblang_zero_rust_vm.c -ldl -lpthread -lm -o pblang
  *
  * Windows PE32+ cross-build:
- *   x86_64-w64-mingw32-gcc -std=c99 -O3 -Wall -Wno-unused-parameter \
+ *   x86_64-w64-mingw32-gcc -std=c99 -O2 -fno-strict-aliasing -mstackrealign \
  *       runtime_stage3/pblang_zero_rust_vm.c \
- *       -lws2_32 -lwinhttp -lgdi32 -luser32 -lbcrypt -o pblang.exe
+ *       -lws2_32 -lwinhttp -lgdi32 -luser32 -lcrypt32 -lbcrypt -lm -o pblang.exe
  * ============================================================================ */
 
 #include "zr_builtins_core.h"
@@ -33,9 +36,10 @@
 #include <fcntl.h>
 #else
 #include <dirent.h>
+#include <sys/resource.h>
 #endif
 
-#define PBLANG_ZR_VERSION_STR "pblang 4.1.0 (sovereign zero-rust runtime; compat 1.5.0)"
+#define PBLANG_ZR_VERSION_STR "pblang 4.2.0 (sovereign zero-rust runtime; compat 1.5.0)"
 
 static void zr_print_version(void) {
     printf("%s\n", PBLANG_ZR_VERSION_STR);
@@ -49,7 +53,8 @@ static void zr_print_help(const char *prog) {
     printf("  %s run [flags] <file.sapp|file.pbck> [args...]      Execute with explicit flags\n", p);
     printf("  %s -e <code_string> [args...]                       Evaluate inline pblang code\n", p);
     printf("  %s repl                                             Interactive native PBLang REPL\n", p);
-    printf("  %s test [flags] [files_or_dirs...]                  Run test suites (`fn test_*` & scripts)\n", p);
+    printf("  %s test [--coverage] [--coverage-json <f>] [--coverage-html <f>] [files_or_dirs...]\n", p);
+    printf("  %s fuzz <file.sapp> [--iterations N] [--seed S] [--json]   Property & crash fuzzer\n", p);
     printf("  %s check [--strict] [--syntax-only] <file.sapp>     Compile-check & verify `.sapp` (`@nogc`)\n", p);
     printf("  %s fmt [--write] [--check] <files...>               Format `.sapp` source files\n", p);
     printf("  %s doc [-o <out.md>] <file.sapp>                    Generate Markdown API documentation\n", p);
@@ -71,7 +76,7 @@ static void zr_print_help(const char *prog) {
     printf("  --allow-all               Enable all host capabilities (default unless --sandbox)\n");
     printf("  --sandbox                 Restrict host I/O unless specific --allow-* flags are given\n");
     printf("  --allow-fs / --deny-fs    Allow or deny filesystem read/write operations\n");
-    printf("  --allow-net / --deny-net  Allow or deny TCP/TLS socket operations\n");
+    printf("  --allow-net / --deny-net  Allow or deny TCP/TLS/UDP socket operations\n");
     printf("  --allow-http              Allow HTTP/HTTPS client & AI provider requests\n");
     printf("  --allow-sqlite            Allow native SQLite3 database operations\n");
     printf("  --allow-ffi               Allow dynamic shared-library FFI loading\n");
@@ -84,6 +89,9 @@ static void zr_print_help(const char *prog) {
     printf("  --record <file.pbrec>     Record non-deterministic syscalls to `.pbrec` trace\n");
     printf("  --stdlib <dir>            Override stdlib directory path\n");
     printf("  --filter <substr>         Filter `test_*` functions / test file paths\n");
+    printf("  --coverage                Collect bytecode line & branch coverage in `pblang test`\n");
+    printf("  --coverage-json <file>    Export coverage report as JSON (`pblang-coverage-v1`)\n");
+    printf("  --coverage-html <file>    Export self-contained dark-mode interactive HTML coverage report\n");
     printf("  -q, --quiet               Compact test output\n");
 }
 
@@ -667,7 +675,7 @@ static bool zr_emit_web_bundle(const char *input_path, const uint8_t *pbck_bytes
 
     /* 2. Emit `pblang_web_host.js` */
     static const char *js_code =
-        "// PBLang v4.1.0 WebAssembly Host Loader\n"
+        "// PBLang v4.2.0 WebAssembly Host Loader\n"
         "export async function loadPBLangWasm(wasmUrl = './app.wasm') {\n"
         "  const resp = await fetch(wasmUrl);\n"
         "  const bytes = await resp.arrayBuffer();\n"
@@ -690,9 +698,9 @@ static bool zr_emit_web_bundle(const char *input_path, const uint8_t *pbck_bytes
     fprintf(hf,
         "<!doctype html>\n"
         "<html lang=\"en\">\n"
-        "<head><meta charset=\"utf-8\"/><title>PBLang 4.1.0 Web App</title></head>\n"
+        "<head><meta charset=\"utf-8\"/><title>PBLang 4.2.0 Web App</title></head>\n"
         "<body style=\"background:#0f172a;color:#f8fafc;font-family:monospace;padding:24px\">\n"
-        "  <h2>PBLang v4.1.0 WebAssembly Target</h2>\n"
+        "  <h2>PBLang v4.2.0 WebAssembly Target</h2>\n"
         "  <pre id=\"out\">Loading app.wasm (%s)...</pre>\n"
         "  <script type=\"module\">\n"
         "    import { loadPBLangWasm } from './pblang_web_host.js';\n"
@@ -1543,11 +1551,12 @@ static int zr_cmd_doc(int argc, char **argv) {
 
 /* ---- `pblang lsp` Native Stdio JSON-RPC 2.0 Language Server ---- */
 
-static void zr_lsp_send(const char *json_payload) {
+static bool zr_lsp_send(const char *json_payload) {
     size_t len = strlen(json_payload);
-    fprintf(stdout, "Content-Length: %zu\r\n\r\n", len);
-    fwrite(json_payload, 1, len, stdout);
-    fflush(stdout);
+    if (fprintf(stdout, "Content-Length: %zu\r\n\r\n", len) < 0) return false;
+    if (len > 0 && fwrite(json_payload, 1, len, stdout) != len) return false;
+    if (fflush(stdout) != 0 || ferror(stdout)) return false;
+    return true;
 }
 
 static void zr_lsp_json_escape(ZrBuf *b, const char *s) {
@@ -1599,19 +1608,56 @@ static void zr_lsp_publish_diagnostics(PbVM *vm, const char *uri, const char *te
     }
 
     zr_buf_append_cstr(&msg, "]}}");
-    zr_lsp_send(msg.data ? msg.data : "{}");
+    (void)zr_lsp_send(msg.data ? msg.data : "{}");
     zr_buf_free(&msg);
     vm_free(&cvm);
+}
+
+static bool zr_mod_get_export(PbValue mod_val, const char *name, PbValue *out) {
+    if (is_obj_type(mod_val, OBJ_MODULE)) {
+        PbModule *m = (PbModule *)val_as_obj(mod_val);
+        if (m->exports && pb_map_get_cstr(m->exports, name, out)) return true;
+        if (m->globals && pb_map_get_cstr(m->globals, name, out)) return true;
+    } else if (is_obj_type(mod_val, OBJ_MAP)) {
+        if (pb_map_get_cstr(AS_MAP(mod_val), name, out)) return true;
+    }
+    return false;
 }
 
 static int zr_cmd_lsp(const char *self_exe) {
 #ifdef _WIN32
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
+#elif defined(SIGPIPE)
+    signal(SIGPIPE, SIG_IGN);
 #endif
     PbVM vm;
     vm_init(&vm);
+    zr_caps_allow_all(&vm.caps);
     zr_configure_vm_paths(&vm, self_exe, NULL, NULL);
+
+    /* Attempt pure-PBLang v4.2 Workspace LSP engine (`stdlib:devtools/workspace_lsp_v42.sapp`) */
+    bool has_pure_lsp = false;
+    PbValue lsp_mod = val_nil(), lsp_create_fn = val_nil(), lsp_handle_fn = val_nil(), lsp_state = val_nil();
+    if (zr_vm_import_module_caps(&vm, "stdlib:devtools/workspace_lsp_v42", NULL, CAP_ALL, &lsp_mod)) {
+        vm_push_root(&vm, lsp_mod);
+        if (zr_mod_get_export(lsp_mod, "create_workspace_lsp", &lsp_create_fn) &&
+            zr_mod_get_export(lsp_mod, "lsp_handle_message", &lsp_handle_fn)) {
+            vm_push_root(&vm, lsp_handle_fn);
+            if (vm_call_value_sync(&vm, lsp_create_fn, 0, NULL, &lsp_state) && is_obj_type(lsp_state, OBJ_MAP)) {
+                vm_push_root(&vm, lsp_state);
+                has_pure_lsp = true;
+            } else {
+                vm_pop_roots(&vm, 2);
+                vm.err_msg[0] = '\0';
+            }
+        } else {
+            vm_pop_roots(&vm, 1);
+            vm.err_msg[0] = '\0';
+        }
+    } else {
+        vm.err_msg[0] = '\0';
+    }
 
     char hdr[512];
     bool shutdown_seen = false;
@@ -1652,6 +1698,35 @@ static int zr_cmd_lsp(const char *self_exe) {
         pb_map_get_cstr(rm, "params", &params_v);
         const char *method = is_obj_type(method_v, OBJ_STR) ? AS_STR(method_v)->chars : "";
 
+        if (has_pure_lsp) {
+            bool is_exit = (strcmp(method, "exit") == 0);
+            bool pipe_ok = true;
+            if (strcmp(method, "shutdown") == 0) shutdown_seen = true;
+            PbValue call_args[2] = { lsp_state, req };
+            PbValue resp_val = val_nil();
+            vm.err_msg[0] = '\0';
+            if (vm_call_value_sync(&vm, lsp_handle_fn, 2, call_args, &resp_val)) {
+                if (resp_val.tag != VAL_NIL) {
+                    vm_push_root(&vm, resp_val);
+                    PbValue jstr = val_nil();
+                    if (bi_json_stringify(&vm, 1, &resp_val, &jstr) && is_obj_type(jstr, OBJ_STR)) {
+                        pipe_ok = zr_lsp_send(AS_STR(jstr)->chars);
+                    }
+                    vm_pop_roots(&vm, 1);
+                }
+                PbValue out_notifs = val_nil();
+                if (pb_map_get_cstr(AS_MAP(lsp_state), "outgoing_notifications", &out_notifs) &&
+                    is_obj_type(out_notifs, OBJ_ARRAY)) {
+                    AS_ARRAY(out_notifs)->len = 0;
+                }
+            } else {
+                vm.err_msg[0] = '\0';
+            }
+            vm_pop_roots(&vm, 1); /* req */
+            if (is_exit || !pipe_ok) break;
+            continue;
+        }
+
         ZrBuf id_json;
         zr_buf_init(&id_json);
         if (has_id) {
@@ -1666,9 +1741,15 @@ static int zr_cmd_lsp(const char *self_exe) {
             zr_buf_printf(&resp,
                 "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"capabilities\":{"
                 "\"textDocumentSync\":1,"
+                "\"definitionProvider\":true,"
+                "\"referencesProvider\":true,"
+                "\"renameProvider\":{\"prepareProvider\":true},"
                 "\"hoverProvider\":true,"
-                "\"completionProvider\":{\"triggerCharacters\":[\".\",\"_\"]}"
-                "},\"serverInfo\":{\"name\":\"pblang-lsp\",\"version\":\"%s\"}}}",
+                "\"documentSymbolProvider\":true,"
+                "\"inlayHintProvider\":true,"
+                "\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},"
+                "\"completionProvider\":{\"triggerCharacters\":[\".\",\":\",\"@\",\"\\\"\"]}"
+                "},\"serverInfo\":{\"name\":\"pblang-workspace-lsp\",\"version\":\"%s\"}}}",
                 id_json.data ? id_json.data : "0", PBLANG_ZR_VERSION);
             zr_lsp_send(resp.data);
             zr_buf_free(&resp);
@@ -1711,7 +1792,7 @@ static int zr_cmd_lsp(const char *self_exe) {
             static const char *kws[] = {
                 "fn", "let", "const", "if", "else", "while", "for", "in", "return",
                 "import", "with", "caps", "requires", "ensures", "comptime",
-                "try", "catch", "defer", "class", "struct", "enum", "match", "spawn"
+                "try", "catch", "defer", "class", "struct", "enum", "trait", "interface", "match", "spawn"
             };
             ZrBuf resp;
             zr_buf_init(&resp);
@@ -1752,6 +1833,7 @@ static int zr_cmd_lsp(const char *self_exe) {
         vm_pop_roots(&vm, 1);
     }
 
+    if (has_pure_lsp) vm_pop_roots(&vm, 3);
     vm_free(&vm);
     return shutdown_seen ? 0 : 0;
 }
@@ -1973,6 +2055,62 @@ static bool zr_root_chunk_calls_global(const PbFunc *root_fn, const char *name) 
     return false;
 }
 
+static bool zr_write_cstr_file(const char *path, const char *data, size_t len) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return false;
+    bool ok = (len == 0) || (fwrite(data, 1, len, fp) == len);
+    fclose(fp);
+    return ok;
+}
+
+static void zr_write_fallback_cov_html(const char *html_path, const ZrCovTable *tbl,
+                                       uint64_t tot_l, uint64_t cov_l, double lpct,
+                                       uint64_t tot_b, uint64_t cov_b, double bpct) {
+    ZrBuf hb;
+    zr_buf_init(&hb);
+    zr_buf_printf(&hb,
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<title>PBLang Coverage Report</title>"
+        "<style>body{background:#0f172a;color:#e2e8f0;font-family:ui-monospace,monospace;padding:24px}"
+        "table{border-collapse:collapse;width:100%%;margin-top:16px}"
+        "th,td{border:1px solid #334155;padding:8px 12px;text-align:left}"
+        "th{background:#1e293b}.ok{color:#4ade80}.warn{color:#facc15}</style></head><body>"
+        "<h1>PBLang v%s Coverage Report</h1>"
+        "<p>Lines: <b>%llu / %llu (%.1f%%)</b> &nbsp;|&nbsp; Branches: <b>%llu / %llu (%.1f%%)</b></p>"
+        "<table><tr><th>File</th><th>Lines</th><th>Line %%</th><th>Branches</th><th>Branch %%</th></tr>",
+        PBLANG_ZR_VERSION,
+        (unsigned long long)cov_l, (unsigned long long)tot_l, lpct,
+        (unsigned long long)cov_b, (unsigned long long)tot_b, bpct);
+    if (tbl) {
+        for (size_t fi = 0; fi < tbl->file_len; fi++) {
+            const ZrCovFile *cf = &tbl->files[fi];
+            if (!cf->path) continue;
+            uint64_t fl_tot = 0, fl_cov = 0;
+            for (size_t ln = 1; ln < cf->line_cap; ln++) {
+                if (cf->line_exec[ln] || cf->line_hits[ln] > 0) {
+                    fl_tot++;
+                    if (cf->line_hits[ln] > 0) fl_cov++;
+                }
+            }
+            uint64_t fb_tot = (uint64_t)cf->branch_len * 2ULL, fb_cov = 0;
+            for (size_t bi = 0; bi < cf->branch_len; bi++) {
+                if (cf->branches[bi].taken_hits > 0) fb_cov++;
+                if (cf->branches[bi].not_taken_hits > 0) fb_cov++;
+            }
+            double flp = fl_tot > 0 ? (100.0 * (double)fl_cov / (double)fl_tot) : 100.0;
+            double fbp = fb_tot > 0 ? (100.0 * (double)fb_cov / (double)fb_tot) : 100.0;
+            zr_buf_printf(&hb,
+                "<tr><td>%s</td><td>%llu/%llu</td><td>%.1f%%</td><td>%llu/%llu</td><td>%.1f%%</td></tr>",
+                cf->path,
+                (unsigned long long)fl_cov, (unsigned long long)fl_tot, flp,
+                (unsigned long long)fb_cov, (unsigned long long)fb_tot, fbp);
+        }
+    }
+    zr_buf_append_cstr(&hb, "</table></body></html>\n");
+    if (hb.data) zr_write_cstr_file(html_path, hb.data, hb.len);
+    zr_buf_free(&hb);
+}
+
 static int zr_cmd_test(const char *self_exe, int argc, char **argv) {
     ZrCaps caps;
     zr_caps_allow_all(&caps);
@@ -1981,6 +2119,9 @@ static int zr_cmd_test(const char *self_exe, int argc, char **argv) {
     const char *filter = NULL;
     bool quiet = false;
     bool strict_taint = false;
+    bool enable_cov = false;
+    const char *cov_json_path = NULL;
+    const char *cov_html_path = NULL;
     ZrTestFileList inputs = { NULL, 0, 0 };
 
     for (int i = 0; i < argc; i++) {
@@ -1992,6 +2133,14 @@ static int zr_cmd_test(const char *self_exe, int argc, char **argv) {
             stdlib_override = argv[++i];
         } else if (strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
             filter = argv[++i];
+        } else if (strcmp(argv[i], "--coverage") == 0) {
+            enable_cov = true;
+        } else if (strcmp(argv[i], "--coverage-json") == 0 && i + 1 < argc) {
+            cov_json_path = argv[++i];
+            enable_cov = true;
+        } else if (strcmp(argv[i], "--coverage-html") == 0 && i + 1 < argc) {
+            cov_html_path = argv[++i];
+            enable_cov = true;
         } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
             quiet = true;
         } else if (argv[i][0] != '-') {
@@ -2020,6 +2169,11 @@ static int zr_cmd_test(const char *self_exe, int argc, char **argv) {
         return 1;
     }
 
+    ZrCovTable shared_cov;
+    zr_cov_table_init(&shared_cov);
+    char discovered_stdlib[4096];
+    discovered_stdlib[0] = '\0';
+
     size_t passed_units = 0, failed_units = 0;
     double t0 = zr_mono_sec();
 
@@ -2030,6 +2184,14 @@ static int zr_cmd_test(const char *self_exe, int argc, char **argv) {
         vm.caps = caps;
         if (strict_taint) vm.taint_guard_enabled = true;
         zr_configure_vm_paths(&vm, self_exe, fpath, stdlib_override);
+        if (discovered_stdlib[0] == '\0' && vm.stdlib_root && vm.stdlib_root[0]) {
+            snprintf(discovered_stdlib, sizeof(discovered_stdlib), "%s", vm.stdlib_root);
+        }
+        if (enable_cov) {
+            vm.cov_table = &shared_cov;
+            vm.cov_owns_table = false;
+            vm.cov_enabled = true;
+        }
         vm.cli_argc = 1;
         vm.cli_argv = &files.paths[fi];
 
@@ -2042,6 +2204,7 @@ static int zr_cmd_test(const char *self_exe, int argc, char **argv) {
             vm_free(&vm);
             continue;
         }
+        if (enable_cov) zr_cov_register_func(&shared_cov, fn);
 
         vm_push_root(&vm, val_obj(fn));
         zr_populate_polyglot_globals(&vm, vm.globals, fn);
@@ -2050,6 +2213,7 @@ static int zr_cmd_test(const char *self_exe, int argc, char **argv) {
         if (!top_ok || (vm.exited && vm.exit_code != 0)) {
             fprintf(stderr, "FAIL %s: %s\n", fpath, vm.err_msg[0] ? vm.err_msg : "top-level exited non-zero");
             failed_units++;
+            if (enable_cov) zr_cov_scan_vm_objects(&vm);
             vm_pop_roots(&vm, 1);
             zr_flight_cleanup_vm(&vm);
             vm_free(&vm);
@@ -2101,9 +2265,45 @@ static int zr_cmd_test(const char *self_exe, int argc, char **argv) {
             free(fn_names);
         }
 
+        if (enable_cov) zr_cov_scan_vm_objects(&vm);
         vm_pop_roots(&vm, 1);
         zr_flight_cleanup_vm(&vm);
         vm_free(&vm);
+    }
+
+    /* Filter out internal stdlib helper files when none of the target test files reside in stdlib */
+    if (enable_cov && discovered_stdlib[0] != '\0') {
+        size_t slen = strlen(discovered_stdlib);
+        bool testing_stdlib = false;
+        for (size_t i = 0; i < files.len; i++) {
+            char cpath[4096];
+            zr_canonicalize_path(files.paths[i], cpath);
+            if (strncmp(cpath, discovered_stdlib, slen) == 0) { testing_stdlib = true; break; }
+        }
+        if (!testing_stdlib) {
+            size_t non_std = 0;
+            for (size_t fi = 0; fi < shared_cov.file_len; fi++) {
+                if (shared_cov.files[fi].path && strncmp(shared_cov.files[fi].path, discovered_stdlib, slen) != 0) {
+                    non_std++;
+                }
+            }
+            if (non_std > 0) {
+                size_t dst = 0;
+                for (size_t fi = 0; fi < shared_cov.file_len; fi++) {
+                    if (shared_cov.files[fi].path && strncmp(shared_cov.files[fi].path, discovered_stdlib, slen) == 0) {
+                        free(shared_cov.files[fi].path);
+                        free(shared_cov.files[fi].line_hits);
+                        free(shared_cov.files[fi].line_exec);
+                        free(shared_cov.files[fi].branches);
+                    } else {
+                        if (dst != fi) shared_cov.files[dst] = shared_cov.files[fi];
+                        dst++;
+                    }
+                }
+                shared_cov.file_len = dst;
+                shared_cov.last_file_idx = -1;
+            }
+        }
     }
 
     for (size_t i = 0; i < files.len; i++) free(files.paths[i]);
@@ -2111,7 +2311,203 @@ static int zr_cmd_test(const char *self_exe, int argc, char **argv) {
 
     double elapsed_ms = (zr_mono_sec() - t0) * 1000.0;
     printf("Test summary: %zu passed, %zu failed (%.1f ms)\n", passed_units, failed_units, elapsed_ms);
+
+    if (enable_cov) {
+        PbVM rep_vm;
+        vm_init(&rep_vm);
+        zr_caps_allow_all(&rep_vm.caps);
+        zr_configure_vm_paths(&rep_vm, self_exe, NULL, stdlib_override);
+
+        PbValue snap = zr_build_coverage_snapshot_map(&rep_vm, &shared_cov, true);
+        vm_push_root(&rep_vm, snap);
+
+        PbMap *sm = AS_MAP(snap);
+        PbValue v_lt = val_nil(), v_lc = val_nil(), v_lp = val_nil();
+        PbValue v_bt = val_nil(), v_bc = val_nil(), v_bp = val_nil();
+        pb_map_get_cstr(sm, "lines_total", &v_lt);
+        pb_map_get_cstr(sm, "lines_covered", &v_lc);
+        pb_map_get_cstr(sm, "line_pct", &v_lp);
+        pb_map_get_cstr(sm, "branches_total", &v_bt);
+        pb_map_get_cstr(sm, "branches_covered", &v_bc);
+        pb_map_get_cstr(sm, "branch_pct", &v_bp);
+
+        uint64_t tot_l = v_lt.tag == VAL_NUM ? (uint64_t)v_lt.as.num : 0;
+        uint64_t cov_l = v_lc.tag == VAL_NUM ? (uint64_t)v_lc.as.num : 0;
+        double   lpct  = v_lp.tag == VAL_NUM ? v_lp.as.num : 100.0;
+        uint64_t tot_b = v_bt.tag == VAL_NUM ? (uint64_t)v_bt.as.num : 0;
+        uint64_t cov_b = v_bc.tag == VAL_NUM ? (uint64_t)v_bc.as.num : 0;
+        double   bpct  = v_bp.tag == VAL_NUM ? v_bp.as.num : 100.0;
+
+        printf("Coverage: %llu/%llu lines (%.1f%%), %llu/%llu branches (%.1f%%)\n",
+               (unsigned long long)cov_l, (unsigned long long)tot_l, lpct,
+               (unsigned long long)cov_b, (unsigned long long)tot_b, bpct);
+
+        if (cov_json_path || cov_html_path) {
+            bool wrote_json = false, wrote_html = false;
+            PbValue cov_mod = val_nil();
+            if (zr_vm_import_module_caps(&rep_vm, "stdlib:devtools/coverage_and_fuzzer", NULL, CAP_ALL, &cov_mod)) {
+                vm_push_root(&rep_vm, cov_mod);
+                PbValue fn_an = val_nil(), fn_js = val_nil(), fn_ht = val_nil(), rep_obj = val_nil();
+                if (zr_mod_get_export(cov_mod, "analyze_coverage_data", &fn_an) &&
+                    vm_call_value_sync(&rep_vm, fn_an, 1, &snap, &rep_obj)) {
+                    vm_push_root(&rep_vm, rep_obj);
+                    if (cov_json_path && zr_mod_get_export(cov_mod, "generate_coverage_json", &fn_js)) {
+                        PbValue js_out = val_nil();
+                        if (vm_call_value_sync(&rep_vm, fn_js, 1, &rep_obj, &js_out) && is_obj_type(js_out, OBJ_STR)) {
+                            wrote_json = zr_write_cstr_file(cov_json_path, AS_STR(js_out)->chars, AS_STR(js_out)->len);
+                        }
+                    }
+                    if (cov_html_path && zr_mod_get_export(cov_mod, "generate_coverage_html", &fn_ht)) {
+                        PbValue ht_out = val_nil();
+                        if (vm_call_value_sync(&rep_vm, fn_ht, 1, &rep_obj, &ht_out) && is_obj_type(ht_out, OBJ_STR)) {
+                            wrote_html = zr_write_cstr_file(cov_html_path, AS_STR(ht_out)->chars, AS_STR(ht_out)->len);
+                        }
+                    }
+                    vm_pop_roots(&rep_vm, 1); /* rep_obj */
+                }
+                vm_pop_roots(&rep_vm, 1); /* cov_mod */
+            }
+            rep_vm.err_msg[0] = '\0';
+
+            if (cov_json_path && !wrote_json) {
+                PbValue jpretty = val_nil();
+                if (bi_json_stringify(&rep_vm, 1, &snap, &jpretty) && is_obj_type(jpretty, OBJ_STR)) {
+                    zr_write_cstr_file(cov_json_path, AS_STR(jpretty)->chars, AS_STR(jpretty)->len);
+                }
+            }
+            if (cov_html_path && !wrote_html) {
+                zr_write_fallback_cov_html(cov_html_path, &shared_cov, tot_l, cov_l, lpct, tot_b, cov_b, bpct);
+            }
+        }
+
+        vm_pop_roots(&rep_vm, 1); /* snap */
+        vm_free(&rep_vm);
+    }
+    zr_cov_table_free(&shared_cov);
+
     return failed_units == 0 ? 0 : 1;
+}
+
+static int zr_cmd_fuzz(const char *self_exe, int argc, char **argv) {
+    const char *stdlib_override = NULL;
+    const char *target_file = NULL;
+    int max_iters = 300;
+    uint64_t seed = 1337;
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--stdlib") == 0 && i + 1 < argc) {
+            stdlib_override = argv[++i];
+        } else if ((strcmp(argv[i], "--iterations") == 0 || strcmp(argv[i], "--iters") == 0) && i + 1 < argc) {
+            max_iters = atoi(argv[++i]);
+            if (max_iters < 1) max_iters = 1;
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed = (uint64_t)strtoull(argv[++i], NULL, 10);
+        } else if (argv[i][0] != '-' && !target_file) {
+            target_file = argv[i];
+        }
+    }
+
+    if (!target_file) {
+        fprintf(stderr, "Usage: pblang fuzz <file.sapp> [--iterations N] [--seed S] [--json]\n");
+        return 1;
+    }
+
+    PbVM vm;
+    vm_init(&vm);
+    zr_caps_allow_all(&vm.caps);
+    zr_configure_vm_paths(&vm, self_exe, target_file, stdlib_override);
+
+    PbArray *fargs = pb_array_new(&vm, (size_t)argc + 2);
+    vm_push_root(&vm, val_obj(fargs));
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--stdlib") == 0 && i + 1 < argc) { i++; continue; }
+        if (strcmp(argv[i], "--iters") == 0) {
+            pb_array_push(&vm, fargs, val_obj(pb_str_c(&vm, "--iterations")));
+        } else {
+            pb_array_push(&vm, fargs, val_obj(pb_str_c(&vm, argv[i])));
+        }
+    }
+
+    PbValue cov_mod = val_nil();
+    if (zr_vm_import_module_caps(&vm, "stdlib:devtools/coverage_and_fuzzer", NULL, CAP_ALL, &cov_mod)) {
+        vm_push_root(&vm, cov_mod);
+        PbValue entry_fn = val_nil();
+        if (zr_mod_get_export(cov_mod, "cli_fuzz_entry", &entry_fn)) {
+            PbValue arg_v = val_obj(fargs);
+            PbValue rep_v = val_nil();
+            if (!vm_call_value_sync(&vm, entry_fn, 1, &arg_v, &rep_v)) {
+                fprintf(stderr, "pblang fuzz error: %s\n", vm.err_msg);
+                vm_pop_roots(&vm, 2);
+                vm_free(&vm);
+                return 1;
+            }
+            int rc = 0;
+            if (is_obj_type(rep_v, OBJ_MAP)) {
+                PbValue ok_v = val_nil(), bug_v = val_nil(), err_v = val_nil();
+                if (pb_map_get_cstr(AS_MAP(rep_v), "ok", &ok_v) && ok_v.tag == VAL_BOOL && !ok_v.as.b) {
+                    if (pb_map_get_cstr(AS_MAP(rep_v), "error", &err_v) && is_obj_type(err_v, OBJ_STR)) {
+                        fprintf(stderr, "%s\n", AS_STR(err_v)->chars);
+                    }
+                    rc = 1;
+                }
+                if (pb_map_get_cstr(AS_MAP(rep_v), "bug_found", &bug_v) && bug_v.tag == VAL_BOOL && bug_v.as.b) {
+                    rc = 1;
+                }
+            }
+            vm_pop_roots(&vm, 2);
+            vm_free(&vm);
+            return rc;
+        }
+        vm_pop_roots(&vm, 1);
+    }
+
+    /* Standalone fallback when stdlib is absent */
+    vm.err_msg[0] = '\0';
+    char lerr[512];
+    lerr[0] = '\0';
+    PbFunc *fn = zr_load_file_pbsh_aware(&vm, vm.current_file ? vm.current_file : target_file, lerr);
+    if (!fn) {
+        fprintf(stderr, "pblang fuzz: compile failed for '%s': %s\n", target_file, lerr);
+        vm_pop_roots(&vm, 1);
+        vm_free(&vm);
+        return 1;
+    }
+    vm_push_root(&vm, val_obj(fn));
+    PbValue top_ret = val_nil();
+    if (!vm_run_root_func(&vm, fn, NULL, &top_ret)) {
+        fprintf(stderr, "pblang fuzz: top-level failure in '%s': %s\n", target_file, vm.err_msg);
+        vm_pop_roots(&vm, 2);
+        vm_free(&vm);
+        return 1;
+    }
+    uint64_t rng = seed ? seed : 1337ULL;
+    size_t targets = 0;
+    for (size_t ei = 0; ei < vm.globals->used; ei++) {
+        PbMapEntry *me = &vm.globals->entries[ei];
+        if (!me->active || !me->key || !is_obj_type(me->val, OBJ_CLOSURE)) continue;
+        PbClosure *cl = AS_CLOSURE(me->val);
+        if (!cl->fn || cl->fn->arity == 0 || cl->fn->arity > 4) continue;
+        targets++;
+        for (int it = 0; it < max_iters; it++) {
+            PbValue args_buf[4];
+            for (uint32_t a = 0; a < cl->fn->arity; a++) {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                args_buf[a] = val_num((double)((int64_t)(rng % 2001ULL) - 1000));
+            }
+            PbValue out_v = val_nil();
+            vm.err_msg[0] = '\0';
+            if (!vm_call_value_sync(&vm, me->val, (int)cl->fn->arity, args_buf, &out_v)) {
+                fprintf(stderr, "FUZZ FAILURE in %s :: %s: %s\n", target_file, me->key->chars, vm.err_msg);
+                vm_pop_roots(&vm, 2);
+                vm_free(&vm);
+                return 1;
+            }
+        }
+    }
+    printf("FUZZ OK: %zu target(s) passed in %s\n", targets, target_file);
+    vm_pop_roots(&vm, 2);
+    vm_free(&vm);
+    return 0;
 }
 
 static int zr_cmd_doctor(const char *self_exe) {
@@ -2309,7 +2705,86 @@ static int zr_cmd_ip_tool(const char *self_exe, const char *action, int argc, ch
     return zr_cmd_eval(self_exe, eval_code, &icaps, stdlib_ov, 7, eargs);
 }
 
+static void zr_apply_host_oom_protection(int argc, char **argv) {
+    const char *disable = getenv("PBLANG_NO_OOM_SHIELD");
+    if (disable && (strcmp(disable, "1") == 0 || strcmp(disable, "true") == 0)) return;
+
+    bool is_daemon = false;
+    for (int i = 1; i < argc; i++) {
+        if (!argv[i]) continue;
+        if (strstr(argv[i], "serve") != NULL || strstr(argv[i], "stdio") != NULL || strcmp(argv[i], "lsp") == 0) {
+            is_daemon = true;
+            break;
+        }
+    }
+
+    uint64_t cap_bytes = is_daemon ? 1073741824ULL : 2684354560ULL;
+    const char *env_cap = getenv("PBLANG_MAX_AS");
+    if (!env_cap || !*env_cap) env_cap = getenv("PBLANG_MAX_MEM_BYTES");
+    if (env_cap && *env_cap) {
+        unsigned long long v = strtoull(env_cap, NULL, 10);
+        if (v >= (64ULL * 1024ULL * 1024ULL)) cap_bytes = (uint64_t)v;
+    }
+
+#if defined(__linux__)
+    if (!is_daemon) {
+        int target_adj = 850;
+        const char *env_adj = getenv("PBLANG_OOM_SCORE_ADJ");
+        if (env_adj && *env_adj) target_adj = atoi(env_adj);
+        if (target_adj < 0) target_adj = 0;
+        if (target_adj > 1000) target_adj = 1000;
+        int cur_adj = 0;
+        FILE *rf = fopen("/proc/self/oom_score_adj", "rb");
+        if (rf) {
+            char abuf[32];
+            size_t nr = fread(abuf, 1, sizeof(abuf) - 1, rf);
+            abuf[nr] = '\0';
+            cur_adj = atoi(abuf);
+            fclose(rf);
+        }
+        if (cur_adj < target_adj) {
+            FILE *wf = fopen("/proc/self/oom_score_adj", "wb");
+            if (wf) {
+                fprintf(wf, "%d\n", target_adj);
+                fclose(wf);
+            }
+        }
+    }
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_AS, &rl) == 0) {
+            uint64_t safe_cap = cap_bytes;
+            if (sizeof(rlim_t) <= 4 && safe_cap > 0x7FFFFFFFULL) safe_cap = 0x7FFFFFFFULL;
+            rlim_t want = (rlim_t)safe_cap;
+            if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max) want = rl.rlim_max;
+            if (rl.rlim_cur == RLIM_INFINITY || want < rl.rlim_cur) {
+                rl.rlim_cur = want;
+                (void)setrlimit(RLIMIT_AS, &rl);
+            }
+        }
+    }
+#elif defined(_WIN32)
+    {
+        HANDLE hJob = CreateJobObjectA(NULL, NULL);
+        if (hJob) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
+            memset(&jeli, 0, sizeof(jeli));
+            jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+            jeli.ProcessMemoryLimit = (SIZE_T)cap_bytes;
+            if (SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
+                (void)AssignProcessToJobObject(hJob, GetCurrentProcess());
+            } else {
+                CloseHandle(hJob);
+            }
+        }
+    }
+#else
+    (void)cap_bytes;
+#endif
+}
+
 int main(int argc, char **argv) {
+    zr_apply_host_oom_protection(argc, argv);
     zr_net_subsystem_init();
 
     char *self_exe = zr_resolve_self_exe(argc > 0 ? argv[0] : NULL);
@@ -2508,6 +2983,11 @@ int main(int argc, char **argv) {
     }
     if (strcmp(sub, "test") == 0) {
         int rc = zr_cmd_test(self_exe, argc - 2, argv + 2);
+        free(self_exe);
+        return rc;
+    }
+    if (strcmp(sub, "fuzz") == 0) {
+        int rc = zr_cmd_fuzz(self_exe, argc - 2, argv + 2);
         free(self_exe);
         return rc;
     }

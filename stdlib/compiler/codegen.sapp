@@ -58,6 +58,7 @@ fn Chunk() {
     return map{
         instructions: [],
         constants: [],
+        current_line: 0,
     };
 }
 
@@ -67,11 +68,18 @@ fn chunk_add_constant(chunk, value) {
 }
 
 fn chunk_write(chunk, instruction) {
+    if map_has(chunk, "current_line") and chunk.current_line > 0 and not map_has(instruction, "line") {
+        instruction.line = chunk.current_line;
+    }
     array_push(chunk.instructions, instruction);
 }
 
 fn chunk_write_op(chunk, opcode, operand) {
-    array_push(chunk.instructions, map{op: opcode, operand: operand});
+    if map_has(chunk, "current_line") and chunk.current_line > 0 {
+        array_push(chunk.instructions, map{op: opcode, operand: operand, line: chunk.current_line});
+    } else {
+        array_push(chunk.instructions, map{op: opcode, operand: operand});
+    }
 }
 
 // ── Code Generator ──────────────────────────────────────────────────────
@@ -305,6 +313,10 @@ fn codegen_literal(cg, node) {
         return;
     }
     if kind == "nil" {
+        if map_has(node, "is_catch_err_val") and node.is_catch_err_val == true {
+            codegen_var(cg, map{ kind: "var", name: "$catch_err_raw" });
+            return;
+        }
         let idx = chunk_add_constant(cg.chunk, nil);
         chunk_write_op(cg.chunk, OP_CONSTANT, idx);
         return;
@@ -358,6 +370,7 @@ fn _copy_locals(locals) {
 fn codegen_try(cg, node) {
     let body_start = cg.next_slot;
     let body_cg = CodeGen();
+    body_cg.chunk.current_line = cg.chunk.current_line;
     body_cg.locals = _copy_locals(cg.locals);
     body_cg.scope_depth = cg.scope_depth;
     // Subchunks execute in this frame's locals/upvalues, not a new function.
@@ -372,6 +385,7 @@ fn codegen_try(cg, node) {
     cg.next_slot = body_cg.next_slot;
 
     let handler_cg = CodeGen();
+    handler_cg.chunk.current_line = cg.chunk.current_line;
     handler_cg.locals = _copy_locals(cg.locals);
     handler_cg.scope_depth = cg.scope_depth;
     handler_cg.next_slot = cg.next_slot;
@@ -388,11 +402,16 @@ fn codegen_try(cg, node) {
         _cleanup_existing_slot(handler_cg, slot);
         slot = slot + 1;
     }
+    let catch_slot: any = nil;
+    if map_has(node, "catch_var") and node.catch_var != nil {
+        handler_cg.scope_depth = handler_cg.scope_depth + 1;
+        catch_slot = codegen_declare_local(handler_cg, "$catch_err_raw");
+    }
     codegen_expr(handler_cg, node.handler);
     chunk_write_op(handler_cg.chunk, OP_RETURN, 0);
     cg.next_slot = handler_cg.next_slot;
 
-    let idx = chunk_add_constant(cg.chunk, map{ try_chunk: body_cg.chunk, catch_chunk: handler_cg.chunk });
+    let idx = chunk_add_constant(cg.chunk, map{ try_chunk: body_cg.chunk, catch_chunk: handler_cg.chunk, catch_slot: catch_slot });
     chunk_write_op(cg.chunk, OP_TRY, idx);
 }
 
@@ -595,9 +614,9 @@ fn codegen_logical(cg, node) {
 // Explicit return/break/continue need the synthetic function boundary. User
 // functions also retain it: closures created in repeated blocks may escape and
 // must not share one reused local slot in native backends with reference captures.
-fn _block_needs_frame(node) {
+fn _block_needs_frame_cfg(node, allow_cf) {
     if is_array(node) {
-        for item in node { if _block_needs_frame(item) { return true; } }
+        for item in node { if _block_needs_frame_cfg(item, allow_cf) { return true; } }
     } else if is_map(node) {
         if map_has(node, "kind") {
             let kind = node.kind;
@@ -605,26 +624,31 @@ fn _block_needs_frame(node) {
                 return _inline_block_needs_frame(node);
             }
             if kind == "fn_lit" or kind == "fn" { return true; }
-            if kind == "return" or kind == "break" or kind == "continue" { return true; }
+            if not allow_cf and (kind == "return" or kind == "break" or kind == "continue") { return true; }
         }
-        for key in map_keys(node) { if _block_needs_frame(node[key]) { return true; } }
+        for key in map_keys(node) { if _block_needs_frame_cfg(node[key], allow_cf) { return true; } }
     }
     return false;
+}
+
+fn _block_needs_frame(node) {
+    return _block_needs_frame_cfg(node, false);
 }
 
 // Parser-generated value blocks can use caller slots directly. This preserves
 // scalar assignments that a by-value VM closure would otherwise lose, and
 // avoids allocating a closure, capture array and argument frame for each block.
 fn _inline_block_needs_frame(node) {
+    let allow_cf = map_has(node, "is_match_arm_block") and node.is_match_arm_block == true;
     let stmts = node.func.body.stmts;
     let count = len(stmts);
     if node.block_tail { count = count - 1; }
     let i = 0;
     while i < count {
-        if _block_needs_frame(stmts[i]) { return true; }
+        if _block_needs_frame_cfg(stmts[i], allow_cf) { return true; }
         i = i + 1;
     }
-    return node.block_tail and _block_needs_frame(stmts[count].value);
+    return node.block_tail and _block_needs_frame_cfg(stmts[count].value, allow_cf);
 }
 fn _codegen_inline_block(cg, node) {
     if _inline_block_needs_frame(node) { return false; }
@@ -717,6 +741,9 @@ fn codegen_map(cg, node) {
 /// Compile any expression
 fn codegen_expr(cg, node) {
     if node == nil { return; }
+    if is_map(node) and map_has(node, "line") and node.line > 0 {
+        cg.chunk.current_line = node.line;
+    }
     let kind = node.kind;
     
     if kind == "number" or kind == "string" or kind == "bool" or kind == "nil" {
@@ -766,6 +793,12 @@ fn codegen_expr(cg, node) {
     }
     if kind == "match" {
         codegen_match(cg, node);
+        return;
+    }
+    if kind == "assign" or kind == "assign_to" {
+        codegen_expr_stmt(cg, map{ kind: "expr_stmt", expr: node });
+        let idx_nil = chunk_add_constant(cg.chunk, nil);
+        chunk_write_op(cg.chunk, OP_CONSTANT, idx_nil);
         return;
     }
     if kind == "unary" {
@@ -1101,6 +1134,7 @@ fn codegen_finish(cg, parameter_count = 0) {
 fn codegen_fnlit(cg, node) {
     let inner_cg = CodeGen();
     inner_cg.parent = cg;   // enables capturing enclosing vars as upvalues
+    inner_cg.chunk.current_line = cg.chunk.current_line;
 
     let k = 0;
     while k < len(node["params"]) {
@@ -1133,6 +1167,7 @@ fn codegen_fn(cg, node) {
     // node = map{kind: "fn", name: "myfn", params: [...], body: [...]}
     let inner_cg = CodeGen();
     inner_cg.parent = cg;   // a nested named fn may capture enclosing vars too
+    inner_cg.chunk.current_line = if map_has(node, "line") and node.line > 0 { node.line } else { cg.chunk.current_line };
 
     let k = 0;
     while k < len(node.params) {
@@ -1248,6 +1283,9 @@ fn codegen_block(cg, block) {
 /// Compile a single statement
 fn codegen_stmt(cg, stmt) {
     if stmt == nil { return; }
+    if is_map(stmt) and map_has(stmt, "line") and stmt.line > 0 {
+        cg.chunk.current_line = stmt.line;
+    }
     let kind = stmt.kind;
     
     if kind == "let" {

@@ -1,0 +1,628 @@
+// stdlib/db/connection_pool_migrations.sapp — Bounded Pool & Versioned Migrations
+//
+// Provides:
+//   1. Bounded thread-safe connection pool (create_pool, with_conn) with mutex
+//      synchronization, min_idle pre-warming, health-ping validation on borrow,
+//      guaranteed try/catch release on exception, query latency telemetry, and
+//      secret-redacted DSN metadata.
+//   2. Tamper-evident versioned schema migrations (run_migrations,
+//      rollback_migration) backed by _pblang_schema_migrations(version, name,
+//      checksum_sha256, applied_at_ms) with constant-time SHA-256 drift detection
+//      and atomic BEGIN ... COMMIT / ROLLBACK execution.
+
+let SOV = import("stdlib:db/sovereign_unified_db.sapp");
+
+let DEFAULT_MAX_SIZE = 8;
+let DEFAULT_MIN_IDLE = 1;
+let DEFAULT_ACQUIRE_TIMEOUT_MS = 5000;
+let DEFAULT_MAX_LIFETIME_MS = 1800000;
+
+fn _opt(opts, key, fallback) {
+    if is_map(opts) and map_has(opts, key) and opts[key] != nil {
+        return opts[key];
+    }
+    return fallback;
+}
+
+fn _clamp_int(val, fallback, lo, hi) {
+    let n = try parse_number(str(val)) catch fallback;
+    if n == nil or n != num_floor(n) { n = fallback; }
+    if n < lo { n = lo; }
+    if n > hi { n = hi; }
+    return n;
+}
+
+fn parse_dsn(dsn) { return SOV.parse_dsn(dsn); }
+fn redact_dsn(dsn) { return SOV.redact_dsn(dsn); }
+
+fn is_pool(obj) {
+    return is_map(obj) and (try obj.format catch "") == "pblang.db.pool.v1";
+}
+
+// ── Connection Health Validation & Latency Instrumentation ───────────────────
+
+fn _ping_raw_conn(raw_conn) {
+    if raw_conn == nil { return false; }
+    if is_map(raw_conn) and map_has(raw_conn, "ping") and is_fn(raw_conn.ping) {
+        return try raw_conn.ping() catch false;
+    }
+    return try { raw_conn.query("SELECT 1", []); true } catch false;
+}
+
+fn _close_raw_conn(raw_conn) {
+    if raw_conn == nil { return false; }
+    if is_map(raw_conn) and map_has(raw_conn, "close") and is_fn(raw_conn.close) {
+        return try { raw_conn.close(); true } catch false;
+    }
+    return false;
+}
+
+fn _record_latency(pool, elapsed_ms, ok) {
+    mutex_lock(pool.mtx);
+    pool.queries_executed = pool.queries_executed + 1;
+    if not ok {
+        pool.query_errors = pool.query_errors + 1;
+    }
+    if elapsed_ms < 0 { elapsed_ms = 0; }
+    pool.total_latency_ms = pool.total_latency_ms + elapsed_ms;
+    if elapsed_ms > pool.max_latency_ms {
+        pool.max_latency_ms = elapsed_ms;
+    }
+    mutex_unlock(pool.mtx);
+}
+
+fn _wrap_lease(pool, slot) {
+    let raw = slot.raw;
+    let state = map{ released: false };
+
+    let lease = map{
+        format: "pblang.db.pool.lease.v1",
+        kind: try raw.kind catch "unknown",
+        slot_id: slot.id,
+        raw: raw
+    };
+
+    lease.exec = fn(sql, params = nil) {
+        if state.released { throw "db.pool: cannot use connection after release"; }
+        let t0 = now_ms();
+        let r = try map{ ok: true, v: raw.exec(sql, params) } catch map{ ok: false, v: nil };
+        _record_latency(pool, now_ms() - t0, r.ok);
+        if not r.ok {
+            slot.tainted = true;
+            throw "db.pool: exec failed on leased connection";
+        }
+        slot.tainted = false;
+        return r.v;
+    };
+
+    lease.query = fn(sql, params = nil) {
+        if state.released { throw "db.pool: cannot use connection after release"; }
+        let t0 = now_ms();
+        let r = try map{ ok: true, v: raw.query(sql, params) } catch map{ ok: false, v: nil };
+        _record_latency(pool, now_ms() - t0, r.ok);
+        if not r.ok {
+            slot.tainted = true;
+            throw "db.pool: query failed on leased connection";
+        }
+        slot.tainted = false;
+        return r.v;
+    };
+
+    lease.prepare = fn(sql) {
+        if state.released { throw "db.pool: cannot use connection after release"; }
+        let prep = raw.prepare(sql);
+        return map{
+            sql: sql,
+            exec: fn(params = nil) {
+                if state.released { throw "db.pool: cannot use prepared stmt after release"; }
+                let t0 = now_ms();
+                let r = try map{ ok: true, v: prep.exec(params) } catch map{ ok: false, v: nil };
+                _record_latency(pool, now_ms() - t0, r.ok);
+                if not r.ok { throw "db.pool: prepared exec failed"; }
+                return r.v;
+            },
+            query: fn(params = nil) {
+                if state.released { throw "db.pool: cannot use prepared stmt after release"; }
+                let t0 = now_ms();
+                let r = try map{ ok: true, v: prep.query(params) } catch map{ ok: false, v: nil };
+                _record_latency(pool, now_ms() - t0, r.ok);
+                if not r.ok { throw "db.pool: prepared query failed"; }
+                return r.v;
+            }
+        };
+    };
+
+    lease.last_insert_rowid = fn() {
+        if state.released { throw "db.pool: cannot use connection after release"; }
+        return raw.last_insert_rowid();
+    };
+
+    lease.transaction = fn(body_fn) {
+        if state.released { throw "db.pool: cannot use connection after release"; }
+        return raw.transaction(fn(_inner) { return body_fn(lease); });
+    };
+
+    lease.tx = fn(body_fn) {
+        if state.released { throw "db.pool: cannot use connection after release"; }
+        return raw.tx(fn(_inner) { return body_fn(lease); });
+    };
+
+    lease.savepoint = fn(name, body_fn) {
+        if state.released { throw "db.pool: cannot use connection after release"; }
+        return raw.savepoint(name, fn(_inner) { return body_fn(lease); });
+    };
+
+    lease.ping = fn() {
+        if state.released { return false; }
+        return _ping_raw_conn(raw);
+    };
+
+    lease.release = fn() {
+        if state.released { return false; }
+        state.released = true;
+        return _release_slot(pool, slot);
+    };
+
+    // Calling close() on a pooled lease safely returns it to the pool!
+    lease.close = fn() {
+        return lease.release();
+    };
+
+    return lease;
+}
+
+// ── Bounded Thread-Safe Pool Lifecycle ───────────────────────────────────────
+
+fn _new_slot(pool) {
+    let raw = pool.factory();
+    mutex_lock(pool.mtx);
+    pool.slot_seq = pool.slot_seq + 1;
+    let sid = pool.slot_seq;
+    pool.created_count = pool.created_count + 1;
+    mutex_unlock(pool.mtx);
+    return map{
+        id: sid,
+        raw: raw,
+        created_ms: now_ms(),
+        last_used_ms: now_ms(),
+        tainted: false
+    };
+}
+
+fn _release_slot(pool, slot) {
+    let should_close = false;
+    mutex_lock(pool.mtx);
+    pool.active_count = pool.active_count - 1;
+    if pool.active_count < 0 { pool.active_count = 0; }
+    pool.released_count = pool.released_count + 1;
+
+    let age = now_ms() - slot.created_ms;
+    if pool.closed or age > pool.max_lifetime_ms or len(pool.idle) >= pool.max_size {
+        should_close = true;
+        pool.evicted_count = pool.evicted_count + 1;
+    } else {
+        slot.last_used_ms = now_ms();
+        array_push(pool.idle, slot);
+    }
+    mutex_unlock(pool.mtx);
+
+    if should_close {
+        _close_raw_conn(slot.raw);
+    }
+    return true;
+}
+
+fn _acquire_lease(pool) {
+    let deadline = now_ms() + pool.acquire_timeout_ms;
+
+    while true {
+        let candidate = nil;
+        let can_create = false;
+
+        mutex_lock(pool.mtx);
+        if pool.closed {
+            mutex_unlock(pool.mtx);
+            throw "db.pool: connection pool is closed";
+        }
+        if len(pool.idle) > 0 {
+            candidate = array_pop(pool.idle);
+            pool.active_count = pool.active_count + 1;
+        } elif pool.active_count < pool.max_size {
+            pool.active_count = pool.active_count + 1;
+            can_create = true;
+        }
+        mutex_unlock(pool.mtx);
+
+        if candidate != nil {
+            let age = now_ms() - candidate.created_ms;
+            let healthy = age <= pool.max_lifetime_ms;
+            if healthy and pool.validate_on_borrow {
+                healthy = _ping_raw_conn(candidate.raw);
+            }
+            if healthy {
+                mutex_lock(pool.mtx);
+                pool.borrowed_count = pool.borrowed_count + 1;
+                mutex_unlock(pool.mtx);
+                candidate.tainted = false;
+                return _wrap_lease(pool, candidate);
+            }
+            // Stale/broken idle connection: close & retry immediately
+            _close_raw_conn(candidate.raw);
+            mutex_lock(pool.mtx);
+            pool.active_count = pool.active_count - 1;
+            pool.evicted_count = pool.evicted_count + 1;
+            mutex_unlock(pool.mtx);
+            continue;
+        }
+
+        if can_create {
+            let created = try map{ ok: true, slot: _new_slot(pool) } catch map{ ok: false, slot: nil };
+            if not created.ok {
+                mutex_lock(pool.mtx);
+                pool.active_count = pool.active_count - 1;
+                mutex_unlock(pool.mtx);
+                throw "db.pool: failed to open new backend connection";
+            }
+            mutex_lock(pool.mtx);
+            pool.borrowed_count = pool.borrowed_count + 1;
+            mutex_unlock(pool.mtx);
+            return _wrap_lease(pool, created.slot);
+        }
+
+        if now_ms() >= deadline {
+            throw "db.pool: acquire timeout (" + str(pool.acquire_timeout_ms) + "ms) — pool exhausted at max_size=" + str(pool.max_size);
+        }
+        sleep_ms(5);
+    }
+}
+
+fn with_conn(pool, callback_fn) {
+    if not is_pool(pool) {
+        throw "db.pool.with_conn: valid pool required";
+    }
+    let lease = _acquire_lease(pool);
+    let outcome = try map{ ok: true, value: callback_fn(lease) } catch map{ ok: false, value: nil };
+    try lease.release() catch nil;
+    if not outcome.ok {
+        throw "db.pool.with_conn: callback threw error (connection safely released to pool)";
+    }
+    return outcome.value;
+}
+
+fn with_conn_result(pool, callback_fn) {
+    if not is_pool(pool) {
+        return map{ ok: false, error: "invalid pool" };
+    }
+    let lease = try _acquire_lease(pool) catch nil;
+    if lease == nil {
+        return map{ ok: false, error: "pool acquire failed or timed out", released: true };
+    }
+    let outcome = try map{ ok: true, value: callback_fn(lease) } catch map{ ok: false, value: nil };
+    let rel = try lease.release() catch false;
+    return map{
+        ok: outcome.ok,
+        value: outcome.value,
+        released: rel,
+        error: if outcome.ok { nil } else { "callback threw error" }
+    };
+}
+
+fn pool_stats(pool) {
+    mutex_lock(pool.mtx);
+    let q = pool.queries_executed;
+    let avg = if q == 0 { 0.0 } else { pool.total_latency_ms / q };
+    let snap = map{
+        format: "pblang.db.pool.stats.v1",
+        redacted_dsn: pool.redacted_dsn,
+        closed: pool.closed,
+        max_size: pool.max_size,
+        min_idle: pool.min_idle,
+        active_connections: pool.active_count,
+        idle_connections: len(pool.idle),
+        in_use: pool.active_count,
+        idle: len(pool.idle),
+        created_connections: pool.created_count,
+        evicted_connections: pool.evicted_count,
+        borrowed_count: pool.borrowed_count,
+        released_count: pool.released_count,
+        queries_executed: q,
+        query_errors: pool.query_errors,
+        total_latency_ms: pool.total_latency_ms,
+        avg_latency_ms: avg,
+        max_latency_ms: pool.max_latency_ms
+    };
+    mutex_unlock(pool.mtx);
+    return snap;
+}
+
+fn close_pool(pool) {
+    if not is_pool(pool) { return false; }
+    mutex_lock(pool.mtx);
+    if pool.closed {
+        mutex_unlock(pool.mtx);
+        return false;
+    }
+    pool.closed = true;
+    let to_close = pool.idle;
+    pool.idle = [];
+    mutex_unlock(pool.mtx);
+
+    let i = 0;
+    while i < len(to_close) {
+        _close_raw_conn(to_close[i].raw);
+        i = i + 1;
+    }
+    return true;
+}
+
+fn create_pool(driver_spec, opts = nil) {
+    let max_size = _clamp_int(_opt(opts, "max_size", DEFAULT_MAX_SIZE), DEFAULT_MAX_SIZE, 1, 256);
+    let min_idle = _clamp_int(_opt(opts, "min_idle", DEFAULT_MIN_IDLE), DEFAULT_MIN_IDLE, 0, max_size);
+    let acquire_timeout_ms = _clamp_int(_opt(opts, "acquire_timeout_ms", DEFAULT_ACQUIRE_TIMEOUT_MS), DEFAULT_ACQUIRE_TIMEOUT_MS, 1, 600000);
+    let max_lifetime_ms = _clamp_int(_opt(opts, "max_lifetime_ms", DEFAULT_MAX_LIFETIME_MS), DEFAULT_MAX_LIFETIME_MS, 100, 86400000);
+    let validate_on_borrow = _opt(opts, "validate_on_borrow", true) == true;
+
+    let factory = nil;
+    let redacted = "[CUSTOM_FACTORY]";
+    if is_fn(driver_spec) {
+        factory = driver_spec;
+    } elif type(driver_spec) == "string" {
+        redacted = redact_dsn(driver_spec);
+        factory = fn() { return SOV.open(driver_spec, opts); };
+    } elif is_map(driver_spec) {
+        let bname = str(_opt(driver_spec, "backend", _opt(driver_spec, "driver", "memory")));
+        let hname = str(_opt(driver_spec, "host", _opt(driver_spec, "namespace", _opt(driver_spec, "path", "local"))));
+        redacted = bname + "://" + hname;
+        factory = fn() { return SOV.open(driver_spec, opts); };
+    } else {
+        throw "db.pool.create_pool: driver_spec must be a DSN string, options map, or factory fn";
+    }
+
+    let pool = map{
+        format: "pblang.db.pool.v1",
+        mtx: mutex_new(),
+        factory: factory,
+        redacted_dsn: redacted,
+        closed: false,
+        max_size: max_size,
+        min_idle: min_idle,
+        acquire_timeout_ms: acquire_timeout_ms,
+        max_lifetime_ms: max_lifetime_ms,
+        validate_on_borrow: validate_on_borrow,
+        idle: [],
+        active_count: 0,
+        slot_seq: 0,
+        created_count: 0,
+        evicted_count: 0,
+        borrowed_count: 0,
+        released_count: 0,
+        queries_executed: 0,
+        query_errors: 0,
+        total_latency_ms: 0.0,
+        max_latency_ms: 0.0
+    };
+
+    // Pre-warm min_idle connections when eager_warm != false
+    if _opt(opts, "eager_warm", true) == true and min_idle > 0 {
+        let w = 0;
+        while w < min_idle {
+            let warm = try _new_slot(pool) catch nil;
+            if warm == nil { break; }
+            array_push(pool.idle, warm);
+            w = w + 1;
+        }
+    }
+
+    pool.acquire = fn() { return _acquire_lease(pool); };
+    pool.with_conn = fn(cb) { return with_conn(pool, cb); };
+    pool.with_conn_result = fn(cb) { return with_conn_result(pool, cb); };
+    pool.exec = fn(sql, params = nil) { return with_conn(pool, fn(c) { return c.exec(sql, params); }); };
+    pool.query = fn(sql, params = nil) { return with_conn(pool, fn(c) { return c.query(sql, params); }); };
+    pool.stats = fn() { return pool_stats(pool); };
+    pool.close = fn() { return close_pool(pool); };
+
+    return pool;
+}
+
+// ── Versioned Schema Migrations with SHA-256 Tamper Detection ────────────────
+
+fn _normalize_migrations(migrations_array) {
+    if type(migrations_array) != "array" {
+        throw "db.migrations: migrations_array must be an array";
+    }
+    let list = [];
+    let i = 0;
+    while i < len(migrations_array) {
+        let m = migrations_array[i];
+        if not is_map(m) {
+            throw "db.migrations: each migration must be a map";
+        }
+        let ver = _opt(m, "version", nil);
+        if type(ver) != "number" or ver != num_floor(ver) or ver < 1 {
+            throw "db.migrations: migration version must be a positive integer";
+        }
+        let name = str(_opt(m, "name", "migration_" + str(ver)));
+        let up_sql = _opt(m, "up_sql", _opt(m, "up", nil));
+        if type(up_sql) != "string" or str_trim(up_sql) == "" {
+            throw "db.migrations: migration " + str(ver) + " requires non-empty up_sql";
+        }
+        let down_sql = _opt(m, "down_sql", _opt(m, "down", ""));
+        array_push(list, map{
+            version: ver,
+            name: name,
+            up_sql: up_sql,
+            down_sql: if down_sql == nil { "" } else { str(down_sql) },
+            checksum_sha256: sha256(up_sql)
+        });
+        i = i + 1;
+    }
+
+    // Sort ascending by version and reject duplicates
+    let a = 0;
+    while a < len(list) {
+        let b = a + 1;
+        while b < len(list) {
+            if list[b].version == list[a].version {
+                throw "db.migrations: duplicate migration version " + str(list[a].version);
+            }
+            if list[b].version < list[a].version {
+                let tmp = list[a];
+                list[a] = list[b];
+                list[b] = tmp;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    return list;
+}
+
+fn _ensure_migrations_table(conn) {
+    let kind = try conn.kind catch "sqlite";
+    if kind == "mssql" {
+        conn.exec("IF OBJECT_ID('_pblang_schema_migrations', 'U') IS NULL CREATE TABLE _pblang_schema_migrations (version INT PRIMARY KEY, name NVARCHAR(255) NOT NULL, checksum_sha256 NVARCHAR(64) NOT NULL, applied_at_ms BIGINT NOT NULL)", []);
+    } else {
+        conn.exec("CREATE TABLE IF NOT EXISTS _pblang_schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum_sha256 TEXT NOT NULL, applied_at_ms BIGINT NOT NULL)", []);
+    }
+}
+
+fn _run_migrations_on_conn(conn, migrations_array, opts = nil) {
+    let verify_checksums = _opt(opts, "verify_checksums", true) == true;
+    let migs = _normalize_migrations(migrations_array);
+    _ensure_migrations_table(conn);
+
+    let existing_rows = conn.query("SELECT version, name, checksum_sha256, applied_at_ms FROM _pblang_schema_migrations ORDER BY version ASC", []);
+    let applied_map = map{};
+    let r = 0;
+    while r < len(existing_rows) {
+        let row = existing_rows[r];
+        applied_map[str(row.version)] = row;
+        r = r + 1;
+    }
+
+    // Phase 1: Verify SHA-256 checksums of all already-applied migrations BEFORE mutating schema
+    if verify_checksums {
+        let v_idx = 0;
+        while v_idx < len(migs) {
+            let m = migs[v_idx];
+            let vk = str(m.version);
+            if map_has(applied_map, vk) {
+                let prev = applied_map[vk];
+                if not constant_time_eq(str(prev.checksum_sha256), m.checksum_sha256) {
+                    throw "db.migrations: checksum tamper/drift detected for version " + vk + " (" + m.name + "): expected " + str(prev.checksum_sha256) + " got " + m.checksum_sha256;
+                }
+            }
+            v_idx = v_idx + 1;
+        }
+    }
+
+    // Phase 2: Execute pending migrations, each inside an atomic BEGIN ... COMMIT transaction
+    let applied_versions = [];
+    let skipped_versions = [];
+    let i = 0;
+    while i < len(migs) {
+        let m = migs[i];
+        let vk = str(m.version);
+        if map_has(applied_map, vk) {
+            array_push(skipped_versions, m.version);
+        } else {
+            let ts = now_ms();
+            let tx_res = conn.tx(fn(tx_c) {
+                tx_c.exec(m.up_sql, []);
+                tx_c.exec(
+                    "INSERT INTO _pblang_schema_migrations (version, name, checksum_sha256, applied_at_ms) VALUES (?, ?, ?, ?)",
+                    [m.version, m.name, m.checksum_sha256, ts]
+                );
+                return true;
+            });
+            if not tx_res.ok {
+                throw "db.migrations: atomic migration failed and rolled back at version " + vk + " (" + m.name + ")";
+            }
+            array_push(applied_versions, m.version);
+        }
+        i = i + 1;
+    }
+
+    return map{
+        ok: true,
+        applied: applied_versions,
+        skipped: skipped_versions,
+        total_applied: len(skipped_versions) + len(applied_versions)
+    };
+}
+
+fn _rollback_on_conn(conn, migrations_array, opts = nil) {
+    let migs = _normalize_migrations(migrations_array);
+    _ensure_migrations_table(conn);
+
+    let mig_by_ver = map{};
+    let i = 0;
+    while i < len(migs) {
+        mig_by_ver[str(migs[i].version)] = migs[i];
+        i = i + 1;
+    }
+
+    let existing_rows = conn.query("SELECT version, name, checksum_sha256, applied_at_ms FROM _pblang_schema_migrations ORDER BY version DESC", []);
+    if len(existing_rows) == 0 {
+        return map{ ok: true, rolled_back: [] };
+    }
+
+    let target_ver = _opt(opts, "target_version", nil);
+    let steps = _clamp_int(_opt(opts, "steps", 1), 1, 1, 10000);
+    let rolled_back = [];
+
+    let r = 0;
+    while r < len(existing_rows) {
+        let row = existing_rows[r];
+        let ver = row.version;
+        if target_ver != nil {
+            if ver <= target_ver { break; }
+        } else {
+            if len(rolled_back) >= steps { break; }
+        }
+
+        let vk = str(ver);
+        if not map_has(mig_by_ver, vk) {
+            throw "db.migrations.rollback: missing migration definition for applied version " + vk;
+        }
+        let m = mig_by_ver[vk];
+        if str_trim(m.down_sql) == "" {
+            throw "db.migrations.rollback: migration version " + vk + " (" + m.name + ") has no down_sql";
+        }
+
+        let tx_res = conn.tx(fn(tx_c) {
+            tx_c.exec(m.down_sql, []);
+            tx_c.exec("DELETE FROM _pblang_schema_migrations WHERE version = ?", [ver]);
+            return true;
+        });
+        if not tx_res.ok {
+            throw "db.migrations.rollback: rollback failed and rolled back at version " + vk;
+        }
+        array_push(rolled_back, ver);
+        r = r + 1;
+    }
+
+    return map{ ok: true, rolled_back: rolled_back };
+}
+
+fn run_migrations(conn_or_pool, migrations_array, opts = nil) {
+    if is_pool(conn_or_pool) {
+        return with_conn(conn_or_pool, fn(c) {
+            return _run_migrations_on_conn(c, migrations_array, opts);
+        });
+    }
+    return _run_migrations_on_conn(conn_or_pool, migrations_array, opts);
+}
+
+fn rollback_migration(conn_or_pool, migrations_array, opts = nil) {
+    if is_pool(conn_or_pool) {
+        return with_conn(conn_or_pool, fn(c) {
+            return _rollback_on_conn(c, migrations_array, opts);
+        });
+    }
+    return _rollback_on_conn(conn_or_pool, migrations_array, opts);
+}
+
+export create_pool, is_pool, with_conn, with_conn_result, pool_stats, close_pool,
+       parse_dsn, redact_dsn,
+       run_migrations, rollback_migration;

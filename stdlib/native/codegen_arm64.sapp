@@ -1,0 +1,3319 @@
+// stdlib/native/codegen_arm64.sapp — Sovereign 100% Pure-PBLang Native ARM64 (AArch64) Backend
+//
+// Complete ARMv8-A A64 32-bit little-endian instruction encoder, .sapp-to-ARM64 native
+// machine-code compiler (64-bit integer + IEEE-754 f64 scalar SIMD + strings + recursion),
+// zero-dependency Linux AArch64 ELF64 & Apple Silicon macOS ARM64 Mach-O 64-bit linkers,
+// A64 disassembler, and deterministic A64 CPU+FPU+Syscall emulator.
+//
+// 100% pure PBLang (.sapp) — zero C, zero Rust, zero Python, zero external toolchains.
+
+let _TOKENIZER = import("stdlib:compiler/tokenizer.sapp");
+let _PARSER = import("stdlib:compiler/parser.sapp");
+
+// ── Architectural Constants ─────────────────────────────────────────────────
+
+let ARM64_XZR = 31;
+let ARM64_SP = 31;
+let ARM64_FP = 29;
+let ARM64_LR = 30;
+
+// ARMv8-A Condition Codes
+let ARM64_COND_EQ = 0;   // Z == 1
+let ARM64_COND_NE = 1;   // Z == 0
+let ARM64_COND_CS = 2;   // C == 1 (HS: unsigned >=)
+let ARM64_COND_HS = 2;
+let ARM64_COND_CC = 3;   // C == 0 (LO: unsigned <)
+let ARM64_COND_LO = 3;
+let ARM64_COND_MI = 4;   // N == 1
+let ARM64_COND_PL = 5;   // N == 0
+let ARM64_COND_VS = 6;   // V == 1
+let ARM64_COND_VC = 7;   // V == 0
+let ARM64_COND_HI = 8;   // C == 1 and Z == 0 (unsigned >)
+let ARM64_COND_LS = 9;   // C == 0 or Z == 1  (unsigned <=)
+let ARM64_COND_GE = 10;  // N == V (signed >=)
+let ARM64_COND_LT = 11;  // N != V (signed <)
+let ARM64_COND_GT = 12;  // Z == 0 and N == V (signed >)
+let ARM64_COND_LE = 13;  // Z == 1 or N != V  (signed <=)
+let ARM64_COND_AL = 14;  // Always
+
+// Binary Container Constants
+let ELF_EM_AARCH64 = 183;          // 0x00B7
+let ELF_BASE_VADDR = 4194304;      // 0x400000
+let ELF_HEADER_TOTAL = 120;        // 64-byte Ehdr + 56-byte Phdr
+
+let MACHO_MH_MAGIC_64 = 4277009103;      // 0xFEEDFACF
+let MACHO_CPU_TYPE_ARM64 = 16777228;     // 0x0100000C
+let MACHO_MH_EXECUTE = 2;
+let MACHO_MH_FLAGS_PIE = 2097285;        // NOUNDEFS | DYLDLINK | TWOLEVEL | PIE
+let MACHO_LC_SEGMENT_64 = 25;            // 0x19
+let MACHO_LC_LOAD_DYLIB = 12;            // 0x0C
+let MACHO_LC_LOAD_DYLINKER = 14;         // 0x0E
+let MACHO_LC_BUILD_VERSION = 50;         // 0x32
+let MACHO_LC_MAIN = 2147483688;          // 0x80000028
+let MACHO_PLATFORM_MACOS = 1;
+let MACHO_PAGE_SIZE = 16384;             // 16 KiB Apple Silicon page
+
+let _TWO52 = 4503599627370496.0;         // 2^52 exact in IEEE-754 f64
+let _U32_MOD = 4294967296;               // 2^32
+
+fn _fail(msg) {
+    throw "codegen_arm64: " + msg;
+}
+
+// ── Exact 64-Bit 4x16-Bit Limb Engine & IEEE-754 Binary64 Codec ─────────────
+// Each 64-bit register / word is represented without precision loss as four
+// unsigned 16-bit limbs [w0, w1, w2, w3] (little-endian: w0 = bits 0..15,
+// w3 = bits 48..63).
+
+fn limbs_zero() {
+    return [0, 0, 0, 0];
+}
+
+fn limbs_clone(a) {
+    return [a[0], a[1], a[2], a[3]];
+}
+
+fn limbs_is_zero(a) {
+    return a[0] == 0 and a[1] == 0 and a[2] == 0 and a[3] == 0;
+}
+
+fn limbs_is_neg(a) {
+    return a[3] >= 32768;
+}
+
+fn limbs_not(a) {
+    return [65535 - a[0], 65535 - a[1], 65535 - a[2], 65535 - a[3]];
+}
+
+fn limbs_add_carry(a, b, cin) {
+    let s0 = a[0] + b[0] + cin;
+    let r0 = s0 % 65536;
+    let c0 = num_floor(s0 / 65536);
+
+    let s1 = a[1] + b[1] + c0;
+    let r1 = s1 % 65536;
+    let c1 = num_floor(s1 / 65536);
+
+    let s2 = a[2] + b[2] + c1;
+    let r2 = s2 % 65536;
+    let c2 = num_floor(s2 / 65536);
+
+    let s3 = a[3] + b[3] + c2;
+    let r3 = s3 % 65536;
+    let cout = num_floor(s3 / 65536);
+
+    let res = [r0, r1, r2, r3];
+    let n_flag = if r3 >= 32768 { 1 } else { 0 };
+    let z_flag = if r0 == 0 and r1 == 0 and r2 == 0 and r3 == 0 { 1 } else { 0 };
+    let c_flag = if cout > 0 { 1 } else { 0 };
+    let an = a[3] >= 32768;
+    let bn = b[3] >= 32768;
+    let rn = r3 >= 32768;
+    let v_flag = if (an == bn) and (rn != an) { 1 } else { 0 };
+    return map{ value: res, n: n_flag, z: z_flag, c: c_flag, v: v_flag };
+}
+
+fn limbs_add(a, b) {
+    return limbs_add_carry(a, b, 0).value;
+}
+
+fn limbs_neg(a) {
+    return limbs_add_carry(limbs_not(a), [0, 0, 0, 0], 1).value;
+}
+
+fn limbs_sub_flags(a, b) {
+    // ARMv8 SUBS/CMP computes A + ~B + 1, so C = NOT borrow!
+    let nb = limbs_not(b);
+    let r = limbs_add_carry(a, nb, 1);
+    let an = a[3] >= 32768;
+    let bn = b[3] >= 32768;
+    let rn = r.value[3] >= 32768;
+    r.v = if (an != bn) and (rn != an) { 1 } else { 0 };
+    return r;
+}
+
+fn limbs_sub(a, b) {
+    return limbs_sub_flags(a, b).value;
+}
+
+fn limbs_mul(a, b) {
+    let acc = [0, 0, 0, 0];
+    let i = 0;
+    while i < 4 {
+        let carry = 0;
+        let j = 0;
+        while i + j < 4 {
+            let cur = acc[i + j] + a[i] * b[j] + carry;
+            acc[i + j] = cur % 65536;
+            carry = num_floor(cur / 65536);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn limbs_and(a, b) {
+    return [
+        bit_and(a[0], b[0]),
+        bit_and(a[1], b[1]),
+        bit_and(a[2], b[2]),
+        bit_and(a[3], b[3])
+    ];
+}
+
+fn limbs_orr(a, b) {
+    return [
+        bit_or(a[0], b[0]),
+        bit_or(a[1], b[1]),
+        bit_or(a[2], b[2]),
+        bit_or(a[3], b[3])
+    ];
+}
+
+fn limbs_eor(a, b) {
+    return [
+        bit_xor(a[0], b[0]),
+        bit_xor(a[1], b[1]),
+        bit_xor(a[2], b[2]),
+        bit_xor(a[3], b[3])
+    ];
+}
+
+fn _pow2(k) {
+    let r = 1;
+    let i = 0;
+    while i < k {
+        r = r * 2;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn limbs_lsl(a, amount) {
+    let sh = amount % 64;
+    if sh < 0 { sh = sh + 64; }
+    if sh == 0 { return limbs_clone(a); }
+    let word_shift = num_floor(sh / 16);
+    let bit_shift = sh % 16;
+    let out = [0, 0, 0, 0];
+    let i = 0;
+    while i < 4 {
+        let src_i = i - word_shift;
+        if src_i >= 0 {
+            let p = _pow2(bit_shift);
+            let v = (a[src_i] * p) % 65536;
+            if bit_shift > 0 and src_i - 1 >= 0 {
+                let carry = num_floor(a[src_i - 1] / _pow2(16 - bit_shift));
+                v = (v + carry) % 65536;
+            }
+            out[i] = v;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn limbs_lsr(a, amount) {
+    let sh = amount % 64;
+    if sh < 0 { sh = sh + 64; }
+    if sh == 0 { return limbs_clone(a); }
+    let word_shift = num_floor(sh / 16);
+    let bit_shift = sh % 16;
+    let out = [0, 0, 0, 0];
+    let i = 0;
+    while i < 4 {
+        let src_i = i + word_shift;
+        if src_i < 4 {
+            let p = _pow2(bit_shift);
+            let v = num_floor(a[src_i] / p);
+            if bit_shift > 0 and src_i + 1 < 4 {
+                let hi_bits = (a[src_i + 1] % p) * _pow2(16 - bit_shift);
+                v = (v + hi_bits) % 65536;
+            }
+            out[i] = v;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn limbs_asr(a, amount) {
+    let sh = amount % 64;
+    if sh < 0 { sh = sh + 64; }
+    if sh == 0 { return limbs_clone(a); }
+    let neg = limbs_is_neg(a);
+    if not neg {
+        return limbs_lsr(a, sh);
+    }
+    // Arithmetic right shift on negative value: ~((~a) >>> sh)
+    return limbs_not(limbs_lsr(limbs_not(a), sh));
+}
+
+fn limbs_cmp_unsigned(a, b) {
+    let i = 3;
+    while i >= 0 {
+        if a[i] < b[i] { return -1; }
+        if a[i] > b[i] { return 1; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn limbs_udiv_rem(a, b) {
+    if limbs_is_zero(b) {
+        return map{ q: [0, 0, 0, 0], r: [0, 0, 0, 0] };
+    }
+    let q = [0, 0, 0, 0];
+    let rem = [0, 0, 0, 0];
+    let bit_idx = 63;
+    while bit_idx >= 0 {
+        rem = limbs_lsl(rem, 1);
+        let wi = num_floor(bit_idx / 16);
+        let bi = bit_idx % 16;
+        let bit_val = num_floor(a[wi] / _pow2(bi)) % 2;
+        rem[0] = rem[0] + bit_val;
+        if limbs_cmp_unsigned(rem, b) >= 0 {
+            rem = limbs_sub(rem, b);
+            q[wi] = q[wi] + _pow2(bi);
+        }
+        bit_idx = bit_idx - 1;
+    }
+    return map{ q: q, r: rem };
+}
+
+fn limbs_udiv(a, b) {
+    return limbs_udiv_rem(a, b).q;
+}
+
+fn limbs_sdiv(a, b) {
+    if limbs_is_zero(b) {
+        return [0, 0, 0, 0];
+    }
+    let an = limbs_is_neg(a);
+    let bn = limbs_is_neg(b);
+    let ua = if an { limbs_neg(a) } else { limbs_clone(a) };
+    let ub = if bn { limbs_neg(b) } else { limbs_clone(b) };
+    let uq = limbs_udiv_rem(ua, ub).q;
+    if an != bn {
+        return limbs_neg(uq);
+    }
+    return uq;
+}
+
+fn i64_to_limbs(n) {
+    if is_array(n) and len(n) == 4 {
+        return limbs_clone(n);
+    }
+    if n == 0 {
+        return [0, 0, 0, 0];
+    }
+    let neg = n < 0;
+    let mag = if neg { num_floor(0 - n) } else { num_floor(n) };
+    let w0 = mag % 65536;
+    let t1 = num_floor(mag / 65536);
+    let w1 = t1 % 65536;
+    let t2 = num_floor(t1 / 65536);
+    let w2 = t2 % 65536;
+    let t3 = num_floor(t2 / 65536);
+    let w3 = t3 % 65536;
+    let pos = [w0, w1, w2, w3];
+    if neg {
+        return limbs_neg(pos);
+    }
+    return pos;
+}
+
+fn limbs_to_i64(a) {
+    if limbs_is_neg(a) {
+        let mag = limbs_neg(a);
+        let v = ((mag[3] * 65536 + mag[2]) * 65536 + mag[1]) * 65536 + mag[0];
+        return 0 - v;
+    }
+    return ((a[3] * 65536 + a[2]) * 65536 + a[1]) * 65536 + a[0];
+}
+
+fn limbs_to_u64_num(a) {
+    return ((a[3] * 65536 + a[2]) * 65536 + a[1]) * 65536 + a[0];
+}
+
+fn f64_to_limbs(x) {
+    if is_array(x) and len(x) == 4 {
+        return limbs_clone(x);
+    }
+    // NaN check
+    if x != x {
+        return [0, 0, 0, 32760]; // 0x7FF8000000000000 quiet NaN
+    }
+    if x == 0.0 {
+        return [0, 0, 0, 0];
+    }
+    let sign_bit = if x < 0.0 { 1 } else { 0 };
+    let ax = if x < 0.0 { 0.0 - x } else { x };
+    // Infinity check
+    if ax > 1.7976931348623157e308 {
+        return [0, 0, 0, sign_bit * 32768 + 2047 * 16];
+    }
+    let exp = 0;
+    let m = ax;
+    while m >= 2.0 and exp < 1024 {
+        m = m / 2.0;
+        exp = exp + 1;
+    }
+    while m < 1.0 and exp > -1022 {
+        m = m * 2.0;
+        exp = exp - 1;
+    }
+    let ebias = 0;
+    let frac = 0.0;
+    if m < 1.0 {
+        ebias = 0;
+        frac = num_floor(m * _TWO52 + 0.5);
+    } else {
+        ebias = exp + 1023;
+        frac = num_floor((m - 1.0) * _TWO52 + 0.5);
+        if frac >= _TWO52 {
+            frac = 0.0;
+            ebias = ebias + 1;
+        }
+    }
+    if ebias >= 2047 {
+        return [0, 0, 0, sign_bit * 32768 + 2047 * 16];
+    }
+    let w0 = frac % 65536;
+    let f1 = num_floor(frac / 65536);
+    let w1 = f1 % 65536;
+    let f2 = num_floor(f1 / 65536);
+    let w2 = f2 % 65536;
+    let top4 = num_floor(f2 / 65536) % 16;
+    let w3 = sign_bit * 32768 + ebias * 16 + top4;
+    return [w0, w1, w2, w3];
+}
+
+fn limbs_to_f64(a) {
+    let w0 = a[0];
+    let w1 = a[1];
+    let w2 = a[2];
+    let w3 = a[3];
+    let sign = if w3 >= 32768 { -1.0 } else { 1.0 };
+    let rem3 = w3 % 32768;
+    let ebias = num_floor(rem3 / 16);
+    let top4 = rem3 % 16;
+    let frac = ((top4 * 65536.0 + w2) * 65536.0 + w1) * 65536.0 + w0;
+    if ebias == 2047 {
+        if frac != 0.0 { return 0.0 / 0.0; }
+        return sign * (1.0 / 0.0);
+    }
+    if ebias == 0 {
+        if frac == 0.0 { return 0.0; }
+        let sub = frac / _TWO52;
+        let k = 0;
+        while k < 1022 {
+            sub = sub / 2.0;
+            k = k + 1;
+        }
+        return sign * sub;
+    }
+    let val = 1.0 + (frac / _TWO52);
+    let exp = ebias - 1023;
+    if exp > 0 {
+        let i = 0;
+        while i < exp {
+            val = val * 2.0;
+            i = i + 1;
+        }
+    } elif exp < 0 {
+        let i = 0;
+        let nexp = 0 - exp;
+        while i < nexp {
+            val = val / 2.0;
+            i = i + 1;
+        }
+    }
+    return sign * val;
+}
+
+// ── Binary Byte Buffer Helpers ──────────────────────────────────────────────
+
+fn _u32(w) {
+    let v = num_floor(w) % _U32_MOD;
+    if v < 0 { v = v + _U32_MOD; }
+    return v;
+}
+
+fn arm64_emit_u32(buf, word) {
+    let w = _u32(word);
+    array_push(buf, w % 256);
+    array_push(buf, num_floor(w / 256) % 256);
+    array_push(buf, num_floor(w / 65536) % 256);
+    array_push(buf, num_floor(w / 16777216) % 256);
+    return buf;
+}
+
+fn arm64_emit_words(buf, words) {
+    let i = 0;
+    while i < len(words) {
+        arm64_emit_u32(buf, words[i]);
+        i = i + 1;
+    }
+    return buf;
+}
+
+fn arm64_word_to_bytes(word) {
+    let out = [];
+    arm64_emit_u32(out, word);
+    return out;
+}
+
+fn _patch_u32(buf, byte_off, word) {
+    let w = _u32(word);
+    buf[byte_off] = w % 256;
+    buf[byte_off + 1] = num_floor(w / 256) % 256;
+    buf[byte_off + 2] = num_floor(w / 65536) % 256;
+    buf[byte_off + 3] = num_floor(w / 16777216) % 256;
+    return nil;
+}
+
+fn _read_u16_le(b, off) {
+    return b[off] + b[off + 1] * 256;
+}
+
+fn _read_u32_le(b, off) {
+    return b[off] + b[off + 1] * 256 + b[off + 2] * 65536 + b[off + 3] * 16777216;
+}
+
+fn _read_u64_le_num(b, off) {
+    let lo = _read_u32_le(b, off);
+    let hi = _read_u32_le(b, off + 4);
+    return hi * _U32_MOD + lo;
+}
+
+fn _push_u16_le(out, val) {
+    let v = num_floor(val) % 65536;
+    if v < 0 { v = v + 65536; }
+    array_push(out, v % 256);
+    array_push(out, num_floor(v / 256) % 256);
+    return out;
+}
+
+fn _push_u32_le(out, val) {
+    return arm64_emit_u32(out, val);
+}
+
+fn _push_u64_le(out, lo32, hi32) {
+    arm64_emit_u32(out, lo32);
+    arm64_emit_u32(out, hi32);
+    return out;
+}
+
+fn _push_u64_num(out, val) {
+    let v = num_floor(val);
+    let lo = v % _U32_MOD;
+    let hi = num_floor(v / _U32_MOD);
+    return _push_u64_le(out, lo, hi);
+}
+
+fn _push_padded_ascii(out, text, fixed_len) {
+    let i = 0;
+    while i < fixed_len {
+        if i < len(text) {
+            array_push(out, strcharcodeat(text, i));
+        } else {
+            array_push(out, 0);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _append_bytes(dst, src) {
+    let i = 0;
+    while i < len(src) {
+        array_push(dst, src[i]);
+        i = i + 1;
+    }
+    return dst;
+}
+
+// ── Exact ARMv8-A A64 32-Bit Instruction Encoders ───────────────────────────
+
+fn _chk_reg(r) {
+    let v = num_floor(r);
+    if v < 0 or v > 31 {
+        _fail("register index out of range 0..31: " + str(r));
+    }
+    return v;
+}
+
+fn _hw_from_shift(shift) {
+    if shift == nil or shift == 0 { return 0; }
+    if shift == 16 or shift == 1 { return 1; }
+    if shift == 32 or shift == 2 { return 2; }
+    if shift == 48 or shift == 3 { return 3; }
+    _fail("invalid MOV wide shift (expected 0, 16, 32, or 48): " + str(shift));
+    return 0;
+}
+
+fn _cond_code(cond) {
+    if type(cond) == "number" {
+        let c = num_floor(cond);
+        if c < 0 or c > 15 { _fail("condition code out of range 0..15: " + str(cond)); }
+        return c;
+    }
+    let s = str_lower(str(cond));
+    if s == "eq" or s == "==" { return ARM64_COND_EQ; }
+    if s == "ne" or s == "!=" { return ARM64_COND_NE; }
+    if s == "cs" or s == "hs" { return ARM64_COND_CS; }
+    if s == "cc" or s == "lo" { return ARM64_COND_CC; }
+    if s == "mi" { return ARM64_COND_MI; }
+    if s == "pl" { return ARM64_COND_PL; }
+    if s == "vs" { return ARM64_COND_VS; }
+    if s == "vc" { return ARM64_COND_VC; }
+    if s == "hi" { return ARM64_COND_HI; }
+    if s == "ls" { return ARM64_COND_LS; }
+    if s == "ge" or s == ">=" { return ARM64_COND_GE; }
+    if s == "lt" or s == "<" { return ARM64_COND_LT; }
+    if s == "gt" or s == ">" { return ARM64_COND_GT; }
+    if s == "le" or s == "<=" { return ARM64_COND_LE; }
+    if s == "al" { return ARM64_COND_AL; }
+    _fail("unknown condition code: " + str(cond));
+    return 0;
+}
+
+fn _imm19(off_words) {
+    let w = num_floor(off_words);
+    if w < -262144 or w > 262143 {
+        _fail("signed 19-bit word offset out of range: " + str(off_words));
+    }
+    if w < 0 { return 524288 + w; }
+    return w;
+}
+
+fn _imm26(off_words) {
+    let w = num_floor(off_words);
+    if w < -33554432 or w > 33554431 {
+        _fail("signed 26-bit word offset out of range: " + str(off_words));
+    }
+    if w < 0 { return 67108864 + w; }
+    return w;
+}
+
+fn _simm7_pair(simm7_scaled8) {
+    let v = num_floor(simm7_scaled8);
+    let idx = v;
+    if v != 0 and (v % 8) == 0 and v >= -512 and v <= 504 {
+        idx = num_floor(v / 8);
+    }
+    if idx < -64 or idx > 63 {
+        _fail("STP/LDP 7-bit scaled offset out of range: " + str(simm7_scaled8));
+    }
+    if idx < 0 { return 128 + idx; }
+    return idx;
+}
+
+fn _uimm12_scaled8(byte_off) {
+    let b = num_floor(byte_off);
+    if b < 0 or (b % 8) != 0 {
+        _fail("64-bit unsigned LDR/STR offset must be non-negative multiple of 8: " + str(byte_off));
+    }
+    let sc = num_floor(b / 8);
+    if sc > 4095 {
+        _fail("64-bit unsigned LDR/STR scaled offset exceeds 12 bits: " + str(byte_off));
+    }
+    return sc;
+}
+
+// Wide immediate moves
+fn arm64_movz(rd, imm16, shift = 0) {
+    let hw = _hw_from_shift(shift);
+    let imm = num_floor(imm16) % 65536;
+    if imm < 0 { imm = imm + 65536; }
+    return 0xD2800000 + hw * 2097152 + imm * 32 + _chk_reg(rd);
+}
+
+fn arm64_movn(rd, imm16, shift = 0) {
+    let hw = _hw_from_shift(shift);
+    let imm = num_floor(imm16) % 65536;
+    if imm < 0 { imm = imm + 65536; }
+    return 0x92800000 + hw * 2097152 + imm * 32 + _chk_reg(rd);
+}
+
+fn arm64_movk(rd, imm16, shift = 0) {
+    let hw = _hw_from_shift(shift);
+    let imm = num_floor(imm16) % 65536;
+    if imm < 0 { imm = imm + 65536; }
+    return 0xF2800000 + hw * 2097152 + imm * 32 + _chk_reg(rd);
+}
+
+fn arm64_mov_i64(rd, val64) {
+    let d = _chk_reg(rd);
+    let limbs = i64_to_limbs(val64);
+    let zero_cnt = 0;
+    let ones_cnt = 0;
+    let i = 0;
+    while i < 4 {
+        if limbs[i] == 0 { zero_cnt = zero_cnt + 1; }
+        if limbs[i] == 65535 { ones_cnt = ones_cnt + 1; }
+        i = i + 1;
+    }
+    if zero_cnt == 4 {
+        return [arm64_movz(d, 0, 0)];
+    }
+    if ones_cnt == 4 {
+        return [arm64_movn(d, 0, 0)];
+    }
+    let words = [];
+    if ones_cnt > zero_cnt {
+        let started = false;
+        let k = 0;
+        while k < 4 {
+            if limbs[k] != 65535 {
+                if not started {
+                    array_push(words, arm64_movn(d, 65535 - limbs[k], k * 16));
+                    started = true;
+                } else {
+                    array_push(words, arm64_movk(d, limbs[k], k * 16));
+                }
+            }
+            k = k + 1;
+        }
+        return words;
+    }
+    let started = false;
+    let k = 0;
+    while k < 4 {
+        if limbs[k] != 0 {
+            if not started {
+                array_push(words, arm64_movz(d, limbs[k], k * 16));
+                started = true;
+            } else {
+                array_push(words, arm64_movk(d, limbs[k], k * 16));
+            }
+        }
+        k = k + 1;
+    }
+    return words;
+}
+
+// Register-to-register move (SP-safe)
+fn arm64_mov_reg(rd, rn) {
+    let d = _chk_reg(rd);
+    let n = _chk_reg(rn);
+    if d == 31 or n == 31 {
+        return 0x91000000 + n * 32 + d; // ADD Xd, Xn, #0 (SP)
+    }
+    return 0xAA0003E0 + n * 65536 + d;  // ORR Xd, XZR, Xn
+}
+
+// Integer ALU
+fn arm64_add_reg(rd, rn, rm) {
+    return 0x8B000000 + _chk_reg(rm) * 65536 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+fn arm64_add_imm(rd, rn, imm12, shift12 = false) {
+    let sh = if shift12 { 4194304 } else { 0 };
+    let imm = num_floor(imm12);
+    if imm < 0 or imm > 4095 { _fail("ADD immediate out of 12-bit range: " + str(imm12)); }
+    return 0x91000000 + sh + imm * 1024 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+fn arm64_sub_reg(rd, rn, rm) {
+    return 0xCB000000 + _chk_reg(rm) * 65536 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+fn arm64_sub_imm(rd, rn, imm12, shift12 = false) {
+    let sh = if shift12 { 4194304 } else { 0 };
+    let imm = num_floor(imm12);
+    if imm < 0 or imm > 4095 { _fail("SUB immediate out of 12-bit range: " + str(imm12)); }
+    return 0xD1000000 + sh + imm * 1024 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+fn arm64_neg_reg(rd, rm) {
+    return arm64_sub_reg(rd, 31, rm);
+}
+
+fn arm64_madd(rd, rn, rm, ra) {
+    return 0x9B000000 + _chk_reg(rm) * 65536 + _chk_reg(ra) * 1024 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+fn arm64_mul(rd, rn, rm) {
+    return arm64_madd(rd, rn, rm, 31); // MADD Rd, Rn, Rm, XZR (0x9B007C00)
+}
+
+fn arm64_msub(rd, rn, rm, ra) {
+    return 0x9B008000 + _chk_reg(rm) * 65536 + _chk_reg(ra) * 1024 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+fn arm64_udiv(rd, rn, rm) {
+    return 0x9AC00800 + _chk_reg(rm) * 65536 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+fn arm64_sdiv(rd, rn, rm) {
+    return 0x9AC00C00 + _chk_reg(rm) * 65536 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+fn arm64_and_reg(rd, rn, rm) {
+    return 0x8A000000 + _chk_reg(rm) * 65536 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+fn arm64_orr_reg(rd, rn, rm) {
+    return 0xAA000000 + _chk_reg(rm) * 65536 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+fn arm64_eor_reg(rd, rn, rm) {
+    return 0xCA000000 + _chk_reg(rm) * 65536 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+fn arm64_lsl_reg(rd, rn, rm) {
+    return 0x9AC02000 + _chk_reg(rm) * 65536 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+fn arm64_lsr_reg(rd, rn, rm) {
+    return 0x9AC02400 + _chk_reg(rm) * 65536 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+fn arm64_asr_reg(rd, rn, rm) {
+    return 0x9AC02800 + _chk_reg(rm) * 65536 + _chk_reg(rn) * 32 + _chk_reg(rd);
+}
+
+// IEEE-754 64-bit Scalar Floating-Point (D0..D31)
+fn arm64_fmov_d_from_x(dd, xn) {
+    return 0x9E670000 + _chk_reg(xn) * 32 + _chk_reg(dd);
+}
+
+fn arm64_fmov_x_from_d(xd, dn) {
+    return 0x9E660000 + _chk_reg(dn) * 32 + _chk_reg(xd);
+}
+
+fn arm64_fmov_d(dd, dn) {
+    return 0x1E604000 + _chk_reg(dn) * 32 + _chk_reg(dd);
+}
+
+fn arm64_mov_f64_bits(dd, f64_val, scratch_x = 9) {
+    let limbs = f64_to_limbs(f64_val);
+    let words = arm64_mov_i64(scratch_x, limbs);
+    array_push(words, arm64_fmov_d_from_x(dd, scratch_x));
+    return words;
+}
+
+fn arm64_fadd_d(dd, dn, dm) {
+    return 0x1E602800 + _chk_reg(dm) * 65536 + _chk_reg(dn) * 32 + _chk_reg(dd);
+}
+
+fn arm64_fsub_d(dd, dn, dm) {
+    return 0x1E603800 + _chk_reg(dm) * 65536 + _chk_reg(dn) * 32 + _chk_reg(dd);
+}
+
+fn arm64_fmul_d(dd, dn, dm) {
+    return 0x1E600800 + _chk_reg(dm) * 65536 + _chk_reg(dn) * 32 + _chk_reg(dd);
+}
+
+fn arm64_fdiv_d(dd, dn, dm) {
+    return 0x1E601800 + _chk_reg(dm) * 65536 + _chk_reg(dn) * 32 + _chk_reg(dd);
+}
+
+fn arm64_fneg_d(dd, dn) {
+    return 0x1E614000 + _chk_reg(dn) * 32 + _chk_reg(dd);
+}
+
+fn arm64_fabs_d(dd, dn) {
+    return 0x1E60C000 + _chk_reg(dn) * 32 + _chk_reg(dd);
+}
+
+fn arm64_fsqrt_d(dd, dn) {
+    return 0x1E61C000 + _chk_reg(dn) * 32 + _chk_reg(dd);
+}
+
+fn arm64_fcmp_d(dn, dm) {
+    return 0x1E602000 + _chk_reg(dm) * 65536 + _chk_reg(dn) * 32;
+}
+
+fn arm64_fcmp_zero_d(dn) {
+    return 0x1E602008 + _chk_reg(dn) * 32;
+}
+
+fn arm64_scvtf_d(dd, xn) {
+    return 0x9E620000 + _chk_reg(xn) * 32 + _chk_reg(dd);
+}
+
+fn arm64_fcvtzs_x(xd, dn) {
+    return 0x9E780000 + _chk_reg(dn) * 32 + _chk_reg(xd);
+}
+
+// Comparisons, Conditional Set & Control Flow
+fn arm64_cmp_reg(rn, rm) {
+    return 0xEB00001F + _chk_reg(rm) * 65536 + _chk_reg(rn) * 32;
+}
+
+fn arm64_cmp_imm(rn, imm12) {
+    let imm = num_floor(imm12);
+    if imm < 0 or imm > 4095 { _fail("CMP immediate out of 12-bit range: " + str(imm12)); }
+    return 0xF100001F + imm * 1024 + _chk_reg(rn) * 32;
+}
+
+fn arm64_cset(rd, cond) {
+    let cc = _cond_code(cond);
+    let inv = bit_xor(cc, 1);
+    return 0x9A9F07E0 + inv * 4096 + _chk_reg(rd);
+}
+
+fn arm64_b(offset_words) {
+    return 0x14000000 + _imm26(offset_words);
+}
+
+fn arm64_bl(offset_words) {
+    return 0x94000000 + _imm26(offset_words);
+}
+
+fn arm64_b_cond(cond, offset_words) {
+    return 0x54000000 + _imm19(offset_words) * 32 + _cond_code(cond);
+}
+
+fn arm64_cbz(rt, offset_words) {
+    return 0xB4000000 + _imm19(offset_words) * 32 + _chk_reg(rt);
+}
+
+fn arm64_cbnz(rt, offset_words) {
+    return 0xB5000000 + _imm19(offset_words) * 32 + _chk_reg(rt);
+}
+
+fn arm64_blr(rn) {
+    return 0xD63F0000 + _chk_reg(rn) * 32;
+}
+
+fn arm64_br(rn) {
+    return 0xD61F0000 + _chk_reg(rn) * 32;
+}
+
+fn arm64_ret(rn = 30) {
+    return 0xD65F0000 + _chk_reg(rn) * 32;
+}
+
+// Memory Load/Store & Stack Frame Operations
+fn arm64_stp_pre(rt1, rt2, rn, simm7_scaled8) {
+    let imm7 = _simm7_pair(simm7_scaled8);
+    return 0xA9800000 + imm7 * 32768 + _chk_reg(rt2) * 1024 + _chk_reg(rn) * 32 + _chk_reg(rt1);
+}
+
+fn arm64_ldp_post(rt1, rt2, rn, simm7_scaled8) {
+    let imm7 = _simm7_pair(simm7_scaled8);
+    return 0xA8C00000 + imm7 * 32768 + _chk_reg(rt2) * 1024 + _chk_reg(rn) * 32 + _chk_reg(rt1);
+}
+
+fn arm64_stp_offset(rt1, rt2, rn, simm7_scaled8) {
+    let imm7 = _simm7_pair(simm7_scaled8);
+    return 0xA9000000 + imm7 * 32768 + _chk_reg(rt2) * 1024 + _chk_reg(rn) * 32 + _chk_reg(rt1);
+}
+
+fn arm64_ldp_offset(rt1, rt2, rn, simm7_scaled8) {
+    let imm7 = _simm7_pair(simm7_scaled8);
+    return 0xA9400000 + imm7 * 32768 + _chk_reg(rt2) * 1024 + _chk_reg(rn) * 32 + _chk_reg(rt1);
+}
+
+fn arm64_ldr_x_uimm(rt, rn, byte_off = 0) {
+    return 0xF9400000 + _uimm12_scaled8(byte_off) * 1024 + _chk_reg(rn) * 32 + _chk_reg(rt);
+}
+
+fn arm64_str_x_uimm(rt, rn, byte_off = 0) {
+    return 0xF9000000 + _uimm12_scaled8(byte_off) * 1024 + _chk_reg(rn) * 32 + _chk_reg(rt);
+}
+
+fn arm64_ldr_d_uimm(dt, rn, byte_off = 0) {
+    return 0xFD400000 + _uimm12_scaled8(byte_off) * 1024 + _chk_reg(rn) * 32 + _chk_reg(dt);
+}
+
+fn arm64_str_d_uimm(dt, rn, byte_off = 0) {
+    return 0xFD000000 + _uimm12_scaled8(byte_off) * 1024 + _chk_reg(rn) * 32 + _chk_reg(dt);
+}
+
+fn arm64_ldrb_uimm(rt, rn, byte_off = 0) {
+    let b = num_floor(byte_off);
+    if b < 0 or b > 4095 { _fail("LDRB offset out of range 0..4095: " + str(byte_off)); }
+    return 0x39400000 + b * 1024 + _chk_reg(rn) * 32 + _chk_reg(rt);
+}
+
+fn arm64_strb_uimm(rt, rn, byte_off = 0) {
+    let b = num_floor(byte_off);
+    if b < 0 or b > 4095 { _fail("STRB offset out of range 0..4095: " + str(byte_off)); }
+    return 0x39000000 + b * 1024 + _chk_reg(rn) * 32 + _chk_reg(rt);
+}
+
+fn arm64_adr(rd, byte_off) {
+    let b = num_floor(byte_off);
+    if b < -1048576 or b > 1048575 {
+        _fail("ADR 21-bit signed byte offset out of range: " + str(byte_off));
+    }
+    let s21 = if b < 0 { 2097152 + b } else { b };
+    let immlo = s21 % 4;
+    let immhi = num_floor(s21 / 4);
+    return 0x10000000 + immlo * 536870912 + immhi * 32 + _chk_reg(rd);
+}
+
+fn arm64_svc(imm16 = 0) {
+    let imm = num_floor(imm16) % 65536;
+    if imm < 0 { imm = imm + 65536; }
+    return 0xD4000001 + imm * 32;
+}
+
+fn arm64_nop() {
+    return 0xD503201F;
+}
+
+// Fluent Assembler Builder (`arm64_asm_*`)
+fn arm64_asm_new() {
+    return map{ bytes: [], labels: map{}, fixups: [] };
+}
+
+fn arm64_asm_pos_words(asm) {
+    return num_floor(len(asm.bytes) / 4);
+}
+
+fn arm64_asm_emit(asm, word) {
+    arm64_emit_u32(asm.bytes, word);
+    return asm;
+}
+
+fn arm64_asm_emit_all(asm, words) {
+    arm64_emit_words(asm.bytes, words);
+    return asm;
+}
+
+fn arm64_asm_label(asm, name) {
+    asm.labels[name] = arm64_asm_pos_words(asm);
+    return asm;
+}
+
+fn arm64_asm_fixup(asm, kind, target_label, reg = 0, cond = 0) {
+    let at_word = arm64_asm_pos_words(asm);
+    array_push(asm.fixups, map{
+        word_pos: at_word,
+        kind: kind,
+        target: target_label,
+        reg: reg,
+        cond: cond
+    });
+    arm64_emit_u32(asm.bytes, arm64_nop());
+    return asm;
+}
+
+fn arm64_asm_finalize(asm) {
+    let i = 0;
+    while i < len(asm.fixups) {
+        let fx = asm.fixups[i];
+        if not map_has(asm.labels, fx.target) {
+            _fail("unresolved ARM64 label: " + str(fx.target));
+        }
+        let target_w = asm.labels[fx.target];
+        let delta_w = target_w - fx.word_pos;
+        let word = arm64_nop();
+        if fx.kind == "b" {
+            word = arm64_b(delta_w);
+        } elif fx.kind == "bl" {
+            word = arm64_bl(delta_w);
+        } elif fx.kind == "b_cond" {
+            word = arm64_b_cond(fx.cond, delta_w);
+        } elif fx.kind == "cbz" {
+            word = arm64_cbz(fx.reg, delta_w);
+        } elif fx.kind == "cbnz" {
+            word = arm64_cbnz(fx.reg, delta_w);
+        } elif fx.kind == "adr" {
+            word = arm64_adr(fx.reg, delta_w * 4);
+        } else {
+            _fail("unknown fixup kind: " + str(fx.kind));
+        }
+        _patch_u32(asm.bytes, fx.word_pos * 4, word);
+        i = i + 1;
+    }
+    return asm.bytes;
+}
+
+// ── Pure-PBLang .sapp Source -> Native ARM64 Machine Code Compiler ──────────
+
+fn _has_float_punct(txt) {
+    let i = 0;
+    while i < len(txt) {
+        let c = strcharcodeat(txt, i);
+        if c == 46 or c == 101 or c == 69 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _annotate_number_tokens(stmts, num_toks, cursor_box) {
+    if stmts == nil { return nil; }
+    let i = 0;
+    while i < len(stmts) {
+        _annotate_node(stmts[i], num_toks, cursor_box);
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _annotate_node(node, num_toks, cursor_box) {
+    if node == nil or not is_map(node) or not map_has(node, "kind") { return nil; }
+    let k = node.kind;
+    if k == "number" {
+        let idx = cursor_box[0];
+        let is_f = false;
+        let nval = 0;
+        if type(node.value) == "string" {
+            if _has_float_punct(node.value) { is_f = true; }
+            nval = parse_number(node.value);
+        } else {
+            nval = node.value;
+            if nval != num_floor(nval) { is_f = true; }
+        }
+        if idx < len(num_toks) {
+            if _has_float_punct(num_toks[idx].text) {
+                is_f = true;
+            }
+            cursor_box[0] = idx + 1;
+        }
+        node.value = nval;
+        node.is_float = is_f;
+        return nil;
+    }
+    if k == "block" {
+        return _annotate_number_tokens(node.stmts, num_toks, cursor_box);
+    }
+    if k == "fn" {
+        return _annotate_node(node.body, num_toks, cursor_box);
+    }
+    if k == "let" or k == "const" or k == "return" or k == "print" {
+        if map_has(node, "value") { _annotate_node(node.value, num_toks, cursor_box); }
+        return nil;
+    }
+    if k == "expr_stmt" {
+        return _annotate_node(node.expr, num_toks, cursor_box);
+    }
+    if k == "assign" {
+        return _annotate_node(node.value, num_toks, cursor_box);
+    }
+    if k == "unary" {
+        return _annotate_node(node.operand, num_toks, cursor_box);
+    }
+    if k == "binary" {
+        _annotate_node(node.left, num_toks, cursor_box);
+        _annotate_node(node.right, num_toks, cursor_box);
+        return nil;
+    }
+    if k == "call" {
+        _annotate_node(node.func, num_toks, cursor_box);
+        let i = 0;
+        while i < len(node.args) {
+            _annotate_node(node.args[i], num_toks, cursor_box);
+            i = i + 1;
+        }
+        return nil;
+    }
+    if k == "if" {
+        _annotate_node(node.cond, num_toks, cursor_box);
+        _annotate_node(node.then, num_toks, cursor_box);
+        if map_has(node, "elifs") and node.elifs != nil {
+            let i = 0;
+            while i < len(node.elifs) {
+                _annotate_node(node.elifs[i].cond, num_toks, cursor_box);
+                _annotate_node(node.elifs[i].body, num_toks, cursor_box);
+                i = i + 1;
+            }
+        }
+        if map_has(node, "else") and node["else"] != nil {
+            _annotate_node(node["else"], num_toks, cursor_box);
+        }
+        return nil;
+    }
+    if k == "while" {
+        _annotate_node(node.cond, num_toks, cursor_box);
+        _annotate_node(node.body, num_toks, cursor_box);
+        return nil;
+    }
+    if k == "for_range" {
+        _annotate_node(node.start, num_toks, cursor_box);
+        _annotate_node(node.end, num_toks, cursor_box);
+        _annotate_node(node.body, num_toks, cursor_box);
+        return nil;
+    }
+    if k == "for_in" {
+        _annotate_node(node.iter, num_toks, cursor_box);
+        _annotate_node(node.body, num_toks, cursor_box);
+        return nil;
+    }
+    if k == "for" {
+        _annotate_node(node.end, num_toks, cursor_box);
+        _annotate_node(node.body, num_toks, cursor_box);
+        return nil;
+    }
+    return nil;
+}
+
+fn _norm_decl_type(t) {
+    if t == nil { return nil; }
+    let s = str_lower(str(t));
+    if s == "float" or s == "f64" or s == "double" { return "float"; }
+    if s == "int" or s == "i64" or s == "number" { return "int"; }
+    if s == "bool" or s == "boolean" { return "bool"; }
+    if s == "string" or s == "str" { return "string"; }
+    return nil;
+}
+
+fn _new_lbl(ctx, prefix) {
+    let id = ctx.lbl_seq;
+    ctx.lbl_seq = id + 1;
+    return "__L_" + prefix + "_" + str(id);
+}
+
+fn _intern_string(ctx, s) {
+    if map_has(ctx.str_map, s) {
+        return ctx.str_map[s];
+    }
+    let id = len(ctx.strings);
+    let lbl = "__STR_" + str(id);
+    let bytes = [];
+    let i = 0;
+    while i < len(s) {
+        array_push(bytes, strcharcodeat(s, i) % 256);
+        i = i + 1;
+    }
+    let info = map{ id: id, label: lbl, text: s, bytes: bytes, byte_len: len(bytes) };
+    array_push(ctx.strings, info);
+    ctx.str_map[s] = info;
+    return info;
+}
+
+fn _alloc_slot(fn_env, name, vtype) {
+    if map_has(fn_env.vars, name) {
+        fn_env.vars[name].vtype = vtype;
+        return fn_env.vars[name];
+    }
+    let slot = fn_env.next_slot;
+    let width = if vtype == "string" { 2 } else { 1 };
+    fn_env.next_slot = slot + width;
+    let entry = map{ name: name, slot: slot, vtype: vtype };
+    fn_env.vars[name] = entry;
+    return entry;
+}
+
+fn _infer_expr_type(expr, fn_env, fn_sigs) {
+    if expr == nil { return "int"; }
+    let k = expr.kind;
+    if k == "number" {
+        if map_has(expr, "is_float") and expr.is_float == true { return "float"; }
+        return "int";
+    }
+    if k == "bool" { return "bool"; }
+    if k == "string" { return "string"; }
+    if k == "ident" {
+        if map_has(fn_env.vars, expr.name) {
+            return fn_env.vars[expr.name].vtype;
+        }
+        return "int";
+    }
+    if k == "unary" {
+        if expr.op == "not" or expr.op == "!" { return "bool"; }
+        return _infer_expr_type(expr.operand, fn_env, fn_sigs);
+    }
+    if k == "binary" {
+        let op = expr.op;
+        if op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=" or op == "and" or op == "or" {
+            return "bool";
+        }
+        let lt = _infer_expr_type(expr.left, fn_env, fn_sigs);
+        let rt = _infer_expr_type(expr.right, fn_env, fn_sigs);
+        if lt == "float" or rt == "float" { return "float"; }
+        return "int";
+    }
+    if k == "call" {
+        if expr.func.kind == "ident" {
+            let nm = expr.func.name;
+            if nm == "float" or nm == "f64" or nm == "sqrt" or nm == "num_sqrt" or nm == "fabs" {
+                return "float";
+            }
+            if nm == "int" or nm == "i64" or nm == "num_floor" {
+                return "int";
+            }
+            if nm == "abs" or nm == "num_abs" {
+                if len(expr.args) > 0 {
+                    return _infer_expr_type(expr.args[0], fn_env, fn_sigs);
+                }
+                return "int";
+            }
+            if map_has(fn_sigs, nm) {
+                return fn_sigs[nm].ret_type;
+            }
+        }
+        return "int";
+    }
+    return "int";
+}
+
+fn _prescan_block(stmts, fn_env, fn_sigs) {
+    if stmts == nil { return nil; }
+    let i = 0;
+    while i < len(stmts) {
+        let st = stmts[i];
+        if st != nil and is_map(st) and map_has(st, "kind") {
+            let k = st.kind;
+            if k == "let" or k == "const" {
+                let vt: any = nil;
+                if map_has(st, "type") and st.type != nil {
+                    vt = _norm_decl_type(st.type);
+                }
+                if vt == nil {
+                    vt = _infer_expr_type(st.value, fn_env, fn_sigs);
+                }
+                _alloc_slot(fn_env, st.name, vt);
+            } elif k == "expr_stmt" and st.expr != nil and st.expr.kind == "assign" {
+                if not map_has(fn_env.vars, st.expr.name) {
+                    let vt = _infer_expr_type(st.expr.value, fn_env, fn_sigs);
+                    _alloc_slot(fn_env, st.expr.name, vt);
+                }
+            } elif k == "return" and st.value != nil {
+                let rt = _infer_expr_type(st.value, fn_env, fn_sigs);
+                if rt == "float" { fn_env.ret_type = "float"; }
+            } elif k == "if" {
+                _prescan_block(st.then.stmts, fn_env, fn_sigs);
+                if map_has(st, "elifs") and st.elifs != nil {
+                    let j = 0;
+                    while j < len(st.elifs) {
+                        _prescan_block(st.elifs[j].body.stmts, fn_env, fn_sigs);
+                        j = j + 1;
+                    }
+                }
+                if map_has(st, "else") and st["else"] != nil {
+                    _prescan_block(st["else"].stmts, fn_env, fn_sigs);
+                }
+            } elif k == "while" {
+                _prescan_block(st.body.stmts, fn_env, fn_sigs);
+            } elif k == "for_range" or k == "for_in" or k == "for" {
+                _alloc_slot(fn_env, st.name, "int");
+                _alloc_slot(fn_env, "__for_end_" + str(fn_env.next_slot), "int");
+                _prescan_block(st.body.stmts, fn_env, fn_sigs);
+            }
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _slot_byte_off(slot) {
+    return 16 + slot * 8;
+}
+
+fn _emit_expr(ctx, asm, expr, fn_env) {
+    if expr == nil {
+        arm64_asm_emit(asm, arm64_movz(0, 0, 0));
+        return "int";
+    }
+    let k = expr.kind;
+    if k == "number" {
+        if map_has(expr, "is_float") and expr.is_float == true {
+            ctx.uses_print_or_fp = true;
+            arm64_asm_emit_all(asm, arm64_mov_f64_bits(0, expr.value, 9));
+            return "float";
+        }
+        arm64_asm_emit_all(asm, arm64_mov_i64(0, expr.value));
+        return "int";
+    }
+    if k == "bool" {
+        let bv = if expr.value { 1 } else { 0 };
+        arm64_asm_emit(asm, arm64_movz(0, bv, 0));
+        return "bool";
+    }
+    if k == "string" {
+        let sinfo = _intern_string(ctx, expr.value);
+        arm64_asm_fixup(asm, "adr", sinfo.label, 0, 0);
+        arm64_asm_emit_all(asm, arm64_mov_i64(1, sinfo.byte_len));
+        return "string";
+    }
+    if k == "ident" {
+        if not map_has(fn_env.vars, expr.name) {
+            _fail("undefined variable in ARM64 codegen: " + str(expr.name));
+        }
+        let v = fn_env.vars[expr.name];
+        let off = _slot_byte_off(v.slot);
+        if v.vtype == "float" {
+            arm64_asm_emit(asm, arm64_ldr_d_uimm(0, 29, off));
+            return "float";
+        }
+        if v.vtype == "string" {
+            arm64_asm_emit(asm, arm64_ldr_x_uimm(0, 29, off));
+            arm64_asm_emit(asm, arm64_ldr_x_uimm(1, 29, off + 8));
+            return "string";
+        }
+        arm64_asm_emit(asm, arm64_ldr_x_uimm(0, 29, off));
+        return v.vtype;
+    }
+    if k == "assign" {
+        if not map_has(fn_env.vars, expr.name) {
+            _fail("assignment to undeclared variable: " + str(expr.name));
+        }
+        let v = fn_env.vars[expr.name];
+        let off = _slot_byte_off(v.slot);
+        let rt = _emit_expr(ctx, asm, expr.value, fn_env);
+        if v.vtype == "float" {
+            if rt != "float" {
+                arm64_asm_emit(asm, arm64_scvtf_d(0, 0));
+            }
+            arm64_asm_emit(asm, arm64_str_d_uimm(0, 29, off));
+            return "float";
+        }
+        if v.vtype == "string" {
+            arm64_asm_emit(asm, arm64_str_x_uimm(0, 29, off));
+            arm64_asm_emit(asm, arm64_str_x_uimm(1, 29, off + 8));
+            return "string";
+        }
+        if rt == "float" {
+            arm64_asm_emit(asm, arm64_fcvtzs_x(0, 0));
+        }
+        arm64_asm_emit(asm, arm64_str_x_uimm(0, 29, off));
+        return v.vtype;
+    }
+    if k == "unary" {
+        let op = expr.op;
+        let ot = _emit_expr(ctx, asm, expr.operand, fn_env);
+        if op == "-" {
+            if ot == "float" {
+                arm64_asm_emit(asm, arm64_fneg_d(0, 0));
+                return "float";
+            }
+            arm64_asm_emit(asm, arm64_neg_reg(0, 0));
+            return "int";
+        }
+        if op == "not" or op == "!" {
+            if ot == "float" {
+                arm64_asm_emit(asm, arm64_fcmp_zero_d(0));
+                arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_EQ));
+            } else {
+                arm64_asm_emit(asm, arm64_cmp_imm(0, 0));
+                arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_EQ));
+            }
+            return "bool";
+        }
+        return ot;
+    }
+    if k == "binary" {
+        let op = expr.op;
+        if op == "and" {
+            let l_false = _new_lbl(ctx, "and_f");
+            let l_end = _new_lbl(ctx, "and_e");
+            let lt = _emit_expr(ctx, asm, expr.left, fn_env);
+            if lt == "float" {
+                arm64_asm_emit(asm, arm64_fcmp_zero_d(0));
+                arm64_asm_fixup(asm, "b_cond", l_false, 0, ARM64_COND_EQ);
+            } else {
+                arm64_asm_fixup(asm, "cbz", l_false, 0, 0);
+            }
+            let rt = _emit_expr(ctx, asm, expr.right, fn_env);
+            if rt == "float" {
+                arm64_asm_emit(asm, arm64_fcmp_zero_d(0));
+                arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_NE));
+            } else {
+                arm64_asm_emit(asm, arm64_cmp_imm(0, 0));
+                arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_NE));
+            }
+            arm64_asm_fixup(asm, "b", l_end, 0, 0);
+            arm64_asm_label(asm, l_false);
+            arm64_asm_emit(asm, arm64_movz(0, 0, 0));
+            arm64_asm_label(asm, l_end);
+            return "bool";
+        }
+        if op == "or" {
+            let l_true = _new_lbl(ctx, "or_t");
+            let l_end = _new_lbl(ctx, "or_e");
+            let lt = _emit_expr(ctx, asm, expr.left, fn_env);
+            if lt == "float" {
+                arm64_asm_emit(asm, arm64_fcmp_zero_d(0));
+                arm64_asm_fixup(asm, "b_cond", l_true, 0, ARM64_COND_NE);
+            } else {
+                arm64_asm_fixup(asm, "cbnz", l_true, 0, 0);
+            }
+            let rt = _emit_expr(ctx, asm, expr.right, fn_env);
+            if rt == "float" {
+                arm64_asm_emit(asm, arm64_fcmp_zero_d(0));
+                arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_NE));
+            } else {
+                arm64_asm_emit(asm, arm64_cmp_imm(0, 0));
+                arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_NE));
+            }
+            arm64_asm_fixup(asm, "b", l_end, 0, 0);
+            arm64_asm_label(asm, l_true);
+            arm64_asm_emit(asm, arm64_movz(0, 1, 0));
+            arm64_asm_label(asm, l_end);
+            return "bool";
+        }
+
+        let lt_guess = _infer_expr_type(expr.left, fn_env, ctx.fn_sigs);
+        let rt_guess = _infer_expr_type(expr.right, fn_env, ctx.fn_sigs);
+        let use_fp = (lt_guess == "float" or rt_guess == "float");
+
+        if use_fp {
+            let lt = _emit_expr(ctx, asm, expr.left, fn_env);
+            if lt != "float" { arm64_asm_emit(asm, arm64_scvtf_d(0, 0)); }
+            arm64_asm_emit(asm, arm64_sub_imm(31, 31, 16, false));
+            arm64_asm_emit(asm, arm64_str_d_uimm(0, 31, 0));
+
+            let rt = _emit_expr(ctx, asm, expr.right, fn_env);
+            if rt != "float" { arm64_asm_emit(asm, arm64_scvtf_d(0, 0)); }
+            arm64_asm_emit(asm, arm64_ldr_d_uimm(1, 31, 0));
+            arm64_asm_emit(asm, arm64_add_imm(31, 31, 16, false));
+            // Left is in D1, Right is in D0
+            if op == "+" { arm64_asm_emit(asm, arm64_fadd_d(0, 1, 0)); return "float"; }
+            if op == "-" { arm64_asm_emit(asm, arm64_fsub_d(0, 1, 0)); return "float"; }
+            if op == "*" { arm64_asm_emit(asm, arm64_fmul_d(0, 1, 0)); return "float"; }
+            if op == "/" { arm64_asm_emit(asm, arm64_fdiv_d(0, 1, 0)); return "float"; }
+            arm64_asm_emit(asm, arm64_fcmp_d(1, 0));
+            if op == "==" { arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_EQ)); return "bool"; }
+            if op == "!=" { arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_NE)); return "bool"; }
+            if op == "<" { arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_MI)); return "bool"; }
+            if op == "<=" { arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_LS)); return "bool"; }
+            if op == ">" { arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_GT)); return "bool"; }
+            if op == ">=" { arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_GE)); return "bool"; }
+            _fail("unsupported float binary operator: " + str(op));
+        }
+
+        // 64-bit Integer Binary Op (Left -> stack -> X1, Right -> X0)
+        _emit_expr(ctx, asm, expr.left, fn_env);
+        arm64_asm_emit(asm, arm64_sub_imm(31, 31, 16, false));
+        arm64_asm_emit(asm, arm64_str_x_uimm(0, 31, 0));
+
+        _emit_expr(ctx, asm, expr.right, fn_env);
+        arm64_asm_emit(asm, arm64_ldr_x_uimm(1, 31, 0));
+        arm64_asm_emit(asm, arm64_add_imm(31, 31, 16, false));
+
+        if op == "+" { arm64_asm_emit(asm, arm64_add_reg(0, 1, 0)); return "int"; }
+        if op == "-" { arm64_asm_emit(asm, arm64_sub_reg(0, 1, 0)); return "int"; }
+        if op == "*" { arm64_asm_emit(asm, arm64_mul(0, 1, 0)); return "int"; }
+        if op == "/" { arm64_asm_emit(asm, arm64_sdiv(0, 1, 0)); return "int"; }
+        if op == "%" {
+            arm64_asm_emit(asm, arm64_sdiv(9, 1, 0));
+            arm64_asm_emit(asm, arm64_msub(0, 9, 0, 1));
+            return "int";
+        }
+        if op == "&" { arm64_asm_emit(asm, arm64_and_reg(0, 1, 0)); return "int"; }
+        if op == "|" { arm64_asm_emit(asm, arm64_orr_reg(0, 1, 0)); return "int"; }
+        if op == "^" { arm64_asm_emit(asm, arm64_eor_reg(0, 1, 0)); return "int"; }
+        if op == "<<" { arm64_asm_emit(asm, arm64_lsl_reg(0, 1, 0)); return "int"; }
+        if op == ">>" { arm64_asm_emit(asm, arm64_asr_reg(0, 1, 0)); return "int"; }
+
+        arm64_asm_emit(asm, arm64_cmp_reg(1, 0));
+        if op == "==" { arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_EQ)); return "bool"; }
+        if op == "!=" { arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_NE)); return "bool"; }
+        if op == "<" { arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_LT)); return "bool"; }
+        if op == "<=" { arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_LE)); return "bool"; }
+        if op == ">" { arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_GT)); return "bool"; }
+        if op == ">=" { arm64_asm_emit(asm, arm64_cset(0, ARM64_COND_GE)); return "bool"; }
+        _fail("unsupported integer binary operator: " + str(op));
+    }
+    if k == "call" {
+        if expr.func.kind != "ident" {
+            _fail("indirect calls require named function in native ARM64 subset");
+        }
+        let nm = expr.func.name;
+        // Hardware FPU / Bitwise Intrinsics
+        if nm == "sqrt" or nm == "num_sqrt" {
+            let at = _emit_expr(ctx, asm, expr.args[0], fn_env);
+            if at != "float" { arm64_asm_emit(asm, arm64_scvtf_d(0, 0)); }
+            arm64_asm_emit(asm, arm64_fsqrt_d(0, 0));
+            return "float";
+        }
+        if nm == "fabs" {
+            let at = _emit_expr(ctx, asm, expr.args[0], fn_env);
+            if at != "float" { arm64_asm_emit(asm, arm64_scvtf_d(0, 0)); }
+            arm64_asm_emit(asm, arm64_fabs_d(0, 0));
+            return "float";
+        }
+        if nm == "abs" or nm == "num_abs" {
+            let at = _emit_expr(ctx, asm, expr.args[0], fn_env);
+            if at == "float" {
+                arm64_asm_emit(asm, arm64_fabs_d(0, 0));
+                return "float";
+            }
+            let pos_l = _new_lbl(ctx, "abs_p");
+            arm64_asm_emit(asm, arm64_cmp_imm(0, 0));
+            arm64_asm_fixup(asm, "b_cond", pos_l, 0, ARM64_COND_GE);
+            arm64_asm_emit(asm, arm64_neg_reg(0, 0));
+            arm64_asm_label(asm, pos_l);
+            return "int";
+        }
+        if nm == "float" or nm == "f64" {
+            let at = _emit_expr(ctx, asm, expr.args[0], fn_env);
+            if at != "float" { arm64_asm_emit(asm, arm64_scvtf_d(0, 0)); }
+            return "float";
+        }
+        if nm == "int" or nm == "i64" or nm == "num_floor" {
+            let at = _emit_expr(ctx, asm, expr.args[0], fn_env);
+            if at == "float" { arm64_asm_emit(asm, arm64_fcvtzs_x(0, 0)); }
+            return "int";
+        }
+        if nm == "bit_and" or nm == "bit_or" or nm == "bit_xor" or nm == "bit_shl" or nm == "bit_shr" {
+            _emit_expr(ctx, asm, expr.args[0], fn_env);
+            arm64_asm_emit(asm, arm64_sub_imm(31, 31, 16, false));
+            arm64_asm_emit(asm, arm64_str_x_uimm(0, 31, 0));
+            _emit_expr(ctx, asm, expr.args[1], fn_env);
+            arm64_asm_emit(asm, arm64_ldr_x_uimm(1, 31, 0));
+            arm64_asm_emit(asm, arm64_add_imm(31, 31, 16, false));
+            if nm == "bit_and" { arm64_asm_emit(asm, arm64_and_reg(0, 1, 0)); }
+            elif nm == "bit_or" { arm64_asm_emit(asm, arm64_orr_reg(0, 1, 0)); }
+            elif nm == "bit_xor" { arm64_asm_emit(asm, arm64_eor_reg(0, 1, 0)); }
+            elif nm == "bit_shl" { arm64_asm_emit(asm, arm64_lsl_reg(0, 1, 0)); }
+            else { arm64_asm_emit(asm, arm64_asr_reg(0, 1, 0)); }
+            return "int";
+        }
+
+        if not map_has(ctx.fn_sigs, nm) {
+            _fail("call to undefined function: " + str(nm));
+        }
+        let sig = ctx.fn_sigs[nm];
+        let argc = len(expr.args);
+        if argc > 8 {
+            _fail("native ARM64 call supports up to 8 register arguments: " + str(nm));
+        }
+        let stack_bytes = num_floor((argc * 8 + 15) / 16) * 16;
+        if stack_bytes > 0 {
+            arm64_asm_emit(asm, arm64_sub_imm(31, 31, stack_bytes, false));
+        }
+        let ai = 0;
+        while ai < argc {
+            let at = _emit_expr(ctx, asm, expr.args[ai], fn_env);
+            let expected_t = if ai < len(sig.param_types) { sig.param_types[ai] } else { "int" };
+            if expected_t == "float" and at != "float" {
+                arm64_asm_emit(asm, arm64_scvtf_d(0, 0));
+                at = "float";
+            }
+            if at == "float" {
+                arm64_asm_emit(asm, arm64_fmov_x_from_d(0, 0));
+            }
+            arm64_asm_emit(asm, arm64_str_x_uimm(0, 31, ai * 8));
+            ai = ai + 1;
+        }
+        ai = 0;
+        while ai < argc {
+            arm64_asm_emit(asm, arm64_ldr_x_uimm(ai, 31, ai * 8));
+            ai = ai + 1;
+        }
+        if stack_bytes > 0 {
+            arm64_asm_emit(asm, arm64_add_imm(31, 31, stack_bytes, false));
+        }
+        arm64_asm_fixup(asm, "bl", sig.label, 0, 0);
+        if sig.ret_type == "float" {
+            arm64_asm_emit(asm, arm64_fmov_d_from_x(0, 0));
+            return "float";
+        }
+        return sig.ret_type;
+    }
+    _fail("unsupported expression kind in ARM64 compiler: " + str(k));
+    return "int";
+}
+
+fn _emit_cond_branch_false(ctx, asm, cond_expr, false_lbl, fn_env) {
+    let ct = _emit_expr(ctx, asm, cond_expr, fn_env);
+    if ct == "float" {
+        arm64_asm_emit(asm, arm64_fcmp_zero_d(0));
+        arm64_asm_fixup(asm, "b_cond", false_lbl, 0, ARM64_COND_EQ);
+    } else {
+        arm64_asm_fixup(asm, "cbz", false_lbl, 0, 0);
+    }
+    return nil;
+}
+
+fn _emit_stmt(ctx, asm, st, fn_env) {
+    if st == nil or not is_map(st) { return nil; }
+    let k = st.kind;
+    if k == "let" or k == "const" {
+        let v = fn_env.vars[st.name];
+        let off = _slot_byte_off(v.slot);
+        let rt = _emit_expr(ctx, asm, st.value, fn_env);
+        if v.vtype == "float" {
+            if rt != "float" { arm64_asm_emit(asm, arm64_scvtf_d(0, 0)); }
+            arm64_asm_emit(asm, arm64_str_d_uimm(0, 29, off));
+        } elif v.vtype == "string" {
+            arm64_asm_emit(asm, arm64_str_x_uimm(0, 29, off));
+            arm64_asm_emit(asm, arm64_str_x_uimm(1, 29, off + 8));
+        } else {
+            if rt == "float" { arm64_asm_emit(asm, arm64_fcvtzs_x(0, 0)); }
+            arm64_asm_emit(asm, arm64_str_x_uimm(0, 29, off));
+        }
+        return nil;
+    }
+    if k == "expr_stmt" {
+        if st.expr != nil and st.expr.kind == "call" and st.expr.func.kind == "ident" and st.expr.func.name == "print" {
+            let p_arg = if len(st.expr.args) > 0 { st.expr.args[0] } else { nil };
+            return _emit_print_stmt(ctx, asm, p_arg, fn_env);
+        }
+        _emit_expr(ctx, asm, st.expr, fn_env);
+        return nil;
+    }
+    if k == "print" {
+        return _emit_print_stmt(ctx, asm, st.value, fn_env);
+    }
+    if k == "return" {
+        if st.value == nil {
+            arm64_asm_emit(asm, arm64_movz(0, 0, 0));
+        } else {
+            let rt = _emit_expr(ctx, asm, st.value, fn_env);
+            if fn_env.ret_type == "float" {
+                if rt != "float" { arm64_asm_emit(asm, arm64_scvtf_d(0, 0)); }
+                arm64_asm_emit(asm, arm64_fmov_x_from_d(0, 0));
+            } elif rt == "float" {
+                arm64_asm_emit(asm, arm64_fmov_x_from_d(0, 0));
+            }
+        }
+        arm64_asm_fixup(asm, "b", fn_env.epilogue_label, 0, 0);
+        return nil;
+    }
+    if k == "if" {
+        let end_lbl = _new_lbl(ctx, "if_end");
+        let next_lbl = _new_lbl(ctx, "if_next");
+        _emit_cond_branch_false(ctx, asm, st.cond, next_lbl, fn_env);
+        _emit_block(ctx, asm, st.then.stmts, fn_env);
+        arm64_asm_fixup(asm, "b", end_lbl, 0, 0);
+        arm64_asm_label(asm, next_lbl);
+        if map_has(st, "elifs") and st.elifs != nil {
+            let ei = 0;
+            while ei < len(st.elifs) {
+                let el = st.elifs[ei];
+                let after_el = _new_lbl(ctx, "elif_next");
+                _emit_cond_branch_false(ctx, asm, el.cond, after_el, fn_env);
+                _emit_block(ctx, asm, el.body.stmts, fn_env);
+                arm64_asm_fixup(asm, "b", end_lbl, 0, 0);
+                arm64_asm_label(asm, after_el);
+                ei = ei + 1;
+            }
+        }
+        if map_has(st, "else") and st["else"] != nil {
+            _emit_block(ctx, asm, st["else"].stmts, fn_env);
+        }
+        arm64_asm_label(asm, end_lbl);
+        return nil;
+    }
+    if k == "while" {
+        let top_lbl = _new_lbl(ctx, "wh_top");
+        let end_lbl = _new_lbl(ctx, "wh_end");
+        let prev_brk = fn_env.break_label;
+        let prev_cnt = fn_env.continue_label;
+        fn_env.break_label = end_lbl;
+        fn_env.continue_label = top_lbl;
+
+        arm64_asm_label(asm, top_lbl);
+        _emit_cond_branch_false(ctx, asm, st.cond, end_lbl, fn_env);
+        _emit_block(ctx, asm, st.body.stmts, fn_env);
+        arm64_asm_fixup(asm, "b", top_lbl, 0, 0);
+        arm64_asm_label(asm, end_lbl);
+
+        fn_env.break_label = prev_brk;
+        fn_env.continue_label = prev_cnt;
+        return nil;
+    }
+    if k == "for_range" or k == "for_in" or k == "for" {
+        let ivar = fn_env.vars[st.name];
+        let ioff = _slot_byte_off(ivar.slot);
+        let end_slot = fn_env.next_slot;
+        fn_env.next_slot = end_slot + 1;
+        let eoff = _slot_byte_off(end_slot);
+
+        let inclusive = false;
+        if k == "for_range" {
+            inclusive = true;
+            _emit_expr(ctx, asm, st.start, fn_env);
+            arm64_asm_emit(asm, arm64_str_x_uimm(0, 29, ioff));
+            _emit_expr(ctx, asm, st.end, fn_env);
+            arm64_asm_emit(asm, arm64_str_x_uimm(0, 29, eoff));
+        } elif k == "for_in" {
+            if st.iter != nil and st.iter.kind == "call" and st.iter.func.kind == "ident" and st.iter.func.name == "range" {
+                if len(st.iter.args) == 1 {
+                    arm64_asm_emit(asm, arm64_movz(0, 0, 0));
+                    arm64_asm_emit(asm, arm64_str_x_uimm(0, 29, ioff));
+                    _emit_expr(ctx, asm, st.iter.args[0], fn_env);
+                    arm64_asm_emit(asm, arm64_str_x_uimm(0, 29, eoff));
+                } else {
+                    _emit_expr(ctx, asm, st.iter.args[0], fn_env);
+                    arm64_asm_emit(asm, arm64_str_x_uimm(0, 29, ioff));
+                    _emit_expr(ctx, asm, st.iter.args[1], fn_env);
+                    arm64_asm_emit(asm, arm64_str_x_uimm(0, 29, eoff));
+                }
+            } else {
+                _fail("native ARM64 for-in supports range(start, end) or 'for i in start to end'");
+            }
+        } else {
+            arm64_asm_emit(asm, arm64_movz(0, 0, 0));
+            arm64_asm_emit(asm, arm64_str_x_uimm(0, 29, ioff));
+            _emit_expr(ctx, asm, st.end, fn_env);
+            arm64_asm_emit(asm, arm64_str_x_uimm(0, 29, eoff));
+        }
+
+        let top_lbl = _new_lbl(ctx, "for_top");
+        let step_lbl = _new_lbl(ctx, "for_step");
+        let end_lbl = _new_lbl(ctx, "for_end");
+        let prev_brk = fn_env.break_label;
+        let prev_cnt = fn_env.continue_label;
+        fn_env.break_label = end_lbl;
+        fn_env.continue_label = step_lbl;
+
+        arm64_asm_label(asm, top_lbl);
+        arm64_asm_emit(asm, arm64_ldr_x_uimm(0, 29, ioff));
+        arm64_asm_emit(asm, arm64_ldr_x_uimm(1, 29, eoff));
+        arm64_asm_emit(asm, arm64_cmp_reg(0, 1));
+        if inclusive {
+            arm64_asm_fixup(asm, "b_cond", end_lbl, 0, ARM64_COND_GT);
+        } else {
+            arm64_asm_fixup(asm, "b_cond", end_lbl, 0, ARM64_COND_GE);
+        }
+        _emit_block(ctx, asm, st.body.stmts, fn_env);
+        arm64_asm_label(asm, step_lbl);
+        arm64_asm_emit(asm, arm64_ldr_x_uimm(0, 29, ioff));
+        arm64_asm_emit(asm, arm64_add_imm(0, 0, 1, false));
+        arm64_asm_emit(asm, arm64_str_x_uimm(0, 29, ioff));
+        arm64_asm_fixup(asm, "b", top_lbl, 0, 0);
+        arm64_asm_label(asm, end_lbl);
+
+        fn_env.break_label = prev_brk;
+        fn_env.continue_label = prev_cnt;
+        return nil;
+    }
+    if k == "break" {
+        if fn_env.break_label == nil { _fail("break outside loop"); }
+        arm64_asm_fixup(asm, "b", fn_env.break_label, 0, 0);
+        return nil;
+    }
+    if k == "continue" {
+        if fn_env.continue_label == nil { _fail("continue outside loop"); }
+        arm64_asm_fixup(asm, "b", fn_env.continue_label, 0, 0);
+        return nil;
+    }
+    if k == "fn" {
+        return nil; // Compiled as top-level function unit
+    }
+    _fail("unsupported statement kind in ARM64 compiler: " + str(k));
+    return nil;
+}
+
+fn _emit_print_stmt(ctx, asm, val_expr, fn_env) {
+    ctx.uses_io = true;
+    if val_expr == nil {
+        let nl = _intern_string(ctx, "");
+        arm64_asm_fixup(asm, "adr", nl.label, 0, 0);
+        arm64_asm_emit(asm, arm64_movz(1, 0, 0));
+        arm64_asm_fixup(asm, "bl", "__rt_print_bytes", 0, 0);
+        return nil;
+    }
+    let vt = _emit_expr(ctx, asm, val_expr, fn_env);
+    if vt == "string" {
+        arm64_asm_fixup(asm, "bl", "__rt_print_bytes", 0, 0);
+    } elif vt == "bool" {
+        ctx.uses_print_bool = true;
+        arm64_asm_fixup(asm, "bl", "__rt_print_bool", 0, 0);
+    } elif vt == "float" {
+        ctx.uses_print_f64 = true;
+        arm64_asm_fixup(asm, "bl", "__rt_print_f64", 0, 0);
+    } else {
+        ctx.uses_print_i64 = true;
+        arm64_asm_fixup(asm, "bl", "__rt_print_i64", 0, 0);
+    }
+    return nil;
+}
+
+fn _emit_block(ctx, asm, stmts, fn_env) {
+    if stmts == nil { return nil; }
+    let i = 0;
+    while i < len(stmts) {
+        _emit_stmt(ctx, asm, stmts[i], fn_env);
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _emit_function(ctx, asm, fn_name, params, body_stmts, sig) {
+    let fn_env = map{
+        name: fn_name,
+        vars: map{},
+        next_slot: 0,
+        ret_type: sig.ret_type,
+        epilogue_label: _new_lbl(ctx, "epilogue_" + fn_name),
+        break_label: nil,
+        continue_label: nil
+    };
+    let pi = 0;
+    while pi < len(params) {
+        let pt = sig.param_types[pi];
+        _alloc_slot(fn_env, params[pi].name, pt);
+        pi = pi + 1;
+    }
+    _prescan_block(body_stmts, fn_env, ctx.fn_sigs);
+    sig.ret_type = fn_env.ret_type;
+
+    // Reserve generous extra slots for any nested loop bounds allocated during emission
+    let total_slots = fn_env.next_slot + 8;
+    let frame_bytes = num_floor((16 + total_slots * 8 + 15) / 16) * 16;
+
+    arm64_asm_label(asm, sig.label);
+    if frame_bytes <= 504 {
+        arm64_asm_emit(asm, arm64_stp_pre(29, 30, 31, 0 - frame_bytes));
+        arm64_asm_emit(asm, arm64_mov_reg(29, 31));
+    } else {
+        arm64_asm_emit(asm, arm64_stp_pre(29, 30, 31, -16));
+        arm64_asm_emit(asm, arm64_sub_imm(31, 31, frame_bytes - 16, false));
+        arm64_asm_emit(asm, arm64_mov_reg(29, 31));
+    }
+
+    pi = 0;
+    while pi < len(params) {
+        let v = fn_env.vars[params[pi].name];
+        arm64_asm_emit(asm, arm64_str_x_uimm(pi, 29, _slot_byte_off(v.slot)));
+        pi = pi + 1;
+    }
+
+    _emit_block(ctx, asm, body_stmts, fn_env);
+
+    // Default fallthrough return 0
+    arm64_asm_emit(asm, arm64_movz(0, 0, 0));
+    arm64_asm_label(asm, fn_env.epilogue_label);
+    if fn_env.ret_type == "float" {
+        arm64_asm_emit(asm, arm64_fmov_d_from_x(0, 0));
+    }
+    if frame_bytes <= 504 {
+        arm64_asm_emit(asm, arm64_ldp_post(29, 30, 31, frame_bytes));
+    } else {
+        arm64_asm_emit(asm, arm64_add_imm(31, 31, frame_bytes - 16, false));
+        arm64_asm_emit(asm, arm64_ldp_post(29, 30, 31, 16));
+    }
+    arm64_asm_emit(asm, arm64_ret(30));
+    return nil;
+}
+
+fn _emit_runtime_helpers(ctx, asm, platform) {
+    if not ctx.uses_io { return nil; }
+
+    // __rt_write(X1 = buf_ptr, X2 = byte_len)
+    arm64_asm_label(asm, "__rt_write");
+    arm64_asm_emit(asm, arm64_movz(0, 1, 0)); // stdout fd = 1
+    if platform == "macos" {
+        arm64_asm_emit(asm, arm64_movz(16, 4, 0)); // macOS SYS_write = 4
+        arm64_asm_emit(asm, arm64_svc(128));       // SVC #0x80
+    } else {
+        arm64_asm_emit(asm, arm64_movz(8, 64, 0)); // Linux __NR_write = 64
+        arm64_asm_emit(asm, arm64_svc(0));         // SVC #0
+    }
+    arm64_asm_emit(asm, arm64_ret(30));
+
+    // __rt_print_bytes(X0 = ptr, X1 = len) -> writes ptr[0..len] + '\n'
+    arm64_asm_label(asm, "__rt_print_bytes");
+    arm64_asm_emit(asm, arm64_stp_pre(29, 30, 31, -32));
+    arm64_asm_emit(asm, arm64_mov_reg(29, 31));
+    let skip_body = _new_lbl(ctx, "pb_nl");
+    arm64_asm_fixup(asm, "cbz", skip_body, 1, 0);
+    arm64_asm_emit(asm, arm64_mov_reg(2, 1));
+    arm64_asm_emit(asm, arm64_mov_reg(1, 0));
+    arm64_asm_fixup(asm, "bl", "__rt_write", 0, 0);
+    arm64_asm_label(asm, skip_body);
+    arm64_asm_emit(asm, arm64_movz(9, 10, 0));
+    arm64_asm_emit(asm, arm64_strb_uimm(9, 31, 16));
+    arm64_asm_emit(asm, arm64_add_imm(1, 31, 16, false));
+    arm64_asm_emit(asm, arm64_movz(2, 1, 0));
+    arm64_asm_fixup(asm, "bl", "__rt_write", 0, 0);
+    arm64_asm_emit(asm, arm64_ldp_post(29, 30, 31, 32));
+    arm64_asm_emit(asm, arm64_ret(30));
+
+    if ctx.uses_print_bool {
+        let s_true = _intern_string(ctx, "true");
+        let s_false = _intern_string(ctx, "false");
+        let l_false = _new_lbl(ctx, "pbool_f");
+        let l_done = _new_lbl(ctx, "pbool_d");
+        arm64_asm_label(asm, "__rt_print_bool");
+        arm64_asm_emit(asm, arm64_stp_pre(29, 30, 31, -16));
+        arm64_asm_emit(asm, arm64_mov_reg(29, 31));
+        arm64_asm_fixup(asm, "cbz", l_false, 0, 0);
+        arm64_asm_fixup(asm, "adr", s_true.label, 0, 0);
+        arm64_asm_emit(asm, arm64_movz(1, 4, 0));
+        arm64_asm_fixup(asm, "bl", "__rt_print_bytes", 0, 0);
+        arm64_asm_fixup(asm, "b", l_done, 0, 0);
+        arm64_asm_label(asm, l_false);
+        arm64_asm_fixup(asm, "adr", s_false.label, 0, 0);
+        arm64_asm_emit(asm, arm64_movz(1, 5, 0));
+        arm64_asm_fixup(asm, "bl", "__rt_print_bytes", 0, 0);
+        arm64_asm_label(asm, l_done);
+        arm64_asm_emit(asm, arm64_ldp_post(29, 30, 31, 16));
+        arm64_asm_emit(asm, arm64_ret(30));
+    }
+
+    if ctx.uses_print_i64 {
+        let l_nz = _new_lbl(ctx, "pi_nz");
+        let l_pos = _new_lbl(ctx, "pi_pos");
+        let l_loop = _new_lbl(ctx, "pi_lp");
+        let l_done = _new_lbl(ctx, "pi_dn");
+
+        arm64_asm_label(asm, "__rt_print_i64");
+        arm64_asm_emit(asm, arm64_stp_pre(29, 30, 31, -64));
+        arm64_asm_emit(asm, arm64_mov_reg(29, 31));
+        arm64_asm_emit(asm, arm64_movz(9, 10, 0));
+        arm64_asm_emit(asm, arm64_strb_uimm(9, 31, 63));
+        arm64_asm_emit(asm, arm64_add_imm(10, 31, 63, false));
+        arm64_asm_emit(asm, arm64_movz(11, 0, 0));
+
+        arm64_asm_fixup(asm, "cbnz", l_nz, 0, 0);
+        arm64_asm_emit(asm, arm64_sub_imm(10, 10, 1, false));
+        arm64_asm_emit(asm, arm64_movz(9, 48, 0));
+        arm64_asm_emit(asm, arm64_strb_uimm(9, 10, 0));
+        arm64_asm_fixup(asm, "b", l_done, 0, 0);
+
+        arm64_asm_label(asm, l_nz);
+        arm64_asm_emit(asm, arm64_cmp_imm(0, 0));
+        arm64_asm_fixup(asm, "b_cond", l_pos, 0, ARM64_COND_GE);
+        arm64_asm_emit(asm, arm64_movz(11, 1, 0));
+        arm64_asm_emit(asm, arm64_neg_reg(0, 0));
+
+        arm64_asm_label(asm, l_pos);
+        arm64_asm_emit(asm, arm64_movz(12, 10, 0));
+        arm64_asm_label(asm, l_loop);
+        arm64_asm_emit(asm, arm64_udiv(13, 0, 12));
+        arm64_asm_emit(asm, arm64_msub(14, 13, 12, 0));
+        arm64_asm_emit(asm, arm64_add_imm(14, 14, 48, false));
+        arm64_asm_emit(asm, arm64_sub_imm(10, 10, 1, false));
+        arm64_asm_emit(asm, arm64_strb_uimm(14, 10, 0));
+        arm64_asm_emit(asm, arm64_mov_reg(0, 13));
+        arm64_asm_fixup(asm, "cbnz", l_loop, 0, 0);
+
+        arm64_asm_fixup(asm, "cbz", l_done, 11, 0);
+        arm64_asm_emit(asm, arm64_sub_imm(10, 10, 1, false));
+        arm64_asm_emit(asm, arm64_movz(9, 45, 0));
+        arm64_asm_emit(asm, arm64_strb_uimm(9, 10, 0));
+
+        arm64_asm_label(asm, l_done);
+        arm64_asm_emit(asm, arm64_add_imm(2, 31, 64, false));
+        arm64_asm_emit(asm, arm64_sub_reg(2, 2, 10));
+        arm64_asm_emit(asm, arm64_mov_reg(1, 10));
+        arm64_asm_fixup(asm, "bl", "__rt_write", 0, 0);
+        arm64_asm_emit(asm, arm64_ldp_post(29, 30, 31, 64));
+        arm64_asm_emit(asm, arm64_ret(30));
+    }
+
+    if ctx.uses_print_f64 {
+        let l_fpos = _new_lbl(ctx, "pf_pos");
+        let l_int_part = _new_lbl(ctx, "pf_int");
+        let l_trim = _new_lbl(ctx, "pf_trim");
+        let l_femit = _new_lbl(ctx, "pf_femit");
+        let l_izero = _new_lbl(ctx, "pf_iz");
+        let l_iloop = _new_lbl(ctx, "pf_ilp");
+        let l_isign = _new_lbl(ctx, "pf_sgn");
+        let l_fdone = _new_lbl(ctx, "pf_dn");
+
+        arm64_asm_label(asm, "__rt_print_f64");
+        arm64_asm_emit(asm, arm64_stp_pre(29, 30, 31, -96));
+        arm64_asm_emit(asm, arm64_mov_reg(29, 31));
+        arm64_asm_emit(asm, arm64_movz(9, 10, 0));
+        arm64_asm_emit(asm, arm64_strb_uimm(9, 31, 95));
+        arm64_asm_emit(asm, arm64_add_imm(10, 31, 95, false));
+        arm64_asm_emit(asm, arm64_movz(11, 0, 0));
+
+        arm64_asm_emit(asm, arm64_fcmp_zero_d(0));
+        arm64_asm_fixup(asm, "b_cond", l_fpos, 0, ARM64_COND_GE);
+        arm64_asm_emit(asm, arm64_movz(11, 1, 0));
+        arm64_asm_emit(asm, arm64_fneg_d(0, 0));
+
+        arm64_asm_label(asm, l_fpos);
+        // Scale by 1,000,000 and round to nearest
+        arm64_asm_emit_all(asm, arm64_mov_i64(12, 1000000));
+        arm64_asm_emit(asm, arm64_scvtf_d(1, 12));
+        arm64_asm_emit_all(asm, arm64_mov_f64_bits(2, 0.5, 9));
+        arm64_asm_emit(asm, arm64_fmul_d(3, 0, 1));
+        arm64_asm_emit(asm, arm64_fadd_d(3, 3, 2));
+        arm64_asm_emit(asm, arm64_fcvtzs_x(13, 3));
+
+        // X14 = int_part, X15 = frac_6digits
+        arm64_asm_emit(asm, arm64_udiv(14, 13, 12));
+        arm64_asm_emit(asm, arm64_msub(15, 14, 12, 13));
+        arm64_asm_emit(asm, arm64_movz(17, 10, 0)); // radix 10
+
+        arm64_asm_fixup(asm, "cbz", l_int_part, 15, 0);
+        arm64_asm_emit(asm, arm64_movz(16, 6, 0)); // 6 fractional digits
+
+        // Trim trailing fractional zeros
+        arm64_asm_label(asm, l_trim);
+        arm64_asm_emit(asm, arm64_udiv(9, 15, 17));
+        arm64_asm_emit(asm, arm64_msub(13, 9, 17, 15));
+        arm64_asm_fixup(asm, "cbnz", l_femit, 13, 0);
+        arm64_asm_emit(asm, arm64_mov_reg(15, 9));
+        arm64_asm_emit(asm, arm64_sub_imm(16, 16, 1, false));
+        arm64_asm_fixup(asm, "cbnz", l_trim, 16, 0);
+        arm64_asm_fixup(asm, "b", l_int_part, 0, 0);
+
+        // Emit remaining X16 fractional digits + '.'
+        arm64_asm_label(asm, l_femit);
+        arm64_asm_emit(asm, arm64_udiv(9, 15, 17));
+        arm64_asm_emit(asm, arm64_msub(13, 9, 17, 15));
+        arm64_asm_emit(asm, arm64_add_imm(13, 13, 48, false));
+        arm64_asm_emit(asm, arm64_sub_imm(10, 10, 1, false));
+        arm64_asm_emit(asm, arm64_strb_uimm(13, 10, 0));
+        arm64_asm_emit(asm, arm64_mov_reg(15, 9));
+        arm64_asm_emit(asm, arm64_sub_imm(16, 16, 1, false));
+        arm64_asm_fixup(asm, "cbnz", l_femit, 16, 0);
+
+        arm64_asm_emit(asm, arm64_sub_imm(10, 10, 1, false));
+        arm64_asm_emit(asm, arm64_movz(9, 46, 0)); // '.'
+        arm64_asm_emit(asm, arm64_strb_uimm(9, 10, 0));
+
+        // Emit integer part X14
+        arm64_asm_label(asm, l_int_part);
+        arm64_asm_fixup(asm, "cbnz", l_iloop, 14, 0);
+        arm64_asm_label(asm, l_izero);
+        arm64_asm_emit(asm, arm64_sub_imm(10, 10, 1, false));
+        arm64_asm_emit(asm, arm64_movz(9, 48, 0));
+        arm64_asm_emit(asm, arm64_strb_uimm(9, 10, 0));
+        arm64_asm_fixup(asm, "b", l_isign, 0, 0);
+
+        arm64_asm_label(asm, l_iloop);
+        arm64_asm_emit(asm, arm64_udiv(9, 14, 17));
+        arm64_asm_emit(asm, arm64_msub(13, 9, 17, 14));
+        arm64_asm_emit(asm, arm64_add_imm(13, 13, 48, false));
+        arm64_asm_emit(asm, arm64_sub_imm(10, 10, 1, false));
+        arm64_asm_emit(asm, arm64_strb_uimm(13, 10, 0));
+        arm64_asm_emit(asm, arm64_mov_reg(14, 9));
+        arm64_asm_fixup(asm, "cbnz", l_iloop, 14, 0);
+
+        arm64_asm_label(asm, l_isign);
+        arm64_asm_fixup(asm, "cbz", l_fdone, 11, 0);
+        arm64_asm_emit(asm, arm64_sub_imm(10, 10, 1, false));
+        arm64_asm_emit(asm, arm64_movz(9, 45, 0));
+        arm64_asm_emit(asm, arm64_strb_uimm(9, 10, 0));
+
+        arm64_asm_label(asm, l_fdone);
+        arm64_asm_emit(asm, arm64_add_imm(2, 31, 96, false));
+        arm64_asm_emit(asm, arm64_sub_reg(2, 2, 10));
+        arm64_asm_emit(asm, arm64_mov_reg(1, 10));
+        arm64_asm_fixup(asm, "bl", "__rt_write", 0, 0);
+        arm64_asm_emit(asm, arm64_ldp_post(29, 30, 31, 96));
+        arm64_asm_emit(asm, arm64_ret(30));
+    }
+
+    // Emit aligned read-only string literal pool
+    let si = 0;
+    while si < len(ctx.strings) {
+        let sinfo = ctx.strings[si];
+        while (len(asm.bytes) % 4) != 0 {
+            array_push(asm.bytes, 0);
+        }
+        arm64_asm_label(asm, sinfo.label);
+        _append_bytes(asm.bytes, sinfo.bytes);
+        array_push(asm.bytes, 0);
+        while (len(asm.bytes) % 4) != 0 {
+            array_push(asm.bytes, 0);
+        }
+        si = si + 1;
+    }
+    return nil;
+}
+
+fn compile_sapp_to_arm64(src_code, opts = nil) {
+    let platform = "linux";
+    let emit_start = true;
+    if is_map(opts) {
+        if map_has(opts, "platform") and opts.platform != nil {
+            platform = str_lower(str(opts.platform));
+        }
+        if map_has(opts, "emit_start") and type(opts.emit_start) == "bool" {
+            emit_start = opts.emit_start;
+        }
+    }
+    if platform == "darwin" or platform == "macos-arm64" or platform == "darwin-arm64" or platform == "apple" {
+        platform = "macos";
+    } else {
+        platform = "linux";
+    }
+
+    let tokens = _TOKENIZER.tokenize(src_code);
+    let num_toks = [];
+    let ti = 0;
+    while ti < len(tokens) {
+        if tokens[ti].kind == "number" {
+            array_push(num_toks, tokens[ti]);
+        }
+        ti = ti + 1;
+    }
+    let parsed = _PARSER.parse(tokens);
+    if len(parsed.errors) > 0 {
+        _fail("parse error: " + str(parsed.errors[0]));
+    }
+    _annotate_number_tokens(parsed.stmts, num_toks, [0]);
+
+    let fn_decls = [];
+    let top_stmts = [];
+    let fn_sigs = map{};
+
+    let i = 0;
+    while i < len(parsed.stmts) {
+        let st = parsed.stmts[i];
+        if st != nil and is_map(st) and st.kind == "fn" {
+            let ptypes = [];
+            let pi = 0;
+            while pi < len(st.params) {
+                let pt = _norm_decl_type(st.params[pi].type);
+                if pt == nil { pt = "int"; }
+                array_push(ptypes, pt);
+                pi = pi + 1;
+            }
+            let rt = _norm_decl_type(st.ret);
+            if rt == nil { rt = "int"; }
+            let sig = map{
+                name: st.name,
+                label: "__fn_" + st.name,
+                param_types: ptypes,
+                ret_type: rt
+            };
+            fn_sigs[st.name] = sig;
+            array_push(fn_decls, st);
+        } else {
+            array_push(top_stmts, st);
+        }
+        i = i + 1;
+    }
+
+    // Two-pass return/param type refinement for float-returning functions
+    let pass = 0;
+    while pass < 2 {
+        let fi = 0;
+        while fi < len(fn_decls) {
+            let fd = fn_decls[fi];
+            let sig = fn_sigs[fd.name];
+            let tmp_env = map{ vars: map{}, next_slot: 0, ret_type: sig.ret_type };
+            let pi = 0;
+            while pi < len(fd.params) {
+                _alloc_slot(tmp_env, fd.params[pi].name, sig.param_types[pi]);
+                pi = pi + 1;
+            }
+            _prescan_block(fd.body.stmts, tmp_env, fn_sigs);
+            sig.ret_type = tmp_env.ret_type;
+            fi = fi + 1;
+        }
+        pass = pass + 1;
+    }
+
+    let ctx = map{
+        fn_sigs: fn_sigs,
+        lbl_seq: 0,
+        strings: [],
+        str_map: map{},
+        uses_io: false,
+        uses_print_bool: false,
+        uses_print_i64: false,
+        uses_print_f64: false,
+        uses_print_or_fp: false
+    };
+
+    let asm = arm64_asm_new();
+    let has_main = map_has(fn_sigs, "main");
+    let has_top = len(top_stmts) > 0;
+
+    if emit_start {
+        arm64_asm_label(asm, "_start");
+        arm64_asm_emit(asm, arm64_movz(29, 0, 0));
+        if has_top {
+            arm64_asm_fixup(asm, "bl", "__top_level_entry", 0, 0);
+        }
+        if has_main {
+            arm64_asm_fixup(asm, "bl", fn_sigs["main"].label, 0, 0);
+            if fn_sigs["main"].ret_type == "float" {
+                arm64_asm_emit(asm, arm64_fcvtzs_x(0, 0));
+            }
+        } elif not has_top {
+            arm64_asm_emit(asm, arm64_movz(0, 0, 0));
+        }
+        if platform == "macos" {
+            arm64_asm_emit(asm, arm64_movz(16, 1, 0)); // macOS SYS_exit = 1
+            arm64_asm_emit(asm, arm64_svc(128));       // SVC #0x80
+        } else {
+            arm64_asm_emit(asm, arm64_movz(8, 93, 0)); // Linux __NR_exit = 93
+            arm64_asm_emit(asm, arm64_svc(0));         // SVC #0
+        }
+    }
+
+    if has_top {
+        let top_sig = map{ name: "__top", label: "__top_level_entry", param_types: [], ret_type: "int" };
+        _emit_function(ctx, asm, "__top", [], top_stmts, top_sig);
+    }
+
+    let fi = 0;
+    while fi < len(fn_decls) {
+        let fd = fn_decls[fi];
+        _emit_function(ctx, asm, fd.name, fd.params, fd.body.stmts, fn_sigs[fd.name]);
+        fi = fi + 1;
+    }
+
+    let text_insns_end_bytes = len(asm.bytes);
+    _emit_runtime_helpers(ctx, asm, platform);
+    let code_bytes = arm64_asm_finalize(asm);
+
+    let entry_off = 0;
+    if emit_start and map_has(asm.labels, "_start") {
+        entry_off = asm.labels["_start"] * 4;
+    } elif has_main {
+        entry_off = asm.labels[fn_sigs["main"].label] * 4;
+    }
+
+    return map{
+        code: code_bytes,
+        entry_offset: entry_off,
+        platform: platform,
+        labels: asm.labels,
+        user_code_bytes: text_insns_end_bytes,
+        strings_count: len(ctx.strings)
+    };
+}
+
+// ── Zero-Dependency Standalone Binary Linkers (Linux ELF64 & macOS Mach-O) ──
+
+fn _resolve_code_payload(src_or_code, platform) {
+    if type(src_or_code) == "string" {
+        return compile_sapp_to_arm64(src_or_code, map{ platform: platform, emit_start: true });
+    }
+    if is_map(src_or_code) and map_has(src_or_code, "code") {
+        let eoff = if map_has(src_or_code, "entry_offset") { src_or_code.entry_offset } else { 0 };
+        return map{ code: src_or_code.code, entry_offset: eoff, platform: platform };
+    }
+    if is_array(src_or_code) {
+        return map{ code: src_or_code, entry_offset: 0, platform: platform };
+    }
+    _fail("expected .sapp source string, compiled map, or A64 byte array");
+    return nil;
+}
+
+fn build_linux_arm64_elf64(src_or_code, out_path = nil) {
+    let payload = _resolve_code_payload(src_or_code, "linux");
+    let code = payload.code;
+    let total_size = ELF_HEADER_TOTAL + len(code);
+    let entry_vaddr = ELF_BASE_VADDR + ELF_HEADER_TOTAL + payload.entry_offset;
+
+    let out = [];
+    // ELF64 Header (64 bytes)
+    array_push(out, 127); array_push(out, 69); array_push(out, 76); array_push(out, 70); // \x7FELF
+    array_push(out, 2);   // EI_CLASS = ELFCLASS64
+    array_push(out, 1);   // EI_DATA  = ELFDATA2LSB (little-endian)
+    array_push(out, 1);   // EI_VERSION = EV_CURRENT
+    array_push(out, 0);   // EI_OSABI = ELFOSABI_NONE
+    let z = 0;
+    while z < 8 { array_push(out, 0); z = z + 1; }
+
+    _push_u16_le(out, 2);                // e_type = ET_EXEC (2)
+    _push_u16_le(out, ELF_EM_AARCH64);   // e_machine = EM_AARCH64 (183)
+    _push_u32_le(out, 1);                // e_version = 1
+    _push_u64_num(out, entry_vaddr);     // e_entry
+    _push_u64_num(out, 64);              // e_phoff = 64
+    _push_u64_num(out, 0);               // e_shoff = 0
+    _push_u32_le(out, 0);                // e_flags = 0
+    _push_u16_le(out, 64);               // e_ehsize = 64
+    _push_u16_le(out, 56);               // e_phentsize = 56
+    _push_u16_le(out, 1);                // e_phnum = 1
+    _push_u16_le(out, 64);               // e_shentsize = 64
+    _push_u16_le(out, 0);                // e_shnum = 0
+    _push_u16_le(out, 0);                // e_shstrndx = 0
+
+    // Program Header PT_LOAD (56 bytes)
+    _push_u32_le(out, 1);                // p_type = PT_LOAD
+    _push_u32_le(out, 5);                // p_flags = PF_R | PF_X (4 | 1)
+    _push_u64_num(out, 0);               // p_offset = 0
+    _push_u64_num(out, ELF_BASE_VADDR);  // p_vaddr = 0x400000
+    _push_u64_num(out, ELF_BASE_VADDR);  // p_paddr = 0x400000
+    _push_u64_num(out, total_size);      // p_filesz
+    _push_u64_num(out, total_size);      // p_memsz
+    _push_u64_num(out, 65536);           // p_align = 0x10000 (64 KiB)
+
+    _append_bytes(out, code);
+
+    if out_path != nil {
+        fs_write_bytes(out_path, out);
+    }
+    return out;
+}
+
+fn build_apple_silicon_macho64(src_or_code, out_path = nil) {
+    let payload = _resolve_code_payload(src_or_code, "macos");
+    let code = payload.code;
+    let text_file_off = 1024; // 0x400 aligned header region
+    let raw_total = text_file_off + len(code);
+    let aligned_total = num_floor((raw_total + MACHO_PAGE_SIZE - 1) / MACHO_PAGE_SIZE) * MACHO_PAGE_SIZE;
+    if aligned_total < MACHO_PAGE_SIZE { aligned_total = MACHO_PAGE_SIZE; }
+    let entry_file_off = text_file_off + payload.entry_offset;
+
+    let cmds = [];
+
+    // 1. LC_SEGMENT_64 __PAGEZERO (72 bytes)
+    _push_u32_le(cmds, MACHO_LC_SEGMENT_64);
+    _push_u32_le(cmds, 72);
+    _push_padded_ascii(cmds, "__PAGEZERO", 16);
+    _push_u64_le(cmds, 0, 0);   // vmaddr = 0
+    _push_u64_le(cmds, 0, 1);   // vmsize = 0x100000000 (4 GiB)
+    _push_u64_le(cmds, 0, 0);   // fileoff = 0
+    _push_u64_le(cmds, 0, 0);   // filesize = 0
+    _push_u32_le(cmds, 0);      // maxprot = 0
+    _push_u32_le(cmds, 0);      // initprot = 0
+    _push_u32_le(cmds, 0);      // nsects = 0
+    _push_u32_le(cmds, 0);      // flags = 0
+
+    // 2. LC_SEGMENT_64 __TEXT + __text section (72 + 80 = 152 bytes)
+    _push_u32_le(cmds, MACHO_LC_SEGMENT_64);
+    _push_u32_le(cmds, 152);
+    _push_padded_ascii(cmds, "__TEXT", 16);
+    _push_u64_le(cmds, 0, 1);               // vmaddr = 0x100000000
+    _push_u64_num(cmds, aligned_total);     // vmsize
+    _push_u64_le(cmds, 0, 0);               // fileoff = 0
+    _push_u64_num(cmds, aligned_total);     // filesize
+    _push_u32_le(cmds, 5);                  // maxprot = VM_PROT_READ | VM_PROT_EXECUTE
+    _push_u32_le(cmds, 5);                  // initprot = VM_PROT_READ | VM_PROT_EXECUTE
+    _push_u32_le(cmds, 1);                  // nsects = 1
+    _push_u32_le(cmds, 0);                  // flags = 0
+
+    // section_64 __text (80 bytes)
+    _push_padded_ascii(cmds, "__text", 16);
+    _push_padded_ascii(cmds, "__TEXT", 16);
+    _push_u64_le(cmds, text_file_off, 1);   // addr = 0x100000000 + text_file_off
+    _push_u64_num(cmds, len(code));         // size
+    _push_u32_le(cmds, text_file_off);      // offset
+    _push_u32_le(cmds, 2);                  // align = 2^2 (4-byte A64 alignment)
+    _push_u32_le(cmds, 0);                  // reloff = 0
+    _push_u32_le(cmds, 0);                  // nreloc = 0
+    _push_u32_le(cmds, 2147484672);         // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+    _push_u32_le(cmds, 0);
+    _push_u32_le(cmds, 0);
+    _push_u32_le(cmds, 0);
+
+    // 3. LC_BUILD_VERSION (24 bytes)
+    _push_u32_le(cmds, MACHO_LC_BUILD_VERSION);
+    _push_u32_le(cmds, 24);
+    _push_u32_le(cmds, MACHO_PLATFORM_MACOS); // PLATFORM_MACOS = 1
+    _push_u32_le(cmds, 917504);               // 14.0.0 (0x000E0000)
+    _push_u32_le(cmds, 917504);               // SDK 14.0.0
+    _push_u32_le(cmds, 0);                    // ntools = 0
+
+    // 4. LC_LOAD_DYLINKER (32 bytes)
+    _push_u32_le(cmds, MACHO_LC_LOAD_DYLINKER);
+    _push_u32_le(cmds, 32);
+    _push_u32_le(cmds, 12);
+    _push_padded_ascii(cmds, "/usr/lib/dyld", 20);
+
+    // 5. LC_LOAD_DYLIB libSystem.B.dylib (56 bytes)
+    _push_u32_le(cmds, MACHO_LC_LOAD_DYLIB);
+    _push_u32_le(cmds, 56);
+    _push_u32_le(cmds, 24);
+    _push_u32_le(cmds, 2);
+    _push_u32_le(cmds, 88801280);             // 1355.0.0
+    _push_u32_le(cmds, 65536);                // 1.0.0
+    _push_padded_ascii(cmds, "/usr/lib/libSystem.B.dylib", 32);
+
+    // 6. LC_MAIN (24 bytes)
+    _push_u32_le(cmds, MACHO_LC_MAIN);
+    _push_u32_le(cmds, 24);
+    _push_u64_num(cmds, entry_file_off);
+    _push_u64_le(cmds, 0, 0);
+
+    let out = [];
+    // mach_header_64 (32 bytes)
+    _push_u32_le(out, MACHO_MH_MAGIC_64);
+    _push_u32_le(out, MACHO_CPU_TYPE_ARM64);
+    _push_u32_le(out, 0);                     // CPU_SUBTYPE_ARM64_ALL
+    _push_u32_le(out, MACHO_MH_EXECUTE);
+    _push_u32_le(out, 6);                     // ncmds = 6
+    _push_u32_le(out, len(cmds));             // sizeofcmds
+    _push_u32_le(out, MACHO_MH_FLAGS_PIE);
+    _push_u32_le(out, 0);                     // reserved
+
+    _append_bytes(out, cmds);
+    while len(out) < text_file_off {
+        array_push(out, 0);
+    }
+    _append_bytes(out, code);
+    while len(out) < aligned_total {
+        array_push(out, 0);
+    }
+
+    if out_path != nil {
+        fs_write_bytes(out_path, out);
+    }
+    return out;
+}
+
+// ── Binary Format Inspector (ELF64 / Mach-O 64 / Raw A64) ───────────────────
+
+fn _extract_binary_image(bin_or_map) {
+    if is_map(bin_or_map) and map_has(bin_or_map, "code") {
+        let c = bin_or_map.code;
+        let e = if map_has(bin_or_map, "entry_offset") { bin_or_map.entry_offset } else { 0 };
+        let base = 4194304;
+        return map{
+            format: "raw",
+            base_addr: base,
+            entry_addr: base + e,
+            code_offset: 0,
+            code_size: len(c),
+            image_bytes: c,
+            load_addr: base,
+            load_bytes: c
+        };
+    }
+    let b = bin_or_map;
+    if not is_array(b) {
+        _fail("expected byte array or compiled ARM64 map");
+    }
+    // Check ELF64 (\x7FELF)
+    if len(b) >= 120 and b[0] == 127 and b[1] == 69 and b[2] == 76 and b[3] == 70 {
+        let machine = _read_u16_le(b, 18);
+        if machine != ELF_EM_AARCH64 {
+            _fail("ELF e_machine is not EM_AARCH64 (183): " + str(machine));
+        }
+        let entry = _read_u64_le_num(b, 24);
+        let phoff = _read_u64_le_num(b, 32);
+        let p_offset = _read_u64_le_num(b, phoff + 8);
+        let p_vaddr = _read_u64_le_num(b, phoff + 16);
+        let p_filesz = _read_u64_le_num(b, phoff + 32);
+        let hdr_sz = ELF_HEADER_TOTAL;
+        let code_slice = [];
+        let i = hdr_sz;
+        while i < len(b) and i < p_offset + p_filesz {
+            array_push(code_slice, b[i]);
+            i = i + 1;
+        }
+        return map{
+            format: "elf64-aarch64",
+            base_addr: p_vaddr + hdr_sz,
+            entry_addr: entry,
+            code_offset: hdr_sz,
+            code_size: len(code_slice),
+            image_bytes: code_slice,
+            load_addr: p_vaddr,
+            load_bytes: b
+        };
+    }
+    // Check Mach-O 64 (0xFEEDFACF -> CF FA ED FE)
+    if len(b) >= 32 and b[0] == 207 and b[1] == 250 and b[2] == 237 and b[3] == 254 {
+        let cputype = _read_u32_le(b, 4);
+        if cputype != MACHO_CPU_TYPE_ARM64 {
+            _fail("Mach-O cputype is not CPU_TYPE_ARM64: " + str(cputype));
+        }
+        let ncmds = _read_u32_le(b, 16);
+        let pos = 32;
+        let text_vmaddr = 4294967296;
+        let sect_off = 1024;
+        let sect_sz = 0;
+        let entry_off = 1024;
+        let ci = 0;
+        while ci < ncmds and pos + 8 <= len(b) {
+            let cmd = _read_u32_le(b, pos);
+            let cmdsize = _read_u32_le(b, pos + 4);
+            if cmd == MACHO_LC_SEGMENT_64 and cmdsize >= 72 {
+                let nsects = _read_u32_le(b, pos + 64);
+                if nsects > 0 and pos + 152 <= len(b) {
+                    text_vmaddr = _read_u64_le_num(b, pos + 24);
+                    sect_sz = _read_u64_le_num(b, pos + 72 + 40);
+                    sect_off = _read_u32_le(b, pos + 72 + 48);
+                }
+            } elif cmd == MACHO_LC_MAIN and cmdsize >= 16 {
+                entry_off = _read_u64_le_num(b, pos + 8);
+            }
+            pos = pos + cmdsize;
+            ci = ci + 1;
+        }
+        let code_slice = [];
+        let i = sect_off;
+        while i < len(b) and i < sect_off + sect_sz {
+            array_push(code_slice, b[i]);
+            i = i + 1;
+        }
+        return map{
+            format: "macho64-arm64",
+            base_addr: text_vmaddr + sect_off,
+            entry_addr: text_vmaddr + entry_off,
+            code_offset: sect_off,
+            code_size: len(code_slice),
+            image_bytes: code_slice,
+            load_addr: text_vmaddr,
+            load_bytes: b
+        };
+    }
+    let base = 4194304;
+    return map{
+        format: "raw",
+        base_addr: base,
+        entry_addr: base,
+        code_offset: 0,
+        code_size: len(b),
+        image_bytes: b,
+        load_addr: base,
+        load_bytes: b
+    };
+}
+
+// ── 100% Pure-PBLang ARM64 A64 Disassembler ─────────────────────────────────
+
+fn _hex_u32(w) {
+    let digits = "0123456789abcdef";
+    let v = _u32(w);
+    let out = "";
+    let i = 0;
+    while i < 8 {
+        let nib = v % 16;
+        out = str_slice(digits, nib, nib + 1) + out;
+        v = num_floor(v / 16);
+        i = i + 1;
+    }
+    return "0x" + out;
+}
+
+fn _gpr_name(r, allow_sp) {
+    if r == 31 {
+        return if allow_sp { "sp" } else { "xzr" };
+    }
+    return "x" + str(r);
+}
+
+fn _cond_name(cc) {
+    let names = ["eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al", "nv"];
+    return names[cc % 16];
+}
+
+fn _sign_ext(val, bits) {
+    let half = _pow2(bits - 1);
+    if val >= half { return val - half * 2; }
+    return val;
+}
+
+fn _decode_one_arm64(w, pc_addr) {
+    let rd = w % 32;
+    let rn = num_floor(w / 32) % 32;
+    let rm = num_floor(w / 65536) % 32;
+    let ra = num_floor(w / 1024) % 32;
+
+    if w == 0xD503201F {
+        return map{ mnemonic: "nop", operands: "" };
+    }
+    // SVC #imm16
+    if bit_and(w, 0xFFE0001F) == 0xD4000001 {
+        let imm16 = num_floor(w / 32) % 65536;
+        return map{ mnemonic: "svc", operands: "#" + str(imm16) };
+    }
+    // RET / BR / BLR
+    if bit_and(w, 0xFFFFFC1F) == 0xD65F0000 {
+        let ops = if rn == 30 { "" } else { _gpr_name(rn, false) };
+        return map{ mnemonic: "ret", operands: ops };
+    }
+    if bit_and(w, 0xFFFFFC1F) == 0xD63F0000 {
+        return map{ mnemonic: "blr", operands: _gpr_name(rn, false) };
+    }
+    if bit_and(w, 0xFFFFFC1F) == 0xD61F0000 {
+        return map{ mnemonic: "br", operands: _gpr_name(rn, false) };
+    }
+    // B / BL (26-bit signed word offset)
+    let top6 = num_floor(w / 67108864);
+    if top6 == 5 or top6 == 37 {
+        let off26 = _sign_ext(w % 67108864, 26);
+        let mn = if top6 == 37 { "bl" } else { "b" };
+        return map{ mnemonic: mn, operands: _hex_u32(pc_addr + off26 * 4) };
+    }
+    // B.cond
+    if num_floor(w / 16777216) == 84 and (num_floor(w / 16) % 2) == 0 {
+        let off19 = _sign_ext(num_floor(w / 32) % 524288, 19);
+        let cc = w % 16;
+        return map{ mnemonic: "b." + _cond_name(cc), operands: _hex_u32(pc_addr + off19 * 4) };
+    }
+    // CBZ / CBNZ
+    let top8 = num_floor(w / 16777216);
+    if top8 == 180 or top8 == 181 {
+        let off19 = _sign_ext(num_floor(w / 32) % 524288, 19);
+        let mn = if top8 == 181 { "cbnz" } else { "cbz" };
+        return map{ mnemonic: mn, operands: _gpr_name(rd, false) + ", " + _hex_u32(pc_addr + off19 * 4) };
+    }
+    // ADR
+    if bit_and(w, 0x9F000000) == 0x10000000 {
+        let immlo = num_floor(w / 536870912) % 4;
+        let immhi = num_floor(w / 32) % 524288;
+        let s21 = _sign_ext(immhi * 4 + immlo, 21);
+        return map{ mnemonic: "adr", operands: _gpr_name(rd, false) + ", " + _hex_u32(pc_addr + s21) };
+    }
+    // MOVZ / MOVN / MOVK
+    let top9 = num_floor(w / 8388608);
+    if top9 == 421 or top9 == 293 or top9 == 485 {
+        let hw = num_floor(w / 2097152) % 4;
+        let imm16 = num_floor(w / 32) % 65536;
+        let mn = if top9 == 421 { "movz" } elif top9 == 293 { "movn" } else { "movk" };
+        let sfx = if hw > 0 { ", lsl #" + str(hw * 16) } else { "" };
+        return map{ mnemonic: mn, operands: _gpr_name(rd, false) + ", #" + str(imm16) + sfx };
+    }
+    // ADD / SUB / CMP immediate
+    if top8 == 145 or top8 == 209 or top8 == 241 {
+        let sh = num_floor(w / 4194304) % 2;
+        let imm12 = num_floor(w / 1024) % 4096;
+        let val = if sh == 1 { imm12 * 4096 } else { imm12 };
+        if top8 == 241 and rd == 31 {
+            return map{ mnemonic: "cmp", operands: _gpr_name(rn, true) + ", #" + str(val) };
+        }
+        if top8 == 145 and val == 0 and (rd == 31 or rn == 31) {
+            return map{ mnemonic: "mov", operands: _gpr_name(rd, true) + ", " + _gpr_name(rn, true) };
+        }
+        let mn = if top8 == 145 { "add" } else { "sub" };
+        return map{ mnemonic: mn, operands: _gpr_name(rd, true) + ", " + _gpr_name(rn, true) + ", #" + str(val) };
+    }
+    // CSET (CSINC Rd, XZR, XZR, inv_cond)
+    if bit_and(w, 0xFFFF0FFE) == 0x9A9F07E0 or bit_and(w, 0xFFFF0FE0) == 0x9A9F07E0 {
+        let inv_cc = num_floor(w / 4096) % 16;
+        return map{ mnemonic: "cset", operands: _gpr_name(rd, false) + ", " + _cond_name(bit_xor(inv_cc, 1)) };
+    }
+    // MADD / MUL / MSUB
+    if bit_and(w, 0xFFE08000) == 0x9B000000 {
+        if ra == 31 {
+            return map{ mnemonic: "mul", operands: _gpr_name(rd, false) + ", " + _gpr_name(rn, false) + ", " + _gpr_name(rm, false) };
+        }
+        return map{ mnemonic: "madd", operands: _gpr_name(rd, false) + ", " + _gpr_name(rn, false) + ", " + _gpr_name(rm, false) + ", " + _gpr_name(ra, false) };
+    }
+    if bit_and(w, 0xFFE08000) == 0x9B008000 {
+        return map{ mnemonic: "msub", operands: _gpr_name(rd, false) + ", " + _gpr_name(rn, false) + ", " + _gpr_name(rm, false) + ", " + _gpr_name(ra, false) };
+    }
+    // SDIV / UDIV / LSLV / LSRV / ASRV
+    if bit_and(w, 0xFFE0FC00) == 0x9AC00C00 {
+        return map{ mnemonic: "sdiv", operands: _gpr_name(rd, false) + ", " + _gpr_name(rn, false) + ", " + _gpr_name(rm, false) };
+    }
+    if bit_and(w, 0xFFE0FC00) == 0x9AC00800 {
+        return map{ mnemonic: "udiv", operands: _gpr_name(rd, false) + ", " + _gpr_name(rn, false) + ", " + _gpr_name(rm, false) };
+    }
+    if bit_and(w, 0xFFE0FC00) == 0x9AC02000 {
+        return map{ mnemonic: "lsl", operands: _gpr_name(rd, false) + ", " + _gpr_name(rn, false) + ", " + _gpr_name(rm, false) };
+    }
+    if bit_and(w, 0xFFE0FC00) == 0x9AC02400 {
+        return map{ mnemonic: "lsr", operands: _gpr_name(rd, false) + ", " + _gpr_name(rn, false) + ", " + _gpr_name(rm, false) };
+    }
+    if bit_and(w, 0xFFE0FC00) == 0x9AC02800 {
+        return map{ mnemonic: "asr", operands: _gpr_name(rd, false) + ", " + _gpr_name(rn, false) + ", " + _gpr_name(rm, false) };
+    }
+    // ADD / SUB / CMP / AND / ORR / MOV / EOR (shifted register)
+    if bit_and(w, 0xFFE0FC00) == 0x8B000000 {
+        return map{ mnemonic: "add", operands: _gpr_name(rd, false) + ", " + _gpr_name(rn, false) + ", " + _gpr_name(rm, false) };
+    }
+    if bit_and(w, 0xFFE0FC00) == 0xCB000000 {
+        if rn == 31 {
+            return map{ mnemonic: "neg", operands: _gpr_name(rd, false) + ", " + _gpr_name(rm, false) };
+        }
+        return map{ mnemonic: "sub", operands: _gpr_name(rd, false) + ", " + _gpr_name(rn, false) + ", " + _gpr_name(rm, false) };
+    }
+    if bit_and(w, 0xFFE0FC1F) == 0xEB00001F {
+        return map{ mnemonic: "cmp", operands: _gpr_name(rn, false) + ", " + _gpr_name(rm, false) };
+    }
+    if bit_and(w, 0xFFE0FC00) == 0x8A000000 {
+        return map{ mnemonic: "and", operands: _gpr_name(rd, false) + ", " + _gpr_name(rn, false) + ", " + _gpr_name(rm, false) };
+    }
+    if bit_and(w, 0xFFE0FC00) == 0xAA000000 {
+        if rn == 31 {
+            return map{ mnemonic: "mov", operands: _gpr_name(rd, false) + ", " + _gpr_name(rm, false) };
+        }
+        return map{ mnemonic: "orr", operands: _gpr_name(rd, false) + ", " + _gpr_name(rn, false) + ", " + _gpr_name(rm, false) };
+    }
+    if bit_and(w, 0xFFE0FC00) == 0xCA000000 {
+        return map{ mnemonic: "eor", operands: _gpr_name(rd, false) + ", " + _gpr_name(rn, false) + ", " + _gpr_name(rm, false) };
+    }
+    // STP / LDP (pre-index, post-index, signed offset)
+    let top10 = num_floor(w / 4194304);
+    if top10 == 678 or top10 == 675 or top10 == 676 or top10 == 677 {
+        let imm7 = _sign_ext(num_floor(w / 32768) % 128, 7) * 8;
+        let rt2 = ra;
+        if top10 == 678 {
+            return map{ mnemonic: "stp", operands: _gpr_name(rd, false) + ", " + _gpr_name(rt2, false) + ", [" + _gpr_name(rn, true) + ", #" + str(imm7) + "]!" };
+        }
+        if top10 == 675 {
+            return map{ mnemonic: "ldp", operands: _gpr_name(rd, false) + ", " + _gpr_name(rt2, false) + ", [" + _gpr_name(rn, true) + "], #" + str(imm7) };
+        }
+        let mn = if top10 == 676 { "stp" } else { "ldp" };
+        return map{ mnemonic: mn, operands: _gpr_name(rd, false) + ", " + _gpr_name(rt2, false) + ", [" + _gpr_name(rn, true) + ", #" + str(imm7) + "]" };
+    }
+    // LDR / STR 64-bit unsigned offset (X & D) and LDRB / STRB
+    if top10 == 997 or top10 == 996 {
+        let off = (num_floor(w / 1024) % 4096) * 8;
+        let mn = if top10 == 997 { "ldr" } else { "str" };
+        return map{ mnemonic: mn, operands: _gpr_name(rd, false) + ", [" + _gpr_name(rn, true) + ", #" + str(off) + "]" };
+    }
+    if top10 == 1013 or top10 == 1012 {
+        let off = (num_floor(w / 1024) % 4096) * 8;
+        let mn = if top10 == 1013 { "ldr" } else { "str" };
+        return map{ mnemonic: mn, operands: "d" + str(rd) + ", [" + _gpr_name(rn, true) + ", #" + str(off) + "]" };
+    }
+    if top10 == 229 or top10 == 228 {
+        let off = num_floor(w / 1024) % 4096;
+        let mn = if top10 == 229 { "ldrb" } else { "strb" };
+        return map{ mnemonic: mn, operands: "w" + str(rd) + ", [" + _gpr_name(rn, true) + ", #" + str(off) + "]" };
+    }
+    // IEEE-754 Scalar FP64 instructions
+    if bit_and(w, 0xFFFFFC00) == 0x9E670000 {
+        return map{ mnemonic: "fmov", operands: "d" + str(rd) + ", " + _gpr_name(rn, false) };
+    }
+    if bit_and(w, 0xFFFFFC00) == 0x9E660000 {
+        return map{ mnemonic: "fmov", operands: _gpr_name(rd, false) + ", d" + str(rn) };
+    }
+    if bit_and(w, 0xFFFFFC00) == 0x1E604000 {
+        return map{ mnemonic: "fmov", operands: "d" + str(rd) + ", d" + str(rn) };
+    }
+    if bit_and(w, 0xFFFFFC00) == 0x9E620000 {
+        return map{ mnemonic: "scvtf", operands: "d" + str(rd) + ", " + _gpr_name(rn, false) };
+    }
+    if bit_and(w, 0xFFFFFC00) == 0x9E780000 {
+        return map{ mnemonic: "fcvtzs", operands: _gpr_name(rd, false) + ", d" + str(rn) };
+    }
+    if bit_and(w, 0xFFE0FC00) == 0x1E602800 {
+        return map{ mnemonic: "fadd", operands: "d" + str(rd) + ", d" + str(rn) + ", d" + str(rm) };
+    }
+    if bit_and(w, 0xFFE0FC00) == 0x1E603800 {
+        return map{ mnemonic: "fsub", operands: "d" + str(rd) + ", d" + str(rn) + ", d" + str(rm) };
+    }
+    if bit_and(w, 0xFFE0FC00) == 0x1E600800 {
+        return map{ mnemonic: "fmul", operands: "d" + str(rd) + ", d" + str(rn) + ", d" + str(rm) };
+    }
+    if bit_and(w, 0xFFE0FC00) == 0x1E601800 {
+        return map{ mnemonic: "fdiv", operands: "d" + str(rd) + ", d" + str(rn) + ", d" + str(rm) };
+    }
+    if bit_and(w, 0xFFFFFC00) == 0x1E614000 {
+        return map{ mnemonic: "fneg", operands: "d" + str(rd) + ", d" + str(rn) };
+    }
+    if bit_and(w, 0xFFFFFC00) == 0x1E60C000 {
+        return map{ mnemonic: "fabs", operands: "d" + str(rd) + ", d" + str(rn) };
+    }
+    if bit_and(w, 0xFFFFFC00) == 0x1E61C000 {
+        return map{ mnemonic: "fsqrt", operands: "d" + str(rd) + ", d" + str(rn) };
+    }
+    if bit_and(w, 0xFFE0FC1F) == 0x1E602000 {
+        return map{ mnemonic: "fcmp", operands: "d" + str(rn) + ", d" + str(rm) };
+    }
+    if bit_and(w, 0xFFFFFC1F) == 0x1E602008 {
+        return map{ mnemonic: "fcmp", operands: "d" + str(rn) + ", #0.0" };
+    }
+    return map{ mnemonic: ".word", operands: _hex_u32(w) };
+}
+
+fn disassemble_arm64(bytes_or_bin) {
+    let img = _extract_binary_image(bytes_or_bin);
+    let b = img.image_bytes;
+    let out = [];
+    let off = 0;
+    while off + 4 <= len(b) {
+        let w = _read_u32_le(b, off);
+        let addr = img.base_addr + off;
+        let dec = _decode_one_arm64(w, addr);
+        let txt = if dec.operands == "" { dec.mnemonic } else { dec.mnemonic + " " + dec.operands };
+        array_push(out, map{
+            offset: off,
+            addr: addr,
+            word: w,
+            hex: _hex_u32(w),
+            mnemonic: dec.mnemonic,
+            operands: dec.operands,
+            text: txt
+        });
+        off = off + 4;
+    }
+    return out;
+}
+
+// ── 100% Pure-PBLang Deterministic ARM64 CPU + FPU + Syscall Emulator ───────
+
+fn _mem_get_page(mem, addr) {
+    let pid = str(num_floor(addr / 4096));
+    if map_has(mem, pid) {
+        return mem[pid];
+    }
+    let pg = [];
+    let i = 0;
+    while i < 4096 {
+        array_push(pg, 0);
+        i = i + 1;
+    }
+    mem[pid] = pg;
+    return pg;
+}
+
+fn _mem_read_u8(mem, addr) {
+    let pid = str(num_floor(addr / 4096));
+    if not map_has(mem, pid) { return 0; }
+    return mem[pid][addr % 4096];
+}
+
+fn _mem_write_u8(mem, addr, byte_val) {
+    let pg = _mem_get_page(mem, addr);
+    pg[addr % 4096] = byte_val % 256;
+    return nil;
+}
+
+fn _mem_read_u32(mem, addr) {
+    let b0 = _mem_read_u8(mem, addr);
+    let b1 = _mem_read_u8(mem, addr + 1);
+    let b2 = _mem_read_u8(mem, addr + 2);
+    let b3 = _mem_read_u8(mem, addr + 3);
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+}
+
+fn _mem_read_limbs64(mem, addr) {
+    let w0 = _mem_read_u8(mem, addr) + _mem_read_u8(mem, addr + 1) * 256;
+    let w1 = _mem_read_u8(mem, addr + 2) + _mem_read_u8(mem, addr + 3) * 256;
+    let w2 = _mem_read_u8(mem, addr + 4) + _mem_read_u8(mem, addr + 5) * 256;
+    let w3 = _mem_read_u8(mem, addr + 6) + _mem_read_u8(mem, addr + 7) * 256;
+    return [w0, w1, w2, w3];
+}
+
+fn _mem_write_limbs64(mem, addr, limbs) {
+    _mem_write_u8(mem, addr, limbs[0] % 256);
+    _mem_write_u8(mem, addr + 1, num_floor(limbs[0] / 256) % 256);
+    _mem_write_u8(mem, addr + 2, limbs[1] % 256);
+    _mem_write_u8(mem, addr + 3, num_floor(limbs[1] / 256) % 256);
+    _mem_write_u8(mem, addr + 4, limbs[2] % 256);
+    _mem_write_u8(mem, addr + 5, num_floor(limbs[2] / 256) % 256);
+    _mem_write_u8(mem, addr + 6, limbs[3] % 256);
+    _mem_write_u8(mem, addr + 7, num_floor(limbs[3] / 256) % 256);
+    return nil;
+}
+
+fn _eval_cond(cc, n, z, c, v) {
+    if cc == ARM64_COND_EQ { return z == 1; }
+    if cc == ARM64_COND_NE { return z == 0; }
+    if cc == ARM64_COND_CS { return c == 1; }
+    if cc == ARM64_COND_CC { return c == 0; }
+    if cc == ARM64_COND_MI { return n == 1; }
+    if cc == ARM64_COND_PL { return n == 0; }
+    if cc == ARM64_COND_VS { return v == 1; }
+    if cc == ARM64_COND_VC { return v == 0; }
+    if cc == ARM64_COND_HI { return c == 1 and z == 0; }
+    if cc == ARM64_COND_LS { return c == 0 or z == 1; }
+    if cc == ARM64_COND_GE { return n == v; }
+    if cc == ARM64_COND_LT { return n != v; }
+    if cc == ARM64_COND_GT { return z == 0 and n == v; }
+    if cc == ARM64_COND_LE { return z == 1 or n != v; }
+    return true;
+}
+
+fn emulate_arm64_binary(elf_or_raw_bytes, args = nil) {
+    let max_steps = 250000;
+    if is_map(args) and map_has(args, "max_steps") and type(args.max_steps) == "number" {
+        max_steps = num_floor(args.max_steps);
+    }
+
+    let img = _extract_binary_image(elf_or_raw_bytes);
+    let mem = map{};
+    let lb = img.load_bytes;
+    let li = 0;
+    while li < len(lb) {
+        if lb[li] != 0 {
+            _mem_write_u8(mem, img.load_addr + li, lb[li]);
+        }
+        li = li + 1;
+    }
+
+    let xregs = [];
+    let dri = 0;
+    while dri < 31 {
+        array_push(xregs, [0, 0, 0, 0]);
+        dri = dri + 1;
+    }
+    let sp = i64_to_limbs(2147450880); // 0x7FFF8000 (16-byte aligned)
+    let sentinel_lr = 3735879680;      // 0xDEAD0000
+    xregs[30] = i64_to_limbs(sentinel_lr);
+
+    // Optional initial X0..X7 arguments when testing raw functions directly
+    if is_array(args) {
+        let ai = 0;
+        while ai < len(args) and ai < 8 {
+            if type(args[ai]) == "number" {
+                xregs[ai] = i64_to_limbs(args[ai]);
+            }
+            ai = ai + 1;
+        }
+    } elif is_map(args) and map_has(args, "x_args") and is_array(args.x_args) {
+        let ai = 0;
+        while ai < len(args.x_args) and ai < 8 {
+            xregs[ai] = i64_to_limbs(args.x_args[ai]);
+            ai = ai + 1;
+        }
+    }
+
+    let dregs = [];
+    let fi = 0;
+    while fi < 32 {
+        array_push(dregs, 0.0);
+        fi = fi + 1;
+    }
+
+    let flag_n = 0;
+    let flag_z = 0;
+    let flag_c = 0;
+    let flag_v = 0;
+
+    let pc = img.entry_addr;
+    let halted = false;
+    let exit_code = 0;
+    let stdout_chars = "";
+    let steps = 0;
+
+    while (not halted) and steps < max_steps {
+        if pc == sentinel_lr {
+            exit_code = limbs_to_i64(xregs[0]);
+            halted = true;
+            break;
+        }
+        let w = _mem_read_u32(mem, pc);
+        let next_pc = pc + 4;
+        steps = steps + 1;
+
+        let rd = w % 32;
+        let rn = num_floor(w / 32) % 32;
+        let rm = num_floor(w / 65536) % 32;
+        let ra = num_floor(w / 1024) % 32;
+        let top6 = num_floor(w / 67108864);
+        let top8 = num_floor(w / 16777216);
+        let top9 = num_floor(w / 8388608);
+        let top10 = num_floor(w / 4194304);
+
+        if w == 0xD503201F {
+            // NOP
+        } elif bit_and(w, 0xFFE0001F) == 0xD4000001 {
+            // SVC #imm16
+            let imm16 = num_floor(w / 32) % 65536;
+            let sysno = if imm16 == 128 { bit_and(xregs[16][0], 32767) } else { limbs_to_i64(xregs[8]) };
+            let is_write = (imm16 == 0 and sysno == 64) or (imm16 == 128 and sysno == 4);
+            let is_exit = (imm16 == 0 and (sysno == 93 or sysno == 94)) or (imm16 == 128 and sysno == 1);
+            if is_write {
+                let fd = limbs_to_i64(xregs[0]);
+                let buf_addr = limbs_to_u64_num(xregs[1]);
+                let cnt = limbs_to_i64(xregs[2]);
+                if (fd == 1 or fd == 2) and cnt > 0 {
+                    let bi = 0;
+                    while bi < cnt {
+                        let ch = _mem_read_u8(mem, buf_addr + bi);
+                        stdout_chars = stdout_chars + strfromcharcode(ch);
+                        bi = bi + 1;
+                    }
+                }
+                xregs[0] = i64_to_limbs(cnt);
+                if imm16 == 128 { flag_c = 0; }
+            } elif is_exit {
+                exit_code = limbs_to_i64(xregs[0]);
+                halted = true;
+            } else {
+                _fail("unsupported ARM64 syscall nr=" + str(sysno) + " (svc #" + str(imm16) + ")");
+            }
+        } elif bit_and(w, 0xFFFFFC1F) == 0xD65F0000 {
+            // RET Xn
+            let target_limbs = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            next_pc = limbs_to_u64_num(target_limbs);
+        } elif bit_and(w, 0xFFFFFC1F) == 0xD63F0000 {
+            // BLR Xn
+            let target_limbs = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            xregs[30] = i64_to_limbs(pc + 4);
+            next_pc = limbs_to_u64_num(target_limbs);
+        } elif bit_and(w, 0xFFFFFC1F) == 0xD61F0000 {
+            // BR Xn
+            let target_limbs = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            next_pc = limbs_to_u64_num(target_limbs);
+        } elif top6 == 5 {
+            // B
+            let off26 = _sign_ext(w % 67108864, 26);
+            next_pc = pc + off26 * 4;
+        } elif top6 == 37 {
+            // BL
+            let off26 = _sign_ext(w % 67108864, 26);
+            xregs[30] = i64_to_limbs(pc + 4);
+            next_pc = pc + off26 * 4;
+        } elif top8 == 84 and (num_floor(w / 16) % 2) == 0 {
+            // B.cond
+            let off19 = _sign_ext(num_floor(w / 32) % 524288, 19);
+            let cc = w % 16;
+            if _eval_cond(cc, flag_n, flag_z, flag_c, flag_v) {
+                next_pc = pc + off19 * 4;
+            }
+        } elif top8 == 180 or top8 == 181 {
+            // CBZ / CBNZ
+            let off19 = _sign_ext(num_floor(w / 32) % 524288, 19);
+            let rv = if rd == 31 { [0, 0, 0, 0] } else { xregs[rd] };
+            let is_z = limbs_is_zero(rv);
+            if (top8 == 180 and is_z) or (top8 == 181 and (not is_z)) {
+                next_pc = pc + off19 * 4;
+            }
+        } elif bit_and(w, 0x9F000000) == 0x10000000 {
+            // ADR
+            let immlo = num_floor(w / 536870912) % 4;
+            let immhi = num_floor(w / 32) % 524288;
+            let s21 = _sign_ext(immhi * 4 + immlo, 21);
+            if rd < 31 {
+                xregs[rd] = i64_to_limbs(pc + s21);
+            }
+        } elif top9 == 421 or top9 == 293 or top9 == 485 {
+            // MOVZ / MOVN / MOVK
+            let hw = num_floor(w / 2097152) % 4;
+            let imm16 = num_floor(w / 32) % 65536;
+            if rd < 31 {
+                if top9 == 421 {
+                    let v = [0, 0, 0, 0];
+                    v[hw] = imm16;
+                    xregs[rd] = v;
+                } elif top9 == 293 {
+                    let v = [65535, 65535, 65535, 65535];
+                    v[hw] = 65535 - imm16;
+                    xregs[rd] = v;
+                } else {
+                    let v = limbs_clone(xregs[rd]);
+                    v[hw] = imm16;
+                    xregs[rd] = v;
+                }
+            }
+        } elif top8 == 145 or top8 == 209 or top8 == 241 {
+            // ADD / SUB / SUBS(CMP) immediate (Rn=31 is SP; Rd=31 is SP for ADD/SUB, XZR for SUBS)
+            let sh = num_floor(w / 4194304) % 2;
+            let imm12 = num_floor(w / 1024) % 4096;
+            let val = if sh == 1 { imm12 * 4096 } else { imm12 };
+            let src = if rn == 31 { sp } else { xregs[rn] };
+            let imm_l = i64_to_limbs(val);
+            if top8 == 145 {
+                let res = limbs_add(src, imm_l);
+                if rd == 31 { sp = res; } else { xregs[rd] = res; }
+            } elif top8 == 209 {
+                let res = limbs_sub(src, imm_l);
+                if rd == 31 { sp = res; } else { xregs[rd] = res; }
+            } else {
+                let sf = limbs_sub_flags(src, imm_l);
+                flag_n = sf.n; flag_z = sf.z; flag_c = sf.c; flag_v = sf.v;
+                if rd < 31 { xregs[rd] = sf.value; }
+            }
+        } elif bit_and(w, 0xFFFF0FE0) == 0x9A9F07E0 {
+            // CSET (CSINC Rd, XZR, XZR, inv_cond)
+            let inv_cc = num_floor(w / 4096) % 16;
+            let cond_ok = _eval_cond(bit_xor(inv_cc, 1), flag_n, flag_z, flag_c, flag_v);
+            if rd < 31 {
+                xregs[rd] = if cond_ok { [1, 0, 0, 0] } else { [0, 0, 0, 0] };
+            }
+        } elif bit_and(w, 0xFFE08000) == 0x9B000000 {
+            // MADD / MUL
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            let vm = if rm == 31 { [0, 0, 0, 0] } else { xregs[rm] };
+            let va = if ra == 31 { [0, 0, 0, 0] } else { xregs[ra] };
+            if rd < 31 { xregs[rd] = limbs_add(va, limbs_mul(vn, vm)); }
+        } elif bit_and(w, 0xFFE08000) == 0x9B008000 {
+            // MSUB
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            let vm = if rm == 31 { [0, 0, 0, 0] } else { xregs[rm] };
+            let va = if ra == 31 { [0, 0, 0, 0] } else { xregs[ra] };
+            if rd < 31 { xregs[rd] = limbs_sub(va, limbs_mul(vn, vm)); }
+        } elif bit_and(w, 0xFFE0FC00) == 0x9AC00C00 {
+            // SDIV
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            let vm = if rm == 31 { [0, 0, 0, 0] } else { xregs[rm] };
+            if rd < 31 { xregs[rd] = limbs_sdiv(vn, vm); }
+        } elif bit_and(w, 0xFFE0FC00) == 0x9AC00800 {
+            // UDIV
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            let vm = if rm == 31 { [0, 0, 0, 0] } else { xregs[rm] };
+            if rd < 31 { xregs[rd] = limbs_udiv(vn, vm); }
+        } elif bit_and(w, 0xFFE0FC00) == 0x9AC02000 {
+            // LSLV
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            let sh = if rm == 31 { 0 } else { xregs[rm][0] % 64 };
+            if rd < 31 { xregs[rd] = limbs_lsl(vn, sh); }
+        } elif bit_and(w, 0xFFE0FC00) == 0x9AC02400 {
+            // LSRV
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            let sh = if rm == 31 { 0 } else { xregs[rm][0] % 64 };
+            if rd < 31 { xregs[rd] = limbs_lsr(vn, sh); }
+        } elif bit_and(w, 0xFFE0FC00) == 0x9AC02800 {
+            // ASRV
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            let sh = if rm == 31 { 0 } else { xregs[rm][0] % 64 };
+            if rd < 31 { xregs[rd] = limbs_asr(vn, sh); }
+        } elif bit_and(w, 0xFFE0FC00) == 0x8B000000 {
+            // ADD reg
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            let vm = if rm == 31 { [0, 0, 0, 0] } else { xregs[rm] };
+            if rd < 31 { xregs[rd] = limbs_add(vn, vm); }
+        } elif bit_and(w, 0xFFE0FC00) == 0xCB000000 {
+            // SUB reg
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            let vm = if rm == 31 { [0, 0, 0, 0] } else { xregs[rm] };
+            if rd < 31 { xregs[rd] = limbs_sub(vn, vm); }
+        } elif bit_and(w, 0xFFE0FC00) == 0xEB000000 {
+            // SUBS / CMP reg
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            let vm = if rm == 31 { [0, 0, 0, 0] } else { xregs[rm] };
+            let sf = limbs_sub_flags(vn, vm);
+            flag_n = sf.n; flag_z = sf.z; flag_c = sf.c; flag_v = sf.v;
+            if rd < 31 { xregs[rd] = sf.value; }
+        } elif bit_and(w, 0xFFE0FC00) == 0x8A000000 {
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            let vm = if rm == 31 { [0, 0, 0, 0] } else { xregs[rm] };
+            if rd < 31 { xregs[rd] = limbs_and(vn, vm); }
+        } elif bit_and(w, 0xFFE0FC00) == 0xAA000000 {
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            let vm = if rm == 31 { [0, 0, 0, 0] } else { xregs[rm] };
+            if rd < 31 { xregs[rd] = limbs_orr(vn, vm); }
+        } elif bit_and(w, 0xFFE0FC00) == 0xCA000000 {
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            let vm = if rm == 31 { [0, 0, 0, 0] } else { xregs[rm] };
+            if rd < 31 { xregs[rd] = limbs_eor(vn, vm); }
+        } elif top10 == 678 or top10 == 675 or top10 == 676 or top10 == 677 {
+            // STP / LDP
+            let imm_bytes = _sign_ext(num_floor(w / 32768) % 128, 7) * 8;
+            let base_l = if rn == 31 { sp } else { xregs[rn] };
+            let base_addr = limbs_to_u64_num(base_l);
+            let rt2 = ra;
+            if top10 == 678 {
+                // STP pre-index
+                let eff = base_addr + imm_bytes;
+                let v1 = if rd == 31 { [0, 0, 0, 0] } else { xregs[rd] };
+                let v2 = if rt2 == 31 { [0, 0, 0, 0] } else { xregs[rt2] };
+                _mem_write_limbs64(mem, eff, v1);
+                _mem_write_limbs64(mem, eff + 8, v2);
+                let new_b = i64_to_limbs(eff);
+                if rn == 31 { sp = new_b; } else { xregs[rn] = new_b; }
+            } elif top10 == 675 {
+                // LDP post-index
+                let v1 = _mem_read_limbs64(mem, base_addr);
+                let v2 = _mem_read_limbs64(mem, base_addr + 8);
+                if rd < 31 { xregs[rd] = v1; }
+                if rt2 < 31 { xregs[rt2] = v2; }
+                let new_b = i64_to_limbs(base_addr + imm_bytes);
+                if rn == 31 { sp = new_b; } else { xregs[rn] = new_b; }
+            } elif top10 == 676 {
+                // STP offset
+                let eff = base_addr + imm_bytes;
+                let v1 = if rd == 31 { [0, 0, 0, 0] } else { xregs[rd] };
+                let v2 = if rt2 == 31 { [0, 0, 0, 0] } else { xregs[rt2] };
+                _mem_write_limbs64(mem, eff, v1);
+                _mem_write_limbs64(mem, eff + 8, v2);
+            } else {
+                // LDP offset
+                let eff = base_addr + imm_bytes;
+                let v1 = _mem_read_limbs64(mem, eff);
+                let v2 = _mem_read_limbs64(mem, eff + 8);
+                if rd < 31 { xregs[rd] = v1; }
+                if rt2 < 31 { xregs[rt2] = v2; }
+            }
+        } elif top10 == 997 or top10 == 996 {
+            // LDR / STR X unsigned offset
+            let off = (num_floor(w / 1024) % 4096) * 8;
+            let base_addr = limbs_to_u64_num(if rn == 31 { sp } else { xregs[rn] });
+            if top10 == 997 {
+                let v = _mem_read_limbs64(mem, base_addr + off);
+                if rd < 31 { xregs[rd] = v; }
+            } else {
+                let v = if rd == 31 { [0, 0, 0, 0] } else { xregs[rd] };
+                _mem_write_limbs64(mem, base_addr + off, v);
+            }
+        } elif top10 == 1013 or top10 == 1012 {
+            // LDR / STR D unsigned offset
+            let off = (num_floor(w / 1024) % 4096) * 8;
+            let base_addr = limbs_to_u64_num(if rn == 31 { sp } else { xregs[rn] });
+            if top10 == 1013 {
+                dregs[rd] = limbs_to_f64(_mem_read_limbs64(mem, base_addr + off));
+            } else {
+                _mem_write_limbs64(mem, base_addr + off, f64_to_limbs(dregs[rd]));
+            }
+        } elif top10 == 229 or top10 == 228 {
+            // LDRB / STRB unsigned offset
+            let off = num_floor(w / 1024) % 4096;
+            let base_addr = limbs_to_u64_num(if rn == 31 { sp } else { xregs[rn] });
+            if top10 == 229 {
+                let bval = _mem_read_u8(mem, base_addr + off);
+                if rd < 31 { xregs[rd] = [bval, 0, 0, 0]; }
+            } else {
+                let bval = if rd == 31 { 0 } else { xregs[rd][0] % 256 };
+                _mem_write_u8(mem, base_addr + off, bval);
+            }
+        } elif bit_and(w, 0xFFFFFC00) == 0x9E670000 {
+            // FMOV Dd, Xn
+            let vn = if rn == 31 { [0, 0, 0, 0] } else { xregs[rn] };
+            dregs[rd] = limbs_to_f64(vn);
+        } elif bit_and(w, 0xFFFFFC00) == 0x9E660000 {
+            // FMOV Xd, Dn
+            if rd < 31 { xregs[rd] = f64_to_limbs(dregs[rn]); }
+        } elif bit_and(w, 0xFFFFFC00) == 0x1E604000 {
+            // FMOV Dd, Dn
+            dregs[rd] = dregs[rn];
+        } elif bit_and(w, 0xFFFFFC00) == 0x9E620000 {
+            // SCVTF Dd, Xn
+            let vn = if rn == 31 { 0 } else { limbs_to_i64(xregs[rn]) };
+            dregs[rd] = vn * 1.0;
+        } elif bit_and(w, 0xFFFFFC00) == 0x9E780000 {
+            // FCVTZS Xd, Dn (truncate toward zero)
+            let fv = dregs[rn];
+            let trunc = if fv < 0.0 { 0 - num_floor(0.0 - fv) } else { num_floor(fv) };
+            if rd < 31 { xregs[rd] = i64_to_limbs(trunc); }
+        } elif bit_and(w, 0xFFE0FC00) == 0x1E602800 {
+            dregs[rd] = dregs[rn] + dregs[rm];
+        } elif bit_and(w, 0xFFE0FC00) == 0x1E603800 {
+            dregs[rd] = dregs[rn] - dregs[rm];
+        } elif bit_and(w, 0xFFE0FC00) == 0x1E600800 {
+            dregs[rd] = dregs[rn] * dregs[rm];
+        } elif bit_and(w, 0xFFE0FC00) == 0x1E601800 {
+            dregs[rd] = dregs[rn] / dregs[rm];
+        } elif bit_and(w, 0xFFFFFC00) == 0x1E614000 {
+            dregs[rd] = 0.0 - dregs[rn];
+        } elif bit_and(w, 0xFFFFFC00) == 0x1E60C000 {
+            dregs[rd] = num_abs(dregs[rn]);
+        } elif bit_and(w, 0xFFFFFC00) == 0x1E61C000 {
+            dregs[rd] = num_sqrt(dregs[rn]);
+        } elif bit_and(w, 0xFFE0FC1F) == 0x1E602000 or bit_and(w, 0xFFFFFC1F) == 0x1E602008 {
+            // FCMP Dn, Dm or FCMP Dn, #0.0 (ARMv8 FP NZCV rules)
+            let a = dregs[rn];
+            let b = if bit_and(w, 0xFFFFFC1F) == 0x1E602008 { 0.0 } else { dregs[rm] };
+            if a != a or b != b {
+                // Unordered (NaN): N=0, Z=0, C=1, V=1
+                flag_n = 0; flag_z = 0; flag_c = 1; flag_v = 1;
+            } elif a == b {
+                flag_n = 0; flag_z = 1; flag_c = 1; flag_v = 0;
+            } elif a < b {
+                flag_n = 1; flag_z = 0; flag_c = 0; flag_v = 0;
+            } else {
+                flag_n = 0; flag_z = 0; flag_c = 1; flag_v = 0;
+            }
+        } else {
+            _fail("illegal or unimplemented A64 instruction " + _hex_u32(w) + " at " + _hex_u32(pc));
+        }
+
+        pc = next_pc;
+    }
+
+    if not halted {
+        _fail("ARM64 emulation exceeded step budget (" + str(max_steps) + " steps)");
+    }
+
+    let gpr_nums = [];
+    let gi = 0;
+    while gi < 31 {
+        array_push(gpr_nums, limbs_to_i64(xregs[gi]));
+        gi = gi + 1;
+    }
+
+    return map{
+        ok: true,
+        format: img.format,
+        exit_code: exit_code,
+        exit_status_u8: bit_and(exit_code, 255),
+        stdout: stdout_chars,
+        x0: gpr_nums[0],
+        d0: dregs[0],
+        steps: steps,
+        regs: gpr_nums,
+        fp_regs: dregs
+    };
+}
+
+export ARM64_XZR, ARM64_SP, ARM64_FP, ARM64_LR;
+export ARM64_COND_EQ, ARM64_COND_NE, ARM64_COND_CS, ARM64_COND_HS;
+export ARM64_COND_CC, ARM64_COND_LO, ARM64_COND_MI, ARM64_COND_PL;
+export ARM64_COND_VS, ARM64_COND_VC, ARM64_COND_HI, ARM64_COND_LS;
+export ARM64_COND_GE, ARM64_COND_LT, ARM64_COND_GT, ARM64_COND_LE, ARM64_COND_AL;
+export ELF_EM_AARCH64, MACHO_MH_MAGIC_64, MACHO_CPU_TYPE_ARM64, MACHO_PLATFORM_MACOS;
+export i64_to_limbs, limbs_to_i64, f64_to_limbs, limbs_to_f64;
+export arm64_emit_u32, arm64_emit_words, arm64_word_to_bytes;
+export arm64_movz, arm64_movn, arm64_movk, arm64_mov_i64, arm64_mov_reg;
+export arm64_add_reg, arm64_add_imm, arm64_sub_reg, arm64_sub_imm, arm64_neg_reg;
+export arm64_madd, arm64_mul, arm64_msub, arm64_udiv, arm64_sdiv;
+export arm64_and_reg, arm64_orr_reg, arm64_eor_reg;
+export arm64_lsl_reg, arm64_lsr_reg, arm64_asr_reg;
+export arm64_fmov_d_from_x, arm64_fmov_x_from_d, arm64_fmov_d, arm64_mov_f64_bits;
+export arm64_fadd_d, arm64_fsub_d, arm64_fmul_d, arm64_fdiv_d;
+export arm64_fneg_d, arm64_fabs_d, arm64_fsqrt_d, arm64_fcmp_d, arm64_fcmp_zero_d;
+export arm64_scvtf_d, arm64_fcvtzs_x;
+export arm64_cmp_reg, arm64_cmp_imm, arm64_cset;
+export arm64_b, arm64_bl, arm64_b_cond, arm64_cbz, arm64_cbnz, arm64_blr, arm64_br, arm64_ret;
+export arm64_stp_pre, arm64_ldp_post, arm64_stp_offset, arm64_ldp_offset;
+export arm64_ldr_x_uimm, arm64_str_x_uimm, arm64_ldr_d_uimm, arm64_str_d_uimm;
+export arm64_ldrb_uimm, arm64_strb_uimm, arm64_adr, arm64_svc, arm64_nop;
+export arm64_asm_new, arm64_asm_pos_words, arm64_asm_emit, arm64_asm_emit_all;
+export arm64_asm_label, arm64_asm_fixup, arm64_asm_finalize;
+export compile_sapp_to_arm64, build_linux_arm64_elf64, build_apple_silicon_macho64;
+export disassemble_arm64, emulate_arm64_binary;

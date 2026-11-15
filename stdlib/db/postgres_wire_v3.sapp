@@ -1,0 +1,1126 @@
+// stdlib/db/postgres_wire_v3.sapp — Pure-PBLang PostgreSQL Wire Protocol v3.0 Driver
+//
+// Implements the PostgreSQL Frontend/Backend Protocol v3.0 (0x00030000 = 196608)
+// directly over capability-gated TCP/TLS sockets without libpq or shell commands:
+//   - Big-endian binary packet framing (StartupMessage, SSLRequest 80877103,
+//     Authentication 'R', ParameterStatus 'S', BackendKeyData 'K', ReadyForQuery 'Z',
+//     RowDescription 'T', DataRow 'D', CommandComplete 'C', ErrorResponse 'E',
+//     Terminate 'X').
+//   - Full RFC 5802 / RFC 7677 SCRAM-SHA-256 (R=10/11/12) with mutual
+//     ServerSignature verification (rogue-server MITM defense), MD5 (R=5),
+//     and opt-in Cleartext (R=3, disabled unless allow_cleartext == true).
+//   - Extended Query Protocol ('P' Parse, 'B' Bind, 'D' Describe, 'E' Execute,
+//     'S' Sync) with true binary/UTF-8 out-of-line parameter binding (zero SQL
+//     text interpolation), plus Simple Query ('Q') and ACID transactions.
+
+let DIGEST = import("stdlib:digest.sapp");
+
+let PG_PROTOCOL_V3 = 196608;      // 0x00030000
+let PG_SSL_REQUEST_CODE = 80877103; // 0x04D2162F
+
+// Standard PostgreSQL Type OIDs
+let OID_BOOL = 16;
+let OID_BYTEA = 17;
+let OID_INT8 = 20;
+let OID_INT2 = 21;
+let OID_INT4 = 23;
+let OID_TEXT = 25;
+let OID_JSON = 114;
+let OID_FLOAT4 = 700;
+let OID_FLOAT8 = 701;
+let OID_VARCHAR = 1043;
+let OID_NUMERIC = 1700;
+let OID_JSONB = 3802;
+
+let MAX_PACKET_BYTES = 67108864;
+let MAX_SCRAM_ITERATIONS = 1000000;
+let MAX_SAFE_INT = 9007199254740991;
+
+fn _opt(opts, key, fallback) {
+    if is_map(opts) and map_has(opts, key) and opts[key] != nil {
+        return opts[key];
+    }
+    return fallback;
+}
+
+// ── Binary Framing Helpers (Big-Endian) ──────────────────────────────────────
+
+fn _append_bytes(dst, src) {
+    let i = 0;
+    let n = len(src);
+    while i < n {
+        array_push(dst, src[i]);
+        i = i + 1;
+    }
+    return dst;
+}
+
+fn _push_u16_be(buf, val) {
+    let v = num_mod(num_floor(val), 65536);
+    if v < 0 { v = v + 65536; }
+    array_push(buf, bit_and(bit_shr(v, 8), 255));
+    array_push(buf, bit_and(v, 255));
+    return buf;
+}
+
+fn _push_i16_be(buf, val) {
+    let v = num_floor(val);
+    if v < 0 { v = 65536 + v; }
+    return _push_u16_be(buf, v);
+}
+
+fn _push_u32_be(buf, val) {
+    let v = num_mod(num_floor(val), 4294967296);
+    if v < 0 { v = v + 4294967296; }
+    array_push(buf, bit_and(num_floor(v / 16777216), 255));
+    array_push(buf, bit_and(num_floor(v / 65536), 255));
+    array_push(buf, bit_and(num_floor(v / 256), 255));
+    array_push(buf, bit_and(v, 255));
+    return buf;
+}
+
+fn _push_i32_be(buf, val) {
+    let v = num_floor(val);
+    if v < 0 { v = 4294967296 + v; }
+    return _push_u32_be(buf, v);
+}
+
+fn _push_i64_be(buf, val) {
+    let v = num_floor(val);
+    if v >= 0 {
+        let hi = num_floor(v / 4294967296);
+        let lo = v - hi * 4294967296;
+        _push_u32_be(buf, hi);
+        _push_u32_be(buf, lo);
+    } else {
+        // Two's complement 64-bit for negative safe integers
+        let pos = 0 - v - 1;
+        let hi_inv = num_floor(pos / 4294967296);
+        let lo_inv = pos - hi_inv * 4294967296;
+        _push_u32_be(buf, bit_xor(hi_inv, 4294967295));
+        _push_u32_be(buf, bit_xor(lo_inv, 4294967295));
+    }
+    return buf;
+}
+
+fn _push_cstring(buf, text) {
+    let s = str(text);
+    if str_contains(s, "\x00") {
+        throw "postgres_wire_v3: NUL byte rejected in protocol C-string";
+    }
+    _append_bytes(buf, str_to_bytes(s));
+    array_push(buf, 0);
+    return buf;
+}
+
+fn _read_u16_be(b, pos) {
+    return b[pos] * 256 + b[pos + 1];
+}
+
+fn _read_i16_be(b, pos) {
+    let u = _read_u16_be(b, pos);
+    if u >= 32768 { return u - 65536; }
+    return u;
+}
+
+fn _read_u32_be(b, pos) {
+    return b[pos] * 16777216 + b[pos + 1] * 65536 + b[pos + 2] * 256 + b[pos + 3];
+}
+
+fn _read_i32_be(b, pos) {
+    let u = _read_u32_be(b, pos);
+    if u >= 2147483648 { return u - 4294967296; }
+    return u;
+}
+
+fn _read_i64_be(b, pos) {
+    let hi = _read_u32_be(b, pos);
+    let lo = _read_u32_be(b, pos + 4);
+    if hi < 2147483648 {
+        return hi * 4294967296 + lo;
+    }
+    let hi_inv = bit_xor(hi, 4294967295);
+    let lo_inv = bit_xor(lo, 4294967295);
+    return 0 - (hi_inv * 4294967296 + lo_inv + 1);
+}
+
+fn _read_cstring(b, pos) {
+    let i = pos;
+    let n = len(b);
+    while i < n and b[i] != 0 {
+        i = i + 1;
+    }
+    if i >= n {
+        throw "postgres_wire_v3: unterminated C-string in backend packet";
+    }
+    let part = slice(b, pos, i);
+    return map{ text: bytes_to_str(part), next: i + 1 };
+}
+
+fn build_framed_packet(msg_type_char, payload_bytes) {
+    let out = [];
+    if msg_type_char != nil and msg_type_char != "" {
+        array_push(out, strcharcodeat(msg_type_char, 0));
+    }
+    _push_u32_be(out, 4 + len(payload_bytes));
+    _append_bytes(out, payload_bytes);
+    return out;
+}
+
+fn build_ssl_request_packet() {
+    let out = [];
+    _push_u32_be(out, 8);
+    _push_u32_be(out, PG_SSL_REQUEST_CODE);
+    return out;
+}
+
+fn build_startup_packet(user, database, extra_params = nil) {
+    let body = [];
+    _push_u32_be(body, PG_PROTOCOL_V3);
+    _push_cstring(body, "user");
+    _push_cstring(body, user);
+    if database != nil and database != "" {
+        _push_cstring(body, "database");
+        _push_cstring(body, database);
+    }
+    _push_cstring(body, "client_encoding");
+    _push_cstring(body, "UTF8");
+    _push_cstring(body, "application_name");
+    _push_cstring(body, _opt(extra_params, "application_name", "pblang"));
+    array_push(body, 0);
+    return build_framed_packet("", body);
+}
+
+fn build_terminate_packet() {
+    return build_framed_packet("X", []);
+}
+
+// ── Socket I/O Helpers ───────────────────────────────────────────────────────
+
+fn _read_exact_str(handle, count) {
+    if count <= 0 { return ""; }
+    let out = [];
+    while len(out) < count {
+        let chunk = tcp_read(handle, count - len(out));
+        if chunk == nil or chunk == "" {
+            throw "postgres_wire_v3: unexpected EOF while reading packet";
+        }
+        let cb = str_to_bytes(chunk);
+        if len(cb) == 0 {
+            throw "postgres_wire_v3: unexpected EOF while reading packet";
+        }
+        _append_bytes(out, cb);
+    }
+    return bytes_to_str(out);
+}
+
+fn read_backend_packet(handle) {
+    let hdr = str_to_bytes(_read_exact_str(handle, 5));
+    let tag_code = hdr[0];
+    let tag = strfromcharcode(tag_code);
+    let pkt_len = _read_u32_be(hdr, 1);
+    if pkt_len < 4 or pkt_len > MAX_PACKET_BYTES {
+        throw "postgres_wire_v3: invalid backend packet length " + str(pkt_len);
+    }
+    let body_len = pkt_len - 4;
+    let payload = [];
+    if body_len > 0 {
+        payload = str_to_bytes(_read_exact_str(handle, body_len));
+    }
+    return map{ tag: tag, tag_code: tag_code, length: pkt_len, payload: payload };
+}
+
+fn write_packet(handle, pkt_bytes) {
+    return tcp_write(handle, pkt_bytes);
+}
+
+// ── RFC 5802 / RFC 7677 SCRAM-SHA-256 & MD5 Auth Primitives ──────────────────
+
+fn _xor_bytes(a, b) {
+    let out = [];
+    let i = 0;
+    let n = len(a);
+    while i < n {
+        array_push(out, bit_xor(a[i], b[i]));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _ct_eq_bytes(a, b) {
+    if len(a) != len(b) { return false; }
+    let diff = 0;
+    let i = 0;
+    while i < len(a) {
+        diff = bit_or(diff, bit_xor(a[i], b[i]));
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+fn _hmac_sha256_raw(key_bytes, msg_bytes) {
+    let hex_mac = hmac_sha256(bytes_to_str(msg_bytes), bytes_to_str(key_bytes));
+    return str_to_bytes(hex_decode(hex_mac));
+}
+
+fn _sha256_raw(msg_bytes) {
+    return str_to_bytes(hex_decode(sha256(bytes_to_str(msg_bytes))));
+}
+
+fn pbkdf2_hmac_sha256_bytes(password_bytes, salt_bytes, iterations, dk_len = 32) {
+    if iterations < 1 or iterations > MAX_SCRAM_ITERATIONS {
+        throw "postgres_wire_v3: SCRAM iteration count out of policy bounds";
+    }
+    let out = [];
+    let block_num = 1;
+    while len(out) < dk_len {
+        let salt_block = [];
+        _append_bytes(salt_block, salt_bytes);
+        _push_u32_be(salt_block, block_num);
+        let u = _hmac_sha256_raw(password_bytes, salt_block);
+        let acc = slice(u, 0, len(u));
+        let iter = 1;
+        while iter < iterations {
+            u = _hmac_sha256_raw(password_bytes, u);
+            let k = 0;
+            while k < 32 {
+                acc[k] = bit_xor(acc[k], u[k]);
+                k = k + 1;
+            }
+            iter = iter + 1;
+        }
+        let m = 0;
+        while m < 32 and len(out) < dk_len {
+            array_push(out, acc[m]);
+            m = m + 1;
+        }
+        block_num = block_num + 1;
+    }
+    return out;
+}
+
+fn scram_escape_username(user) {
+    let s = str_replace_all(str(user), "=", "=3D");
+    return str_replace_all(s, ",", "=2C");
+}
+
+fn scram_client_first(user, explicit_nonce = nil) {
+    let nonce = explicit_nonce;
+    if nonce == nil or nonce == "" {
+        nonce = base64_encode_bytes(random_bytes(18));
+    }
+    let bare = "n=" + scram_escape_username(user) + ",r=" + nonce;
+    return map{
+        nonce: nonce,
+        client_first_bare: bare,
+        client_first_message: "n,," + bare
+    };
+}
+
+fn _parse_scram_kv(text) {
+    let out = map{};
+    let parts = str_split(text, ",");
+    let i = 0;
+    while i < len(parts) {
+        let p = parts[i];
+        let eq_pos = str_index_of(p, "=");
+        if eq_pos > 0 {
+            let k = str_slice(p, 0, eq_pos);
+            let v = str_slice(p, eq_pos + 1, len(p));
+            out[k] = v;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn scram_client_final(password, client_first_state, server_first_message) {
+    let kv = _parse_scram_kv(server_first_message);
+    let combined_nonce = _opt(kv, "r", "");
+    let salt_b64 = _opt(kv, "s", "");
+    let iter_str = _opt(kv, "i", "0");
+    if combined_nonce == "" or salt_b64 == "" {
+        throw "postgres_wire_v3: malformed SCRAM-SHA-256 server-first-message";
+    }
+    if not str_starts_with(combined_nonce, client_first_state.nonce) or len(combined_nonce) <= len(client_first_state.nonce) {
+        throw "postgres_wire_v3: SCRAM server nonce does not extend client nonce";
+    }
+    let iterations = try parse_number(iter_str) catch 0;
+    if iterations == nil or iterations != num_floor(iterations) or iterations < 1 or iterations > MAX_SCRAM_ITERATIONS {
+        throw "postgres_wire_v3: invalid SCRAM iteration count";
+    }
+    let salt_bytes = base64_decode_bytes(salt_b64);
+    let pw_bytes = str_to_bytes(str(password));
+    let salted_pw = pbkdf2_hmac_sha256_bytes(pw_bytes, salt_bytes, iterations, 32);
+    let client_key = _hmac_sha256_raw(salted_pw, str_to_bytes("Client Key"));
+    let stored_key = _sha256_raw(client_key);
+    let server_key = _hmac_sha256_raw(salted_pw, str_to_bytes("Server Key"));
+
+    let without_proof = "c=biws,r=" + combined_nonce;
+    let auth_message = client_first_state.client_first_bare + "," + server_first_message + "," + without_proof;
+    let auth_bytes = str_to_bytes(auth_message);
+
+    let client_sig = _hmac_sha256_raw(stored_key, auth_bytes);
+    let client_proof = _xor_bytes(client_key, client_sig);
+    let expected_server_sig = _hmac_sha256_raw(server_key, auth_bytes);
+
+    return map{
+        client_final_message: without_proof + ",p=" + base64_encode_bytes(client_proof),
+        expected_server_signature: expected_server_sig,
+        salted_password: salted_pw,
+        stored_key: stored_key,
+        server_key: server_key,
+        auth_message: auth_message
+    };
+}
+
+fn scram_verify_server_final(server_final_message, expected_server_sig) {
+    let kv = _parse_scram_kv(server_final_message);
+    if map_has(kv, "e") {
+        throw "postgres_wire_v3: SCRAM server error: " + str(kv.e);
+    }
+    let v_b64 = _opt(kv, "v", "");
+    if v_b64 == "" {
+        return false;
+    }
+    let actual_sig = try base64_decode_bytes(v_b64) catch nil;
+    if actual_sig == nil { return false; }
+    return _ct_eq_bytes(actual_sig, expected_server_sig);
+}
+
+fn compute_md5_auth_password(user, password, salt_4bytes) {
+    let inner_hex = DIGEST.md5_hex_bytes(str_to_bytes(str(password) + str(user)));
+    let outer_in = str_to_bytes(inner_hex);
+    _append_bytes(outer_in, salt_4bytes);
+    return "md5" + DIGEST.md5_hex_bytes(outer_in);
+}
+
+// ── ErrorResponse Parser ─────────────────────────────────────────────────────
+
+fn parse_error_fields(payload) {
+    let fields = map{};
+    let pos = 0;
+    while pos < len(payload) {
+        let code = payload[pos];
+        if code == 0 { break; }
+        let cs = _read_cstring(payload, pos + 1);
+        fields[strfromcharcode(code)] = cs.text;
+        pos = cs.next;
+    }
+    return map{
+        severity: _opt(fields, "S", "ERROR"),
+        sqlstate: _opt(fields, "C", "XX000"),
+        message: _opt(fields, "M", "PostgreSQL backend error"),
+        detail: _opt(fields, "D", "")
+    };
+}
+
+// ── Type Encoding & Decoding (Text + Binary OIDs) ────────────────────────────
+
+fn bytes_param(raw_bytes) {
+    return map{ __pg_bytea: true, bytes: raw_bytes };
+}
+
+fn json_param(val, is_jsonb = false) {
+    return map{ __pg_json: true, jsonb: is_jsonb, value: val };
+}
+
+fn _encode_param(val) {
+    if val == nil {
+        return map{ oid: 0, is_null: true, fmt: 0, bytes: [] };
+    }
+    let kind = type(val);
+    if kind == "bool" {
+        return map{
+            oid: OID_BOOL,
+            is_null: false,
+            fmt: 0,
+            bytes: str_to_bytes(if val { "t" } else { "f" })
+        };
+    }
+    if kind == "number" {
+        if val == num_floor(val) and val >= -2147483648 and val <= 2147483647 {
+            return map{ oid: OID_INT4, is_null: false, fmt: 0, bytes: str_to_bytes(str(val)) };
+        }
+        if val == num_floor(val) and val >= (0 - MAX_SAFE_INT) and val <= MAX_SAFE_INT {
+            return map{ oid: OID_INT8, is_null: false, fmt: 0, bytes: str_to_bytes(str(val)) };
+        }
+        return map{ oid: OID_FLOAT8, is_null: false, fmt: 0, bytes: str_to_bytes(str(val)) };
+    }
+    if kind == "string" {
+        return map{ oid: OID_TEXT, is_null: false, fmt: 0, bytes: str_to_bytes(val) };
+    }
+    if kind == "map" and (try val.__pg_bytea catch false) == true {
+        return map{ oid: OID_BYTEA, is_null: false, fmt: 1, bytes: val.bytes };
+    }
+    if kind == "map" and (try val.__bytes catch nil) != nil {
+        return map{ oid: OID_BYTEA, is_null: false, fmt: 1, bytes: val.__bytes };
+    }
+    if kind == "map" and (try val.__pg_json catch false) == true {
+        let oid = if val.jsonb { OID_JSONB } else { OID_JSON };
+        return map{ oid: oid, is_null: false, fmt: 0, bytes: str_to_bytes(json_stringify(val.value)) };
+    }
+    if kind == "map" or kind == "array" {
+        return map{ oid: OID_JSON, is_null: false, fmt: 0, bytes: str_to_bytes(json_stringify(val)) };
+    }
+    return map{ oid: OID_TEXT, is_null: false, fmt: 0, bytes: str_to_bytes(str(val)) };
+}
+
+fn _decode_ieee754_f32_be(b) {
+    let bits = _read_u32_be(b, 0);
+    let sign = if bit_and(bit_shr(bits, 31), 1) == 1 { -1.0 } else { 1.0 };
+    let exp = bit_and(bit_shr(bits, 23), 255);
+    let frac = bit_and(bits, 8388607);
+    if exp == 0 and frac == 0 { return 0.0; }
+    if exp == 255 { return 0.0; }
+    if exp == 0 {
+        return sign * (frac / 8388608.0) * num_pow(2.0, -126.0);
+    }
+    return sign * (1.0 + (frac / 8388608.0)) * num_pow(2.0, exp - 127.0);
+}
+
+fn _decode_ieee754_f64_be(b) {
+    let le = [b[7], b[6], b[5], b[4], b[3], b[2], b[1], b[0]];
+    return num_from_le_bytes(le);
+}
+
+fn _decode_pg_numeric_binary(b) {
+    if len(b) < 8 { return 0; }
+    let ndigits = _read_u16_be(b, 0);
+    let weight = _read_i16_be(b, 2);
+    let sign = _read_u16_be(b, 4);
+    let _dscale = _read_u16_be(b, 6);
+    if sign == 49152 { return nil; } // NUMERIC_NAN = 0xC000
+    let acc = 0.0;
+    let i = 0;
+    let pos = 8;
+    while i < ndigits and pos + 1 < len(b) {
+        let d = _read_u16_be(b, pos);
+        let p = weight - i;
+        acc = acc + d * num_pow(10000.0, p);
+        pos = pos + 2;
+        i = i + 1;
+    }
+    if sign == 16384 { acc = 0.0 - acc; } // NUMERIC_NEG = 0x4000
+    return acc;
+}
+
+fn decode_pg_value(oid, fmt_code, raw_bytes) {
+    if raw_bytes == nil { return nil; }
+    if fmt_code == 1 {
+        if oid == OID_BOOL { return len(raw_bytes) > 0 and raw_bytes[0] != 0; }
+        if oid == OID_INT2 { return _read_i16_be(raw_bytes, 0); }
+        if oid == OID_INT4 { return _read_i32_be(raw_bytes, 0); }
+        if oid == OID_INT8 { return _read_i64_be(raw_bytes, 0); }
+        if oid == OID_FLOAT4 { return _decode_ieee754_f32_be(raw_bytes); }
+        if oid == OID_FLOAT8 { return _decode_ieee754_f64_be(raw_bytes); }
+        if oid == OID_BYTEA { return raw_bytes; }
+        if oid == OID_NUMERIC { return _decode_pg_numeric_binary(raw_bytes); }
+        if oid == OID_JSON {
+            let txt = bytes_to_str(raw_bytes);
+            return try json_parse(txt) catch txt;
+        }
+        if oid == OID_JSONB {
+            let jb = if len(raw_bytes) > 0 and raw_bytes[0] == 1 { slice(raw_bytes, 1, len(raw_bytes)) } else { raw_bytes };
+            let txt2 = bytes_to_str(jb);
+            return try json_parse(txt2) catch txt2;
+        }
+        return bytes_to_str(raw_bytes);
+    }
+
+    // Text format (fmt_code == 0)
+    let text = bytes_to_str(raw_bytes);
+    if oid == OID_BOOL {
+        return text == "t" or text == "true" or text == "TRUE" or text == "1";
+    }
+    if oid == OID_INT2 or oid == OID_INT4 or oid == OID_INT8 {
+        let parsed_i = try parse_number(text) catch nil;
+        if parsed_i != nil and parsed_i >= (0 - MAX_SAFE_INT) and parsed_i <= MAX_SAFE_INT {
+            return parsed_i;
+        }
+        return text;
+    }
+    if oid == OID_FLOAT4 or oid == OID_FLOAT8 or oid == OID_NUMERIC {
+        let parsed_f = try parse_number(text) catch nil;
+        if parsed_f != nil { return parsed_f; }
+        return text;
+    }
+    if oid == OID_JSON or oid == OID_JSONB {
+        return try json_parse(text) catch text;
+    }
+    if oid == OID_BYTEA {
+        if str_starts_with(text, "\\x") {
+            return str_to_bytes(hex_decode(str_slice(text, 2, len(text))));
+        }
+        return str_to_bytes(text);
+    }
+    return text;
+}
+
+// ── Placeholder Normalization (? -> $1, $2 outside string literals) ──────────
+
+fn normalize_pg_placeholders(sql) {
+    let s = str(sql);
+    if not str_contains(s, "?") { return s; }
+    let out = "";
+    let idx = 1;
+    let in_sq = false;
+    let in_dq = false;
+    let i = 0;
+    let n = len(s);
+    while i < n {
+        let ch = str_slice(s, i, i + 1);
+        if ch == "'" and not in_dq {
+            if in_sq and i + 1 < n and str_slice(s, i + 1, i + 2) == "'" {
+                out = out + "''";
+                i = i + 2;
+                continue;
+            }
+            in_sq = not in_sq;
+            out = out + ch;
+        } elif ch == "\"" and not in_sq {
+            in_dq = not in_dq;
+            out = out + ch;
+        } elif ch == "?" and not in_sq and not in_dq {
+            out = out + "$" + str(idx);
+            idx = idx + 1;
+        } else {
+            out = out + ch;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── Extended Query Packet Builders ('P', 'B', 'D', 'E', 'S', 'Q') ────────────
+
+fn build_parse_packet(stmt_name, sql, param_oids) {
+    let body = [];
+    _push_cstring(body, stmt_name);
+    _push_cstring(body, sql);
+    _push_u16_be(body, len(param_oids));
+    let i = 0;
+    while i < len(param_oids) {
+        _push_u32_be(body, param_oids[i]);
+        i = i + 1;
+    }
+    return build_framed_packet("P", body);
+}
+
+fn build_bind_packet(portal_name, stmt_name, encoded_params, result_format = 0) {
+    let body = [];
+    _push_cstring(body, portal_name);
+    _push_cstring(body, stmt_name);
+
+    // Parameter format codes (one per parameter: 0=text, 1=binary)
+    _push_u16_be(body, len(encoded_params));
+    let i = 0;
+    while i < len(encoded_params) {
+        _push_u16_be(body, encoded_params[i].fmt);
+        i = i + 1;
+    }
+
+    // Parameter values: [-1:i32] for NULL, else [byte_len:i32][bytes]
+    _push_u16_be(body, len(encoded_params));
+    i = 0;
+    while i < len(encoded_params) {
+        let p = encoded_params[i];
+        if p.is_null {
+            _push_i32_be(body, -1);
+        } else {
+            _push_u32_be(body, len(p.bytes));
+            _append_bytes(body, p.bytes);
+        }
+        i = i + 1;
+    }
+
+    // Result column format codes: 1 entry applying to all columns (0=text, 1=binary)
+    if result_format == 1 {
+        _push_u16_be(body, 1);
+        _push_u16_be(body, 1);
+    } else {
+        _push_u16_be(body, 0);
+    }
+    return build_framed_packet("B", body);
+}
+
+fn build_describe_packet(kind_char, target_name) {
+    let body = [strcharcodeat(kind_char, 0)];
+    _push_cstring(body, target_name);
+    return build_framed_packet("D", body);
+}
+
+fn build_execute_packet(portal_name, max_rows = 0) {
+    let body = [];
+    _push_cstring(body, portal_name);
+    _push_u32_be(body, max_rows);
+    return build_framed_packet("E", body);
+}
+
+fn build_sync_packet() {
+    return build_framed_packet("S", []);
+}
+
+fn build_simple_query_packet(sql) {
+    let body = [];
+    _push_cstring(body, sql);
+    return build_framed_packet("Q", body);
+}
+
+// ── RowDescription & DataRow Decoders ────────────────────────────────────────
+
+fn parse_row_description(payload) {
+    let count = _read_u16_be(payload, 0);
+    let cols = [];
+    let pos = 2;
+    let i = 0;
+    while i < count {
+        let cs = _read_cstring(payload, pos);
+        pos = cs.next;
+        let table_oid = _read_u32_be(payload, pos);
+        let col_attr = _read_i16_be(payload, pos + 4);
+        let type_oid = _read_u32_be(payload, pos + 6);
+        let type_size = _read_i16_be(payload, pos + 10);
+        let type_mod = _read_i32_be(payload, pos + 12);
+        let fmt_code = _read_u16_be(payload, pos + 16);
+        pos = pos + 18;
+        array_push(cols, map{
+            name: cs.text,
+            table_oid: table_oid,
+            col_attr: col_attr,
+            type_oid: type_oid,
+            type_size: type_size,
+            type_mod: type_mod,
+            format_code: fmt_code
+        });
+        i = i + 1;
+    }
+    return cols;
+}
+
+fn parse_data_row(payload, cols) {
+    let count = _read_u16_be(payload, 0);
+    let row = map{};
+    let pos = 2;
+    let i = 0;
+    while i < count {
+        let vlen = _read_i32_be(payload, pos);
+        pos = pos + 4;
+        let col_name = "col_" + str(i);
+        let oid = OID_TEXT;
+        let fmt = 0;
+        if i < len(cols) {
+            col_name = cols[i].name;
+            oid = cols[i].type_oid;
+            fmt = cols[i].format_code;
+        }
+        if vlen < 0 {
+            row[col_name] = nil;
+        } else {
+            let raw = slice(payload, pos, pos + vlen);
+            pos = pos + vlen;
+            row[col_name] = decode_pg_value(oid, fmt, raw);
+        }
+        i = i + 1;
+    }
+    return row;
+}
+
+fn _parse_command_tag_rows(tag_str) {
+    // Examples: "INSERT 0 1", "UPDATE 3", "DELETE 2", "SELECT 5", "BEGIN"
+    let parts = str_split(str_trim(tag_str), " ");
+    if len(parts) >= 2 {
+        let last = parts[len(parts) - 1];
+        let n = try parse_number(last) catch nil;
+        if n != nil and n == num_floor(n) and n >= 0 { return n; }
+    }
+    return 0;
+}
+
+// ── Connection Execution & Handshake Lifecycle ───────────────────────────────
+
+fn _read_until_ready(conn) {
+    let cols = [];
+    let rows = [];
+    let affected = 0;
+    let cmd_tag = "";
+    let first_err = nil;
+
+    while true {
+        let pkt = read_backend_packet(conn.handle);
+        let t = pkt.tag;
+        if t == "T" {
+            cols = parse_row_description(pkt.payload);
+        } elif t == "D" {
+            array_push(rows, parse_data_row(pkt.payload, cols));
+        } elif t == "C" {
+            let cs = _read_cstring(pkt.payload, 0);
+            cmd_tag = cs.text;
+            affected = affected + _parse_command_tag_rows(cmd_tag);
+        } elif t == "E" {
+            first_err = parse_error_fields(pkt.payload);
+        } elif t == "S" {
+            let k_cs = _read_cstring(pkt.payload, 0);
+            let v_cs = _read_cstring(pkt.payload, k_cs.next);
+            conn.server_params[k_cs.text] = v_cs.text;
+        } elif t == "Z" {
+            if len(pkt.payload) > 0 {
+                conn.tx_status = strfromcharcode(pkt.payload[0]);
+            }
+            break;
+        }
+        // '1' ParseComplete, '2' BindComplete, '3' CloseComplete, 'n' NoData,
+        // 'I' EmptyQueryResponse, 'N' NoticeResponse continue until 'Z'.
+    }
+
+    if first_err != nil {
+        throw "postgres_wire_v3 [" + first_err.sqlstate + "]: " + first_err.message;
+    }
+    return map{
+        rows: rows,
+        columns: cols,
+        affected_rows: affected,
+        command_tag: cmd_tag,
+        tx_status: conn.tx_status
+    };
+}
+
+fn _execute_extended(conn, sql, params = nil, stmt_name = "") {
+    if not conn.open { throw "postgres_wire_v3: connection is closed"; }
+    if params == nil { params = []; }
+    if type(params) != "array" { throw "postgres_wire_v3: params must be an array"; }
+
+    let norm_sql = normalize_pg_placeholders(sql);
+    let encoded = [];
+    let oids = [];
+    let i = 0;
+    while i < len(params) {
+        let ep = _encode_param(params[i]);
+        array_push(encoded, ep);
+        array_push(oids, ep.oid);
+        i = i + 1;
+    }
+
+    let wire = [];
+    if stmt_name == "" {
+        _append_bytes(wire, build_parse_packet("", norm_sql, oids));
+    }
+    _append_bytes(wire, build_bind_packet("", stmt_name, encoded, conn.result_format));
+    _append_bytes(wire, build_describe_packet("P", ""));
+    _append_bytes(wire, build_execute_packet("", 0));
+    _append_bytes(wire, build_sync_packet());
+
+    write_packet(conn.handle, wire);
+    conn.queries_run = conn.queries_run + 1;
+    return _read_until_ready(conn);
+}
+
+fn _execute_simple(conn, sql) {
+    if not conn.open { throw "postgres_wire_v3: connection is closed"; }
+    write_packet(conn.handle, build_simple_query_packet(sql));
+    conn.queries_run = conn.queries_run + 1;
+    return _read_until_ready(conn);
+}
+
+fn _prepare_named(conn, sql) {
+    if not conn.open { throw "postgres_wire_v3: connection is closed"; }
+    conn.stmt_seq = conn.stmt_seq + 1;
+    let sname = "pbstmt_" + str(conn.stmt_seq);
+    let norm_sql = normalize_pg_placeholders(sql);
+    let wire = [];
+    _append_bytes(wire, build_parse_packet(sname, norm_sql, []));
+    _append_bytes(wire, build_sync_packet());
+    write_packet(conn.handle, wire);
+    _read_until_ready(conn);
+
+    return map{
+        name: sname,
+        sql: norm_sql,
+        exec: fn(params = nil) {
+            let res = _execute_extended(conn, norm_sql, params, sname);
+            return res.affected_rows;
+        },
+        query: fn(params = nil) {
+            let res = _execute_extended(conn, norm_sql, params, sname);
+            return res.rows;
+        }
+    };
+}
+
+fn _authenticate_handshake(conn, user, password, database, opts) {
+    write_packet(conn.handle, build_startup_packet(user, database, opts));
+
+    let scram_first = nil;
+    let scram_final = nil;
+    let scram_used = false;
+    let scram_verified = false;
+    let allow_cleartext = _opt(opts, "allow_cleartext", false) == true;
+
+    while true {
+        let pkt = read_backend_packet(conn.handle);
+        let t = pkt.tag;
+        if t == "R" {
+            let auth_type = _read_u32_be(pkt.payload, 0);
+            if auth_type == 0 {
+                if scram_used and not scram_verified {
+                    try tcp_close(conn.handle) catch nil;
+                    conn.open = false;
+                    throw "postgres_wire_v3: SCRAM ServerSignature missing before AuthOk (MITM blocked)";
+                }
+                conn.authenticated = true;
+            } elif auth_type == 3 {
+                if not allow_cleartext {
+                    try tcp_close(conn.handle) catch nil;
+                    conn.open = false;
+                    throw "postgres_wire_v3: cleartext password requested by server but allow_cleartext is false";
+                }
+                let pw_body = [];
+                _push_cstring(pw_body, password);
+                write_packet(conn.handle, build_framed_packet("p", pw_body));
+                conn.auth_method = "cleartext";
+            } elif auth_type == 5 {
+                let salt4 = slice(pkt.payload, 4, 8);
+                let md5_pw = compute_md5_auth_password(user, password, salt4);
+                let pw_body2 = [];
+                _push_cstring(pw_body2, md5_pw);
+                write_packet(conn.handle, build_framed_packet("p", pw_body2));
+                conn.auth_method = "md5";
+            } elif auth_type == 10 {
+                // Parse supported SASL mechanisms
+                let pos = 4;
+                let supports_scram = false;
+                while pos < len(pkt.payload) and pkt.payload[pos] != 0 {
+                    let m_cs = _read_cstring(pkt.payload, pos);
+                    if m_cs.text == "SCRAM-SHA-256" { supports_scram = true; }
+                    pos = m_cs.next;
+                }
+                if not supports_scram {
+                    try tcp_close(conn.handle) catch nil;
+                    conn.open = false;
+                    throw "postgres_wire_v3: server SASL mechanisms do not include SCRAM-SHA-256";
+                }
+                scram_used = true;
+                scram_first = scram_client_first(user, _opt(opts, "scram_nonce", nil));
+                let cf_bytes = str_to_bytes(scram_first.client_first_message);
+                let sasl_init = [];
+                _push_cstring(sasl_init, "SCRAM-SHA-256");
+                _push_u32_be(sasl_init, len(cf_bytes));
+                _append_bytes(sasl_init, cf_bytes);
+                write_packet(conn.handle, build_framed_packet("p", sasl_init));
+                conn.auth_method = "SCRAM-SHA-256";
+            } elif auth_type == 11 {
+                if scram_first == nil {
+                    try tcp_close(conn.handle) catch nil;
+                    conn.open = false;
+                    throw "postgres_wire_v3: unexpected SASLContinue";
+                }
+                let sf_msg = bytes_to_str(slice(pkt.payload, 4, len(pkt.payload)));
+                scram_final = scram_client_final(password, scram_first, sf_msg);
+                let resp_bytes = str_to_bytes(scram_final.client_final_message);
+                write_packet(conn.handle, build_framed_packet("p", resp_bytes));
+            } elif auth_type == 12 {
+                if scram_final == nil {
+                    try tcp_close(conn.handle) catch nil;
+                    conn.open = false;
+                    throw "postgres_wire_v3: unexpected SASLFinal";
+                }
+                let sfinal_msg = bytes_to_str(slice(pkt.payload, 4, len(pkt.payload)));
+                if not scram_verify_server_final(sfinal_msg, scram_final.expected_server_signature) {
+                    try tcp_close(conn.handle) catch nil;
+                    conn.open = false;
+                    throw "postgres_wire_v3: SCRAM mutual ServerSignature verification failed (MITM blocked)";
+                }
+                scram_verified = true;
+            } else {
+                try tcp_close(conn.handle) catch nil;
+                conn.open = false;
+                throw "postgres_wire_v3: unsupported authentication method " + str(auth_type);
+            }
+        } elif t == "S" {
+            let k_cs = _read_cstring(pkt.payload, 0);
+            let v_cs = _read_cstring(pkt.payload, k_cs.next);
+            conn.server_params[k_cs.text] = v_cs.text;
+        } elif t == "K" {
+            conn.backend_pid = _read_u32_be(pkt.payload, 0);
+            conn.backend_secret_key = _read_u32_be(pkt.payload, 4);
+        } elif t == "E" {
+            let err = parse_error_fields(pkt.payload);
+            try tcp_close(conn.handle) catch nil;
+            conn.open = false;
+            throw "postgres_wire_v3 [" + err.sqlstate + "]: " + err.message;
+        } elif t == "Z" {
+            if len(pkt.payload) > 0 {
+                conn.tx_status = strfromcharcode(pkt.payload[0]);
+            }
+            break;
+        }
+    }
+    return conn;
+}
+
+fn _attach_methods(conn) {
+    conn.exec = fn(sql, params = nil) {
+        if params == nil or len(params) == 0 {
+            let upper = str_upper(str_trim(sql));
+            if upper == "BEGIN" or upper == "COMMIT" or upper == "ROLLBACK" or str_starts_with(upper, "SAVEPOINT ") or str_starts_with(upper, "ROLLBACK TO ") or str_starts_with(upper, "RELEASE ") {
+                let sres = _execute_simple(conn, sql);
+                return sres.affected_rows;
+            }
+        }
+        let res = _execute_extended(conn, sql, params, "");
+        return res.affected_rows;
+    };
+
+    conn.query = fn(sql, params = nil) {
+        let res = _execute_extended(conn, sql, params, "");
+        return res.rows;
+    };
+
+    conn.query_full = fn(sql, params = nil) {
+        return _execute_extended(conn, sql, params, "");
+    };
+
+    conn.simple_query = fn(sql) {
+        return _execute_simple(conn, sql);
+    };
+
+    conn.prepare = fn(sql) {
+        return _prepare_named(conn, sql);
+    };
+
+    conn.begin = fn() { _execute_simple(conn, "BEGIN"); return true; };
+    conn.commit = fn() { _execute_simple(conn, "COMMIT"); return true; };
+    conn.rollback = fn() { _execute_simple(conn, "ROLLBACK"); return true; };
+
+    conn.transaction = fn(body_fn) {
+        _execute_simple(conn, "BEGIN");
+        let out = try body_fn(conn) catch nil;
+        if out == nil {
+            try _execute_simple(conn, "ROLLBACK") catch nil;
+            return nil;
+        }
+        _execute_simple(conn, "COMMIT");
+        return out;
+    };
+
+    conn.tx = fn(body_fn) {
+        _execute_simple(conn, "BEGIN");
+        let r = try map{ ok: true, value: body_fn(conn) } catch map{ ok: false };
+        if r.ok {
+            _execute_simple(conn, "COMMIT");
+        } else {
+            try _execute_simple(conn, "ROLLBACK") catch nil;
+        }
+        return r;
+    };
+
+    conn.savepoint = fn(name, body_fn) {
+        let q = "\"" + str_replace_all(str(name), "\"", "\"\"") + "\"";
+        _execute_simple(conn, "SAVEPOINT " + q);
+        let r = try map{ ok: true, value: body_fn(conn) } catch map{ ok: false };
+        if not r.ok {
+            try _execute_simple(conn, "ROLLBACK TO SAVEPOINT " + q) catch nil;
+        }
+        _execute_simple(conn, "RELEASE SAVEPOINT " + q);
+        return r;
+    };
+
+    conn.ping = fn() {
+        let ok = try {
+            let r = _execute_simple(conn, "SELECT 1 AS ok");
+            len(r.rows) >= 0
+        } catch false;
+        return ok;
+    };
+
+    conn.last_insert_rowid = fn() { return nil; };
+
+    conn.close = fn() {
+        if not conn.open { return false; }
+        try write_packet(conn.handle, build_terminate_packet()) catch nil;
+        try tcp_close(conn.handle) catch nil;
+        conn.open = false;
+        return true;
+    };
+
+    return conn;
+}
+
+fn open(opts) {
+    if not is_map(opts) { throw "postgres_wire_v3.open: options map required"; }
+    let host = str(_opt(opts, "host", "127.0.0.1"));
+    let port = _opt(opts, "port", 5432);
+    let user = str(_opt(opts, "user", "postgres"));
+    let password = str(_opt(opts, "password", ""));
+    let database = str(_opt(opts, "database", user));
+    let sslmode = str_lower(str(_opt(opts, "sslmode", if _opt(opts, "tls", false) == true { "direct" } else { "disable" })));
+    let result_format = _opt(opts, "result_format", 0);
+
+    let handle = nil;
+    let is_tls = false;
+    let addr = if str_contains(host, ":") and not str_starts_with(host, "[") {
+        "[" + host + "]:" + str(port)
+    } else {
+        host + ":" + str(port)
+    };
+
+    if sslmode == "direct" {
+        handle = tcp_connect_tls(host, port);
+        is_tls = true;
+    } else {
+        handle = tcp_connect(addr);
+        if sslmode == "require" or sslmode == "prefer" {
+            write_packet(handle, build_ssl_request_packet());
+            let resp = str_to_bytes(_read_exact_str(handle, 1));
+            if len(resp) == 1 and resp[0] == 83 { // 'S'
+                try tcp_close(handle) catch nil;
+                handle = tcp_connect_tls(host, port);
+                is_tls = true;
+            } elif sslmode == "require" {
+                try tcp_close(handle) catch nil;
+                throw "postgres_wire_v3: server rejected SSLRequest in sslmode=require";
+            }
+        }
+    }
+
+    let conn = map{
+        format: "pblang.db.postgres.v3",
+        kind: "postgres",
+        handle: handle,
+        open: true,
+        tls: is_tls,
+        host: host,
+        port: port,
+        user: user,
+        database: database,
+        authenticated: false,
+        auth_method: "none",
+        tx_status: "I",
+        backend_pid: 0,
+        backend_secret_key: 0,
+        server_params: map{},
+        result_format: result_format,
+        stmt_seq: 0,
+        queries_run: 0
+    };
+
+    _authenticate_handshake(conn, user, password, database, opts);
+    return _attach_methods(conn);
+}
+
+fn connect(opts) {
+    return try map{ ok: true, conn: open(opts) } catch map{ ok: false, error: "PostgreSQL connection failed" };
+}
+
+export PG_PROTOCOL_V3, PG_SSL_REQUEST_CODE,
+       OID_BOOL, OID_BYTEA, OID_INT8, OID_INT2, OID_INT4, OID_TEXT,
+       OID_JSON, OID_FLOAT4, OID_FLOAT8, OID_VARCHAR, OID_NUMERIC, OID_JSONB,
+       open, connect, bytes_param, json_param,
+       normalize_pg_placeholders,
+       pbkdf2_hmac_sha256_bytes, scram_escape_username, scram_client_first,
+       scram_client_final, scram_verify_server_final, compute_md5_auth_password,
+       build_framed_packet, build_ssl_request_packet, build_startup_packet,
+       build_parse_packet, build_bind_packet, build_describe_packet,
+       build_execute_packet, build_sync_packet, build_simple_query_packet,
+       build_terminate_packet, read_backend_packet, write_packet,
+       parse_row_description, parse_data_row, decode_pg_value, parse_error_fields;

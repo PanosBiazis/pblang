@@ -178,6 +178,7 @@ let _expr_depth = 0;
 let MAX_TYPE_DEPTH = 64;
 let _type_depth = 0;
 let _type_pending_gt = 0;
+let _match_tmp_seq = 0;
 
 // Drop only parser-owned references. Returned ASTs, diagnostics and the caller's
 // token array retain their own ownership; never clear those arrays in place.
@@ -188,6 +189,7 @@ fn discard_state() {
     _expr_depth = 0;
     _type_depth = 0;
     _type_pending_gt = 0;
+    _match_tmp_seq = 0;
 }
 
 // Value-free debug information; this parser is still not reentrant.
@@ -286,7 +288,35 @@ fn parse(token_list) {
 
 // ── Statement parsers ─────────────────────────────────────────────────────────
 
-fn parse_stmt() {
+fn _skip_optional_type_params() {
+    if not (current().kind == "operator" and current().text == "<") {
+        return;
+    }
+    advance(); // consume '<'
+    let depth = 1;
+    while depth > 0 and not is_at_end() {
+        let tk = current();
+        if tk.kind == "punct" and tk.text == "{" { break; }
+        if tk.kind == "operator" and tk.text == "<" {
+            depth = depth + 1;
+            advance();
+        } elif tk.kind == "operator" and tk.text == ">" {
+            depth = depth - 1;
+            advance();
+        } elif tk.kind == "operator" and tk.text == ">>" {
+            advance();
+            if depth >= 2 {
+                depth = depth - 2;
+            } else {
+                depth = 0;
+            }
+        } else {
+            advance();
+        }
+    }
+}
+
+fn _parse_stmt_raw() {
     let t = current();
 
     if t.kind == "keyword" {
@@ -329,6 +359,15 @@ fn parse_stmt() {
         }
     }
 
+    // `trait Name<T> { ... }` — contextual: `trait` remains an ordinary ident
+    // unless followed directly by a trait name and `{` / `<`.
+    if t.kind == "ident" and t.text == "trait"
+       and (peek(1).kind == "ident" or _is_ctx_name_kw(peek(1)))
+       and ((peek(2).kind == "punct" and peek(2).text == "{")
+            or (peek(2).kind == "operator" and peek(2).text == "<")) {
+        return parse_trait();
+    }
+
     // `async fn ...` — contextual: `async` is an ident, recognised only directly
     // before the `fn` keyword (§48 port). Anywhere else it's a normal identifier.
     if t.kind == "ident" and t.text == "async"
@@ -349,6 +388,15 @@ fn parse_stmt() {
     }
 
     return parse_expr_stmt();
+}
+
+fn parse_stmt() {
+    let start_line = try current().line catch 0;
+    let s = _parse_stmt_raw();
+    if s != nil and is_map(s) and not map_has(s, "line") and start_line > 0 {
+        s.line = start_line;
+    }
+    return s;
 }
 
 fn parse_let() {
@@ -431,6 +479,7 @@ fn parse_fn_decl() {
     let name_token = _expect_ctx_name();
     if name_token == nil { return nil; }
     let name = name_token.text;
+    _skip_optional_type_params();
 
     expect("punct", "(");
     let params = [];
@@ -456,7 +505,7 @@ fn parse_fn_decl() {
     }
 
     let ret_type = nil;
-    if match_token("punct", ":") {
+    if match_token("punct", ":") or match_token("operator", "->") {
         ret_type = parse_type();
     }
 
@@ -491,6 +540,7 @@ fn parse_struct() {
     let name_token = expect("ident", nil);
     if name_token == nil { return nil; }
     let name = name_token.text;
+    _skip_optional_type_params();
 
     expect("punct", "{");
     let params = [];
@@ -505,7 +555,7 @@ fn parse_struct() {
             if match_token("punct", ":") { ftype = parse_type(); }
             push(params, map{ name: fname, type: ftype, default: nil });
             push(entries, map{ key: fname, value: expr_ident(fname) });
-            if not match_token("punct", ",") { break; }
+            if not (match_token("punct", ",") or match_token("punct", ";")) { break; }
             if current().kind == "punct" and current().text == "}" { break; } // trailing comma
         }
         expect("punct", "}");
@@ -526,15 +576,18 @@ fn parse_interface() {
     let name_token = expect("ident", nil);
     if name_token == nil { return nil; }
     let name = name_token.text;
+    _skip_optional_type_params();
 
     expect("punct", "{");
     let members = [];
     if not match_token("punct", "}") {
         while true {
             if current().kind == "punct" and current().text == "}" { break; }
-            let m_token = expect("ident", nil);
+            if current().kind == "keyword" and current().text == "fn" { advance(); }
+            let m_token = _expect_ctx_name();
             if m_token == nil { break; }
             push(members, m_token.text);
+            _skip_optional_type_params();
             // optional `( params )` — parsed and discarded (name drives the check)
             if match_token("punct", "(") {
                 while not (current().kind == "punct" and current().text == ")") {
@@ -543,7 +596,12 @@ fn parse_interface() {
                 }
                 match_token("punct", ")");
             }
-            if not match_token("punct", ";") { break; }
+            if match_token("punct", ":") or match_token("operator", "->") {
+                parse_type();
+            }
+            if not (match_token("punct", ";") or match_token("punct", ",")) {
+                if current().kind == "punct" and current().text == "}" { break; }
+            }
             if current().kind == "punct" and current().text == "}" { break; } // trailing ;
         }
         expect("punct", "}");
@@ -560,6 +618,70 @@ fn parse_interface() {
     let body = stmt_block([stmt_return(acc)]);
     let params = [ map{ name: "x", type: nil, default: nil } ];
     return stmt_fn(name, params, body, nil);
+}
+
+// `trait Name<T> { fn m1(self, a: T) -> bool; m2(); }` — algebraic/structural trait
+// descriptor matching zr_compiler.h: desugars to
+// `let Name = map{ __trait_name: "Name", __methods: [...], check: fn(x){...}, __call: fn(x){...} }`.
+fn parse_trait() {
+    let trait_tok = advance(); // skip 'trait'
+    let name_token = _expect_ctx_name();
+    if name_token == nil { return nil; }
+    let name = name_token.text;
+    _skip_optional_type_params();
+
+    expect("punct", "{");
+    let members = [];
+    let method_exprs = [];
+    while not is_at_end() and not (current().kind == "punct" and current().text == "}") {
+        if match_token("punct", ";") or match_token("punct", ",") {
+            // empty separator
+        } else {
+            if current().kind == "keyword" and current().text == "fn" { advance(); }
+            let m_token = _expect_ctx_name();
+            if m_token == nil { break; }
+            push(members, m_token.text);
+            push(method_exprs, expr_string(m_token.text));
+            _skip_optional_type_params();
+            if match_token("punct", "(") {
+                let pdepth = 1;
+                while pdepth > 0 and not is_at_end() {
+                    if current().kind == "punct" and current().text == "(" { pdepth = pdepth + 1; }
+                    elif current().kind == "punct" and current().text == ")" { pdepth = pdepth - 1; }
+                    advance();
+                }
+            }
+            if match_token("punct", ":") or match_token("operator", "->") {
+                parse_type();
+            }
+            if current().kind == "punct" and current().text == "{" {
+                parse_block(); // optional default method body
+            }
+            if match_token("punct", ";") or match_token("punct", ",") { }
+        }
+    }
+    expect("punct", "}");
+
+    let make_pred = fn() {
+        let acc = expr_call(expr_ident("is_map"), [expr_ident("x")]);
+        let i = 0;
+        while i < len(members) {
+            let has = expr_call(expr_ident("has_member"), [expr_ident("x"), expr_string(members[i])]);
+            acc = expr_binary("and", acc, has);
+            i = i + 1;
+        }
+        return expr_fnlit(["x"], stmt_block([stmt_return(acc)]));
+    };
+
+    let entries = [
+        map{ key: "__trait_name", value: expr_string(name) },
+        map{ key: "__methods", value: expr_array(method_exprs) },
+        map{ key: "check", value: make_pred() },
+        map{ key: "__call", value: make_pred() },
+    ];
+    let s = stmt_let(name, expr_map(entries), nil);
+    s.line = try trait_tok.line catch 0;
+    return s;
 }
 
 // Build the constructor for an enum DATA variant `Variant(t0, t1, ...)`:
@@ -589,21 +711,23 @@ fn enum_data_ctor(enum_name, variant_name, param_types) {
     return ctor;
 }
 
-// `enum Name { Variant [(types...)] (, ...)* }` — desugars to
+// `enum Name<T, E> { Variant [( [field:] type, ... )] (, ...)* }` — desugars to
 // `let Name = map{ Variant: <tagged map | ctor fn>, ... }`. Unit variants are
 // `{ __enum, __variant }` tagged maps; data variants are constructor functions
-// returning `{ __enum, __variant, values: [...] }`. Matches the Rust desugaring.
+// returning `{ __enum, __variant, values: [...] }`. Matches the Rust/Stage3 desugaring.
 fn parse_enum() {
-    advance(); // skip 'enum'
+    let enum_tok = advance(); // skip 'enum'
     let name_token = expect("ident", nil);
     if name_token == nil { return nil; }
     let name = name_token.text;
+    _skip_optional_type_params();
 
     expect("punct", "{");
     let entries = [];
     if not match_token("punct", "}") {
         while true {
-            let vname_token = expect("ident", nil);
+            if current().kind == "punct" and current().text == "}" { break; }
+            let vname_token = _expect_ctx_name();
             if vname_token == nil { break; }
             let vname = vname_token.text;
             if current().kind == "punct" and current().text == "(" {
@@ -611,8 +735,15 @@ fn parse_enum() {
                 let param_types = [];
                 if not (current().kind == "punct" and current().text == ")") {
                     while true {
+                        // Support named variant fields `Ok(v: T)` as well as positional `Ok(T)`.
+                        if (current().kind == "ident" or current().kind == "keyword")
+                           and peek(1).kind == "punct" and peek(1).text == ":" {
+                            advance(); // field name
+                            advance(); // ':'
+                        }
                         push(param_types, parse_type());
                         if not match_token("punct", ",") { break; }
+                        if current().kind == "punct" and current().text == ")" { break; }
                     }
                 }
                 expect("punct", ")");
@@ -623,13 +754,15 @@ fn parse_enum() {
                 push(uentries, map{ key: "__variant", value: expr_string(vname) });
                 push(entries, map{ key: vname, value: expr_map(uentries) });
             }
-            if not match_token("punct", ",") { break; }
+            if not (match_token("punct", ",") or match_token("punct", ";")) { break; }
             if current().kind == "punct" and current().text == "}" { break; } // trailing comma
         }
         expect("punct", "}");
     }
 
-    return stmt_let(name, expr_map(entries), nil);
+    let s = stmt_let(name, expr_map(entries), nil);
+    s.line = try enum_tok.line catch 0;
+    return s;
 }
 
 // `class Name { fn m(self, ...) { ... } ... }` — OOP sugar. Desugars to a class
@@ -645,6 +778,7 @@ fn parse_class() {
     let name_token = expect("ident", nil);
     if name_token == nil { return nil; }
     let cname = name_token.text;
+    _skip_optional_type_params();
 
     expect("punct", "{");
     let entries = [];
@@ -657,6 +791,7 @@ fn parse_class() {
         let mname_token = expect("ident", nil);
         if mname_token == nil { break; }
         let mname = mname_token.text;
+        _skip_optional_type_params();
         expect("punct", "(");
         let params = [];   // plain strings, per expr_fnlit
         if not match_token("punct", ")") {
@@ -674,7 +809,7 @@ fn parse_class() {
             }
             expect("punct", ")");
         }
-        if match_token("punct", ":") { parse_type(); }   // optional return type
+        if match_token("punct", ":") or match_token("operator", "->") { parse_type(); }   // optional return type
         let body = parse_block();
         push(entries, map{ key: mname, value: expr_fnlit(params, body) });
         if mname == "init" {
@@ -789,7 +924,23 @@ fn parse_if_expr() {
     return parse_if_expr_arm();
 }
 
-// A match arm's pattern: `_` (wildcard), an ident (binds the scrutinee), or a
+fn _parse_enum_pat_subs() {
+    advance(); // consume '('
+    let subs = [];
+    if not match_token("punct", ")") {
+        while true {
+            push(subs, parse_match_pattern());
+            if not match_token("punct", ",") { break; }
+            if current().kind == "punct" and current().text == ")" { break; }
+        }
+        expect("punct", ")");
+    }
+    return subs;
+}
+
+// A match arm's pattern: `_` (wildcard), negative number literal, qualified or
+// unqualified enum variant pattern (`Enum.Variant(p1, ...)`, `Enum::Variant(...)`,
+// `Enum.Variant`, `Variant(p1, ...)`), an ident (binds the scrutinee), or a
 // literal/constant expression (matched by `==`).
 fn parse_match_pattern() {
     let t = current();
@@ -797,7 +948,33 @@ fn parse_match_pattern() {
         advance();
         return map{ ptype: "wildcard" };
     }
+    if t.kind == "operator" and t.text == "-" and peek(1).kind == "number" {
+        advance();
+        let nt = advance();
+        return map{ ptype: "literal", value: expr_unary("-", expr_number(nt.text)) };
+    }
     if t.kind == "ident" {
+        // Qualified enum variant: `Enum.Variant` or `Enum::Variant` with optional `(subpats...)`
+        let is_dot = peek(1).kind == "punct" and peek(1).text == ".";
+        let is_colon2 = peek(1).kind == "punct" and peek(1).text == ":"
+            and peek(2).kind == "punct" and peek(2).text == ":";
+        if is_dot or is_colon2 {
+            let ename = advance().text;
+            if is_dot { advance(); } else { advance(); advance(); }
+            let vtok = _member_name();
+            let vname = if vtok != nil { vtok.text } else { "" };
+            if current().kind == "punct" and current().text == "(" {
+                let subs = _parse_enum_pat_subs();
+                return map{ ptype: "enum", enum_name: ename, variant_name: vname, has_parens: true, subs: subs };
+            }
+            return map{ ptype: "enum", enum_name: ename, variant_name: vname, has_parens: false, subs: [] };
+        }
+        // Unqualified enum data variant: `Ok(x)`, `Err(msg)`, `Some(v)`
+        if peek(1).kind == "punct" and peek(1).text == "(" {
+            let vname = advance().text;
+            let subs = _parse_enum_pat_subs();
+            return map{ ptype: "enum", enum_name: nil, variant_name: vname, has_parens: true, subs: subs };
+        }
         advance();
         return map{ ptype: "bind", name: t.text };
     }
@@ -806,45 +983,175 @@ fn parse_match_pattern() {
     return map{ ptype: "literal", value: lit };
 }
 
+fn _wrap_binds_expr(binds, inner_expr) {
+    if len(binds) == 0 { return inner_expr; }
+    if is_map(inner_expr) and map_has(inner_expr, "block_expr") and inner_expr.block_expr == true {
+        let merged = [];
+        let bi = 0;
+        while bi < len(binds) {
+            push(merged, binds[bi]);
+            bi = bi + 1;
+        }
+        let old_s = inner_expr.func.body.stmts;
+        let oi = 0;
+        while oi < len(old_s) {
+            push(merged, old_s[oi]);
+            oi = oi + 1;
+        }
+        inner_expr.func.body.stmts = merged;
+        return inner_expr;
+    }
+    let stmts = [];
+    let bi = 0;
+    while bi < len(binds) {
+        push(stmts, binds[bi]);
+        bi = bi + 1;
+    }
+    push(stmts, stmt_return(inner_expr));
+    let call = expr_call(expr_fnlit([], stmt_block(stmts)), []);
+    call.block_expr = true;
+    call.block_tail = true;
+    return call;
+}
+
+fn _compile_enum_pat_check(val_expr, pat, binds_out) {
+    let pt = pat.ptype;
+    if pt == "wildcard" {
+        return nil;
+    }
+    if pt == "bind" {
+        push(binds_out, stmt_let(pat.name, val_expr, nil));
+        return nil;
+    }
+    if pt == "literal" {
+        return expr_binary("==", val_expr, pat.value);
+    }
+    if pt == "enum" {
+        let chk = expr_call(expr_ident("is_map"), [val_expr]);
+        if pat.enum_name != nil {
+            chk = expr_binary("and", chk, expr_binary("==", expr_member(val_expr, "__enum"), expr_string(pat.enum_name)));
+        }
+        chk = expr_binary("and", chk, expr_binary("==", expr_member(val_expr, "__variant"), expr_string(pat.variant_name)));
+        if pat.has_parens {
+            let vals_expr = expr_member(val_expr, "values");
+            chk = expr_binary("and", chk, expr_call(expr_ident("is_array"), [vals_expr]));
+            chk = expr_binary("and", chk, expr_binary("==", expr_call(expr_ident("len"), [vals_expr]), expr_number(str(len(pat.subs)))));
+            let si = 0;
+            while si < len(pat.subs) {
+                let item_expr = expr_index(vals_expr, expr_number(str(si)));
+                let sub_chk = _compile_enum_pat_check(item_expr, pat.subs[si], binds_out);
+                if sub_chk != nil {
+                    chk = expr_binary("and", chk, sub_chk);
+                }
+                si = si + 1;
+            }
+        } else {
+            chk = expr_binary("and", chk, expr_unary("not", expr_call(expr_ident("is_array"), [expr_member(val_expr, "values")])));
+        }
+        return chk;
+    }
+    return nil;
+}
+
+fn _lower_match_arm(pat, guard, body) {
+    if pat.ptype != "enum" {
+        return map{ pattern: pat, guard: guard, body: body };
+    }
+    let tmp_name = "$me_" + str(_match_tmp_seq);
+    _match_tmp_seq = _match_tmp_seq + 1;
+    let binds = [];
+    let pat_chk = _compile_enum_pat_check(expr_ident(tmp_name), pat, binds);
+    let full_guard = pat_chk;
+    if guard != nil {
+        let wrapped_guard = _wrap_binds_expr(binds, guard);
+        if full_guard != nil {
+            full_guard = expr_binary("and", full_guard, wrapped_guard);
+        } else {
+            full_guard = wrapped_guard;
+        }
+    }
+    let wrapped_body = _wrap_binds_expr(binds, body);
+    return map{
+        pattern: map{ ptype: "bind", name: tmp_name },
+        guard: full_guard,
+        body: wrapped_body,
+    };
+}
+
+fn _match_arm_arrow() {
+    if current().kind == "punct" and current().text == ":" {
+        advance();
+        return true;
+    }
+    if current().kind == "operator" and (current().text == "=>" or current().text == "->") {
+        advance();
+        return true;
+    }
+    // Tokenizer emits `=` then `>` when `=>` is written in source.
+    if current().kind == "operator" and current().text == "="
+       and peek(1).kind == "operator" and peek(1).text == ">" {
+        advance();
+        advance();
+        return true;
+    }
+    if current().kind == "punct" and current().text == "{" {
+        return true;
+    }
+    return false;
+}
+
 // match expression:
 //   match SCRUTINEE {
-//       case PATTERN [if GUARD] : BODY ;
+//       [case] PATTERN [if GUARD] (=> | -> | :) BODY [; | ,]
 //       ...
-//       else : BODY ;
+//       [else (=> | -> | :) BODY [; | ,]]
 //   }
-// Patterns: `_` wildcard, ident bind, or literal (matched by `==`). Arms are
-// tried top to bottom; the first matching arm's BODY is the value. `else` (or no
-// match) yields the else body, or nil if absent.
 fn parse_match() {
-    advance(); // skip 'match'
+    let m_tok = advance(); // skip 'match'
     let scrut = parse_expr();
     expect("punct", "{");
     let arms = [];
     let melse = nil;
-    while not (current().kind == "punct" and current().text == "}") {
-        if current().kind == "keyword" and current().text == "else" {
+    while not is_at_end() and not (current().kind == "punct" and current().text == "}") {
+        if match_token("punct", ";") or match_token("punct", ",") {
+            // allow extra separators
+        } elif current().kind == "keyword" and current().text == "else" {
             advance();
-            if current().kind == "punct" and current().text == ":" { advance(); }
+            _match_arm_arrow();
             melse = parse_expr();
-            if current().kind == "punct" and current().text == ";" { advance(); }
-        } else if current().kind == "keyword" and current().text == "case" {
-            advance();
+            if is_map(melse) and map_has(melse, "block_expr") and melse.block_expr == true {
+                melse.is_match_arm_block = true;
+            }
+            if match_token("punct", ";") or match_token("punct", ",") { }
+        } else {
+            let before_arm = pos;
+            if current().kind == "keyword" and current().text == "case" {
+                advance();
+            }
             let pat = parse_match_pattern();
             let guard = nil;
             if current().kind == "keyword" and current().text == "if" {
                 advance();
                 guard = parse_expr();
             }
-            expect("punct", ":");
+            if not _match_arm_arrow() {
+                expect("punct", ":");
+            }
             let body = parse_expr();
-            if current().kind == "punct" and current().text == ";" { advance(); }
-            push(arms, map{ pattern: pat, guard: guard, body: body });
-        } else {
-            break; // unexpected token — stop to avoid an infinite loop
+            if is_map(body) and map_has(body, "block_expr") and body.block_expr == true {
+                body.is_match_arm_block = true;
+            }
+            if match_token("punct", ";") or match_token("punct", ",") { }
+            push(arms, _lower_match_arm(pat, guard, body));
+            if pos == before_arm {
+                break; // unexpected token — stop to avoid an infinite loop
+            }
         }
     }
     expect("punct", "}");
-    return map{ kind: "match", scrutinee: scrut, arms: arms, melse: melse };
+    let node = map{ kind: "match", scrutinee: scrut, arms: arms, melse: melse };
+    node.line = try m_tok.line catch 0;
+    return node;
 }
 
 fn parse_if() {
@@ -1038,18 +1345,38 @@ fn parse_block_expr() {
     let tail = nil;
     while not is_at_end() and current().text != "}" {
         let t = current();
-        let is_stmt_kw = t.kind == "keyword" and (t.text == "let" or t.text == "const"
-            or t.text == "fn" or t.text == "return" or t.text == "if" or t.text == "while"
+        let is_named_fn = t.kind == "keyword" and t.text == "fn"
+            and not (peek(1).kind == "punct" and peek(1).text == "(")
+            and not (peek(1).kind == "operator" and peek(1).text == "<");
+        let is_stmt_kw = (t.kind == "keyword" and (t.text == "let" or t.text == "const"
+            or t.text == "return" or t.text == "while"
             or t.text == "for" or t.text == "break" or t.text == "continue"
             or t.text == "import" or t.text == "export" or t.text == "struct"
-            or t.text == "enum" or t.text == "class" or t.text == "interface");
+            or t.text == "enum" or t.text == "class" or t.text == "interface"))
+            or is_named_fn;
+        let is_trait = t.kind == "ident" and t.text == "trait"
+            and (peek(1).kind == "ident" or _is_ctx_name_kw(peek(1)))
+            and ((peek(2).kind == "punct" and peek(2).text == "{")
+                 or (peek(2).kind == "operator" and peek(2).text == "<"));
         let is_assign = (t.kind == "ident" or _is_ctx_name_kw(t))
-            and peek(1).kind == "operator" and peek(1).text == "=";
+            and peek(1).kind == "operator" and _is_assign_op(peek(1).text);
         // `print` is a statement in leading position (examples wrap whole
         // programs in a bare block; parse_stmt applies the same rule).
         let is_print = t.kind == "ident" and t.text == "print"
             and not (peek(1).kind == "operator" and peek(1).text == "=");
-        if is_stmt_kw or is_assign or is_print {
+        if t.kind == "keyword" and t.text == "if" {
+            let ie = parse_expr();
+            if match_token("punct", ";") {
+                push(stmts, stmt_expr(ie));
+            } elif current().kind == "punct" and current().text == "}" {
+                tail = ie;
+                break;
+            } else {
+                push(errors, "Expected ';' after statement in expression block at line "
+                    + str(current().line) + ":" + str(current().col));
+                push(stmts, stmt_expr(ie));
+            }
+        } elif is_stmt_kw or is_trait or is_assign or is_print {
             let before = pos;
             let s = parse_stmt();
             if s != nil { push(stmts, s); }
@@ -1145,7 +1472,8 @@ fn parse_assignment_expr() {
     // Assignment: <lvalue> = <expr>. The lvalue is a parsed postfix expression —
     // a bare ident, or an index/member chain (`a[i] = v`, `m.k = v`,
     // `cg.chunk.instructions[j].operand = x`).
-    if current().kind == "operator" and current().text == "=" {
+    if current().kind == "operator" and current().text == "="
+       and not (peek(1).kind == "operator" and peek(1).text == ">") {
         advance();
         let value = parse_assignment_expr();   // right-associative
         if left.kind == "ident" {
@@ -1501,29 +1829,64 @@ fn parse_primary() {
             return parse_match();
         }
         if t.text == "try" {
-            // `try <expr> catch <expr>` — an expression that yields the body's
-            // value, or the handler's value if the body raises.
+            // `try <expr> catch [err | (err)] <expr>` — yields the body's
+            // value, or the handler's value (with optional bound error variable).
             advance();
             let body = parse_expr();
             let handler = expr_nil();
+            let catch_var: any = nil;
             if current().kind == "keyword" and current().text == "catch" {
                 advance();
-                handler = parse_expr();
+                if (current().kind == "ident" or _is_ctx_name_kw(current()))
+                   and peek(1).kind == "punct" and peek(1).text == "{" {
+                    catch_var = advance().text;
+                    handler = parse_block_expr();
+                } elif current().kind == "punct" and current().text == "("
+                   and (peek(1).kind == "ident" or _is_ctx_name_kw(peek(1)))
+                   and peek(2).kind == "punct" and peek(2).text == ")"
+                   and peek(3).kind == "punct" and peek(3).text == "{" {
+                    advance();
+                    catch_var = advance().text;
+                    advance();
+                    handler = parse_block_expr();
+                } else {
+                    handler = parse_expr();
+                }
+                if catch_var != nil and is_map(handler) and handler.kind == "call"
+                   and is_map(handler.func) and handler.func.kind == "fn_lit" {
+                    let cval = expr_nil();
+                    cval.is_catch_err_val = true;
+                    let cbind = stmt_let(catch_var, cval, "any");
+                    let new_stmts = [cbind];
+                    let hi = 0;
+                    let old_stmts = handler.func.body.stmts;
+                    while hi < len(old_stmts) {
+                        push(new_stmts, old_stmts[hi]);
+                        hi = hi + 1;
+                    }
+                    handler.func.body.stmts = new_stmts;
+                }
             }
-            return map{ kind: "try", body: body, handler: handler };
+            return map{ kind: "try", body: body, handler: handler, catch_var: catch_var };
         }
         if t.text == "fn" {
             advance();
+            _skip_optional_type_params();
             expect("punct", "(");
             let params = [];
             if not match_token("punct", ")") {
                 while true {
                     let pn = _expect_ctx_name();
                     if pn == nil { break; }
+                    if match_token("punct", ":") { parse_type(); }
                     push(params, pn.text);
                     if not match_token("punct", ",") { break; }
+                    if current().kind == "punct" and current().text == ")" { break; }
                 }
                 expect("punct", ")");
+            }
+            if match_token("punct", ":") or match_token("operator", "->") {
+                parse_type();
             }
             let body = parse_block();
             return expr_fnlit(params, body);
@@ -1631,6 +1994,16 @@ fn _parse_type_primary() {
         let right = parse_type();
         _type_expect(">");
         return name + "<" + left + "," + right + ">";
+    }
+    if _type_match("<") {
+        if not _type_match(">") {
+            while true {
+                parse_type();
+                if not _type_match(",") { break; }
+            }
+            _type_expect(">");
+        }
+        return name;
     }
     return name;
 }
