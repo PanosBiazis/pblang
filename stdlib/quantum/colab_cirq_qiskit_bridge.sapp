@@ -1742,6 +1742,204 @@ fn generate_colab_gpu_notebook_json(opts = nil) {
     return json_text;
 }
 
+// ── 5. Smart Laptop-Resource-Saving Offload Governor (Eco Local vs Cloud GPU/TPU) ──
+
+fn _parse_first_int_in_line(line) {
+    let digits = "";
+    let started = false;
+    let n = len(line);
+    let i = 0;
+    while i < n {
+        let ch = str_slice(line, i, i + 1);
+        if ch >= "0" and ch <= "9" {
+            digits = digits + ch;
+            started = true;
+        } else if started {
+            break;
+        }
+        i = i + 1;
+    }
+    if len(digits) == 0 { return 0; }
+    let v = try json_parse(digits) catch 0;
+    return if type(v) == "number" { num_floor(v) } else { 0 };
+}
+
+// Zero-fork (< 0.5 ms) laptop resource telemetry from /proc & /sys/class/power_supply
+fn probe_laptop_resources() {
+    let mem_total_kb = 0;
+    let mem_avail_kb = 0;
+    let mem_raw = try fs_read("/proc/meminfo") catch "";
+    if len(mem_raw) > 0 {
+        let mlines = str_split(mem_raw, "\n");
+        let mi = 0;
+        while mi < len(mlines) {
+            let ln = mlines[mi];
+            if str_starts_with(ln, "MemTotal:") {
+                mem_total_kb = _parse_first_int_in_line(ln);
+            } else if str_starts_with(ln, "MemAvailable:") {
+                mem_avail_kb = _parse_first_int_in_line(ln);
+            }
+            if mem_total_kb > 0 and mem_avail_kb > 0 { break; }
+            mi = mi + 1;
+        }
+    }
+
+    let load_1m = 0.0;
+    let load_raw = try fs_read("/proc/loadavg") catch "";
+    if len(load_raw) > 0 {
+        let lparts = str_split(str_trim(load_raw), " ");
+        if len(lparts) > 0 {
+            let lv = try json_parse(lparts[0]) catch 0.0;
+            load_1m = if type(lv) == "number" { lv * 1.0 } else { 0.0 };
+        }
+    }
+
+    let hp = try hpc_probe() catch map{ cpu_threads: 4 };
+    let cpu_threads = if is_map(hp) and map_has(hp, "cpu_threads") and hp.cpu_threads > 0 {
+        num_floor(hp.cpu_threads)
+    } else {
+        4
+    };
+
+    let on_battery = false;
+    let battery_pct = 100;
+    let bat_candidates = ["/sys/class/power_supply/BAT0", "/sys/class/power_supply/BAT1", "/sys/class/power_supply/BATT"];
+    let bi = 0;
+    while bi < len(bat_candidates) {
+        let bdir = bat_candidates[bi];
+        let bstat = str_trim(try fs_read(bdir + "/status") catch "");
+        if len(bstat) > 0 {
+            if str_lower(bstat) == "discharging" {
+                on_battery = true;
+            }
+            let bcap = str_trim(try fs_read(bdir + "/capacity") catch "");
+            if len(bcap) > 0 {
+                battery_pct = _parse_first_int_in_line(bcap);
+            }
+            break;
+        }
+        bi = bi + 1;
+    }
+
+    let mem_total_mb = if mem_total_kb > 0 { num_floor(mem_total_kb / 1024.0) } else { 8192 };
+    let mem_avail_mb = if mem_avail_kb > 0 { num_floor(mem_avail_kb / 1024.0) } else { 4096 };
+    let load_ratio = if cpu_threads > 0 { load_1m / (cpu_threads * 1.0) } else { load_1m };
+
+    let low_ram = mem_avail_mb < 2500;
+    let high_cpu_load = load_ratio > 0.70;
+    let low_battery = on_battery and (battery_pct < 35);
+    let laptop_constrained = low_ram or high_cpu_load or low_battery;
+
+    let eco_threads = if on_battery or high_cpu_load {
+        let half = num_floor(cpu_threads / 2.0);
+        if half < 1 { 1 } else { half }
+    } else {
+        let cap_t = cpu_threads - 2;
+        if cap_t < 1 { 1 } else { cap_t }
+    };
+
+    return map{
+        ok: true,
+        mem_total_mb: mem_total_mb,
+        mem_avail_mb: mem_avail_mb,
+        cpu_threads: cpu_threads,
+        eco_local_threads: eco_threads,
+        load_1m: load_1m,
+        load_ratio: load_ratio,
+        on_battery: on_battery,
+        battery_pct: battery_pct,
+        low_ram: low_ram,
+        high_cpu_load: high_cpu_load,
+        low_battery: low_battery,
+        laptop_constrained: laptop_constrained
+    };
+}
+
+// Automatically selects the lowest-laptop-impact execution target:
+//   - "local_pblang_eco": instant local execution (< 15 MB RAM, 0 browser tabs) for light tasks
+//   - "colab_cloud_t4_gpu_background": CUDA / QLoRA / noisy Cirq-Qiskit / constrained-laptop offload
+//   - "colab_cloud_v5e1_tpu_background": 47 GB High-RAM / XLA TensorCore / >= 23q / >= 4096 matrix offload
+fn decide_smart_colab_offload(workload = nil) {
+    let hw = probe_laptop_resources();
+    let kind = if is_map(workload) and map_has(workload, "kind") {
+        str_lower(str_trim(str(workload.kind)))
+    } else {
+        "auto"
+    };
+    let n_qubits = if is_map(workload) and map_has(workload, "n_qubits") {
+        num_floor(workload.n_qubits)
+    } else {
+        0
+    };
+    let is_clifford = if is_map(workload) and map_has(workload, "is_clifford") {
+        workload.is_clifford == true
+    } else {
+        false
+    };
+    let shots = if is_map(workload) and map_has(workload, "shots") {
+        num_floor(workload.shots)
+    } else {
+        1024
+    };
+    let matrix_dim = if is_map(workload) and map_has(workload, "matrix_dim") {
+        num_floor(workload.matrix_dim)
+    } else {
+        0
+    };
+    let est_ram_mb = if is_map(workload) and map_has(workload, "estimated_ram_mb") {
+        num_floor(workload.estimated_ram_mb)
+    } else {
+        0
+    };
+    let needs_cuda = (kind == "cuda" or kind == "qlora" or kind == "transformer_gpu" or kind == "gpu") or
+        (is_map(workload) and map_has(workload, "needs_cuda") and workload.needs_cuda == true);
+    let needs_tpu = (kind == "tpu" or kind == "xla" or kind == "jax_tpu") or
+        (is_map(workload) and map_has(workload, "needs_tpu") and workload.needs_tpu == true);
+
+    let route = "local_pblang_eco";
+    let accelerator = "LOCAL_ECO";
+    let colab_notebook_url = "";
+    let reason = "Light workload fits in < 15 MB local PBLang eco-mode with 0 browser tab RAM overhead.";
+
+    if needs_tpu or est_ram_mb > 10000 or matrix_dim >= 4096 or ((not is_clifford) and n_qubits >= 23) {
+        route = "colab_cloud_v5e1_tpu_background";
+        accelerator = "TPU_V5E1";
+        colab_notebook_url = "https://colab.research.google.com/github/PanosBiazis/pblang/blob/main/examples/quantum_ai/pblang_v4_colab_tpu_cirq_qiskit.ipynb";
+        reason = "High-RAM / large-tensor / >=23q workload offloaded to Google Cloud TPU v5e-1 (47 GB RAM, 24 threads, XLA TPU v5 lite).";
+    } else if needs_cuda or ((not is_clifford) and n_qubits >= 19) or shots >= 16384 or kind == "cirq_qiskit_heavy" or
+              (hw.laptop_constrained and (n_qubits >= 14 or matrix_dim >= 1024 or est_ram_mb >= 512 or kind == "heavy")) {
+        route = "colab_cloud_t4_gpu_background";
+        accelerator = "GPU_T4";
+        colab_notebook_url = "https://colab.research.google.com/github/PanosBiazis/pblang/blob/main/examples/quantum_ai/pblang_v4_colab_gpu_cirq_qiskit.ipynb";
+        reason = if hw.laptop_constrained {
+            "Laptop resource protection active (RAM/CPU/Battery threshold) — offloading compute to Google Cloud Tesla T4 GPU."
+        } else {
+            "CUDA / QLoRA / >=19q / high-shot quantum workload offloaded to Google Cloud Tesla T4 GPU."
+        };
+    }
+
+    let uses_colab = route != "local_pblang_eco";
+    return map{
+        ok: true,
+        selected_route: route,
+        accelerator: accelerator,
+        uses_colab_cloud: uses_colab,
+        colab_notebook_url: colab_notebook_url,
+        reason: reason,
+        laptop_protection_directives: map{
+            open_in_background_tab: true,
+            preserve_existing_user_tabs: true,
+            zero_cookie_or_token_reads: true,
+            avoid_screenshots: true,
+            auto_disconnect_and_delete_runtime: uses_colab,
+            auto_close_temporary_colab_tab: uses_colab,
+            local_eco_threads: hw.eco_local_threads,
+            nice_priority: 10
+        },
+        laptop_telemetry: hw
+    };
+}
+
 export BRIDGE_VERSION,
        BRIDGE_FORMAT,
        redact_sensitive_text,
@@ -1759,4 +1957,7 @@ export BRIDGE_VERSION,
        compute_hellinger_fidelity,
        cost_optimized_quantum_policy,
        smart_quantum_execute,
-       generate_colab_gpu_notebook_json;
+       generate_colab_gpu_notebook_json,
+       probe_laptop_resources,
+       decide_smart_colab_offload;
+
