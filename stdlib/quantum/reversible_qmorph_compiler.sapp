@@ -1,0 +1,693 @@
+// stdlib/quantum/reversible_qmorph_compiler.sapp — PBLang v5.3.0
+// Pillar 1: Reversible Logic & Bennett Uncomputation Compiler (@reversible fn ->
+// Toffoli/Fredkin/CNOT/X gates + OpenQASM 3.0 Dynamic Feed-Forward) and
+// Fail-Closed Q-MORPH Regime Auto-Detector & Policy Engine (Q0 -> Q1 -> Q2 -> Q3).
+
+let QMORPH_VERSION = "5.3.0";
+
+// ── Internal Helpers ─────────────────────────────────────────────────────────
+
+fn _clone_int_arr(arr) {
+    let out = [];
+    let i = 0;
+    while i < len(arr) {
+        push(out, arr[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _clone_gate(g) {
+    let ctrls = if map_has(g, "controls") and is_array(g.controls) { _clone_int_arr(g.controls) } else { [] };
+    let targs = if map_has(g, "targets") and is_array(g.targets) { _clone_int_arr(g.targets) } else { [] };
+    let ph = if map_has(g, "phase") { str(g.phase) } else { "direct" };
+    return map{
+        op: str_upper(str_trim(str(g.op))),
+        controls: ctrls,
+        targets: targs,
+        phase: ph
+    };
+}
+
+fn _mk_x(t, ph) {
+    return map{ op: "X", controls: [], targets: [t], phase: ph };
+}
+
+fn _mk_cnot(c, t, ph) {
+    return map{ op: "CNOT", controls: [c], targets: [t], phase: ph };
+}
+
+fn _mk_ccnot(c1, c2, t, ph) {
+    return map{ op: "CCNOT", controls: [c1, c2], targets: [t], phase: ph };
+}
+
+fn _mk_cswap(c, t1, t2, ph) {
+    return map{ op: "CSWAP", controls: [c], targets: [t1, t2], phase: ph };
+}
+
+fn _append_bennett(compute_gates, copy_gates) {
+    let all_gates = [];
+    let i = 0;
+    while i < len(compute_gates) {
+        let g = _clone_gate(compute_gates[i]);
+        g.phase = "compute";
+        push(all_gates, g);
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(copy_gates) {
+        let g = _clone_gate(copy_gates[j]);
+        g.phase = "copy_out";
+        push(all_gates, g);
+        j = j + 1;
+    }
+    let k = len(compute_gates) - 1;
+    while k >= 0 {
+        let g = _clone_gate(compute_gates[k]);
+        g.phase = "uncompute";
+        push(all_gates, g);
+        k = k - 1;
+    }
+    return all_gates;
+}
+
+fn _apply_gate_to_bits(bits, g) {
+    let op = str_upper(str_trim(str(g.op)));
+    if op == "X" {
+        let t = g.targets[0];
+        bits[t] = 1 - bits[t];
+        return bits;
+    }
+    if op == "CNOT" or op == "CX" {
+        let c = g.controls[0];
+        let t = g.targets[0];
+        if bits[c] == 1 {
+            bits[t] = 1 - bits[t];
+        }
+        return bits;
+    }
+    if op == "CCNOT" or op == "CCX" or op == "TOFFOLI" {
+        let c1 = g.controls[0];
+        let c2 = g.controls[1];
+        let t = g.targets[0];
+        if bits[c1] == 1 and bits[c2] == 1 {
+            bits[t] = 1 - bits[t];
+        }
+        return bits;
+    }
+    if op == "CSWAP" or op == "FREDKIN" {
+        let c = g.controls[0];
+        let t1 = g.targets[0];
+        let t2 = g.targets[1];
+        if bits[c] == 1 {
+            let tmp = bits[t1];
+            bits[t1] = bits[t2];
+            bits[t2] = tmp;
+        }
+        return bits;
+    }
+    throw "reversible_qmorph_compiler: unsupported reversible gate op '" + op + "'";
+}
+
+fn _emit_qasm3_gate_line(g, indent) {
+    let op = str_upper(str_trim(str(g.op)));
+    if op == "X" {
+        return indent + "x q[" + str(g.targets[0]) + "];\n";
+    }
+    if op == "CNOT" or op == "CX" {
+        return indent + "cx q[" + str(g.controls[0]) + "], q[" + str(g.targets[0]) + "];\n";
+    }
+    if op == "CCNOT" or op == "CCX" or op == "TOFFOLI" {
+        return indent + "ccx q[" + str(g.controls[0]) + "], q[" + str(g.controls[1]) + "], q[" + str(g.targets[0]) + "];\n";
+    }
+    if op == "CSWAP" or op == "FREDKIN" {
+        return indent + "cswap q[" + str(g.controls[0]) + "], q[" + str(g.targets[0]) + "], q[" + str(g.targets[1]) + "];\n";
+    }
+    if op == "Z" {
+        return indent + "z q[" + str(g.targets[0]) + "];\n";
+    }
+    if op == "H" {
+        return indent + "h q[" + str(g.targets[0]) + "];\n";
+    }
+    throw "reversible_qmorph_compiler: unsupported OpenQASM 3.0 gate '" + op + "'";
+}
+
+// ── 1. Reversible Logic & Bennett Uncomputation Compiler ─────────────────────
+
+fn compile_reversible_expr(op_name, spec) {
+    let op = str_lower(str_trim(str(op_name)));
+    let sp = if is_map(spec) { spec } else { map{} };
+
+    let input_qubits = [];
+    let output_qubits = [];
+    let ancilla_qubits = [];
+    let compute_gates = [];
+    let copy_gates = [];
+    let gates = [];
+
+    if op == "xor" {
+        // Inputs: a=0, b=1; Output: out=2; Ancilla: anc=3 (Bennett compute-copy-uncompute)
+        input_qubits = [0, 1];
+        output_qubits = [2];
+        ancilla_qubits = [3];
+        push(compute_gates, _mk_cnot(0, 3, "compute"));
+        push(compute_gates, _mk_cnot(1, 3, "compute"));
+        push(copy_gates, _mk_cnot(3, 2, "copy_out"));
+        gates = _append_bennett(compute_gates, copy_gates);
+    } else if op == "and" {
+        // Inputs: a=0, b=1; Output: out=2; Ancilla: anc=3
+        input_qubits = [0, 1];
+        output_qubits = [2];
+        ancilla_qubits = [3];
+        push(compute_gates, _mk_ccnot(0, 1, 3, "compute"));
+        push(copy_gates, _mk_cnot(3, 2, "copy_out"));
+        gates = _append_bennett(compute_gates, copy_gates);
+    } else if op == "or" {
+        // a | b = !(!a & !b) using anc=3; restore a,b in compute and uncompute anc to |0>
+        input_qubits = [0, 1];
+        output_qubits = [2];
+        ancilla_qubits = [3];
+        push(compute_gates, _mk_x(0, "compute"));
+        push(compute_gates, _mk_x(1, "compute"));
+        push(compute_gates, _mk_ccnot(0, 1, 3, "compute"));
+        push(compute_gates, _mk_x(3, "compute"));
+        push(compute_gates, _mk_x(0, "compute"));
+        push(compute_gates, _mk_x(1, "compute"));
+        push(copy_gates, _mk_cnot(3, 2, "copy_out"));
+        gates = _append_bennett(compute_gates, copy_gates);
+    } else if op == "maj" {
+        // MAJ(a, b, c) = (a & b) ^ (b & c) ^ (a & c)
+        // Inputs: a=0, b=1, c=2; Output: out=3; Ancilla: anc=4
+        input_qubits = [0, 1, 2];
+        output_qubits = [3];
+        ancilla_qubits = [4];
+        push(compute_gates, _mk_ccnot(0, 1, 4, "compute"));
+        push(compute_gates, _mk_ccnot(1, 2, 4, "compute"));
+        push(compute_gates, _mk_ccnot(0, 2, 4, "compute"));
+        push(copy_gates, _mk_cnot(4, 3, "copy_out"));
+        gates = _append_bennett(compute_gates, copy_gates);
+    } else if op == "half_adder" {
+        // Inputs: a=0, b=1; Outputs: sum=2, carry=3; Ancillas: anc_sum=4, anc_carry=5
+        input_qubits = [0, 1];
+        output_qubits = [2, 3];
+        ancilla_qubits = [4, 5];
+        push(compute_gates, _mk_cnot(0, 4, "compute"));
+        push(compute_gates, _mk_cnot(1, 4, "compute"));
+        push(compute_gates, _mk_ccnot(0, 1, 5, "compute"));
+        push(copy_gates, _mk_cnot(4, 2, "copy_out"));
+        push(copy_gates, _mk_cnot(5, 3, "copy_out"));
+        gates = _append_bennett(compute_gates, copy_gates);
+    } else if op == "full_adder" {
+        // Inputs: a=0, b=1, cin=2; Outputs: sum=3, cout=4; Ancillas: anc_sum=5, anc_cout=6
+        input_qubits = [0, 1, 2];
+        output_qubits = [3, 4];
+        ancilla_qubits = [5, 6];
+        push(compute_gates, _mk_cnot(0, 5, "compute"));
+        push(compute_gates, _mk_cnot(1, 5, "compute"));
+        push(compute_gates, _mk_cnot(2, 5, "compute"));
+        push(compute_gates, _mk_ccnot(0, 1, 6, "compute"));
+        push(compute_gates, _mk_ccnot(1, 2, 6, "compute"));
+        push(compute_gates, _mk_ccnot(0, 2, 6, "compute"));
+        push(copy_gates, _mk_cnot(5, 3, "copy_out"));
+        push(copy_gates, _mk_cnot(6, 4, "copy_out"));
+        gates = _append_bennett(compute_gates, copy_gates);
+    } else if op == "mux_fredkin" {
+        // 2:1 Multiplexer via Fredkin (CSWAP): out = sel ? d1 : d0
+        // Inputs: sel=0, d0=1, d1=2; Output: out=3; Ancillas: w0=4, w1=5
+        input_qubits = [0, 1, 2];
+        output_qubits = [3];
+        ancilla_qubits = [4, 5];
+        push(compute_gates, _mk_cnot(1, 4, "compute"));
+        push(compute_gates, _mk_cnot(2, 5, "compute"));
+        push(compute_gates, _mk_cswap(0, 4, 5, "compute"));
+        push(copy_gates, _mk_cnot(4, 3, "copy_out"));
+        gates = _append_bennett(compute_gates, copy_gates);
+    } else if op == "compare_eq" {
+        // Width-bit equality comparator: A[0..w-1] == B[0..w-1]
+        let width = if map_has(sp, "width") { num_floor(sp.width) } else { 2 };
+        if width < 1 {
+            throw "reversible_qmorph_compiler: compare_eq width must be >= 1";
+        }
+        let i = 0;
+        while i < 2 * width {
+            push(input_qubits, i);
+            i = i + 1;
+        }
+        let out_q = 2 * width;
+        output_qubits = [out_q];
+        let eq_base = out_q + 1;
+        let eq_i = 0;
+        while eq_i < width {
+            let eq_q = eq_base + eq_i;
+            push(ancilla_qubits, eq_q);
+            push(compute_gates, _mk_cnot(eq_i, eq_q, "compute"));
+            push(compute_gates, _mk_cnot(width + eq_i, eq_q, "compute"));
+            push(compute_gates, _mk_x(eq_q, "compute"));
+            eq_i = eq_i + 1;
+        }
+        let final_anc = eq_base;
+        if width >= 2 {
+            let acc_base = eq_base + width;
+            let a0 = acc_base;
+            push(ancilla_qubits, a0);
+            push(compute_gates, _mk_ccnot(eq_base, eq_base + 1, a0, "compute"));
+            final_anc = a0;
+            let j = 2;
+            while j < width {
+                let prev_acc = acc_base + (j - 2);
+                let cur_acc = acc_base + (j - 1);
+                push(ancilla_qubits, cur_acc);
+                push(compute_gates, _mk_ccnot(prev_acc, eq_base + j, cur_acc, "compute"));
+                final_anc = cur_acc;
+                j = j + 1;
+            }
+        }
+        push(copy_gates, _mk_cnot(final_anc, out_q, "copy_out"));
+        gates = _append_bennett(compute_gates, copy_gates);
+    } else if op == "capability_check" {
+        // Reversible capability gate: granted = has_cap & role_match & not_revoked
+        // Inputs: has_cap=0, role_match=1, not_revoked=2; Output: granted=3; Ancillas: anc_pair=4, anc_grant=5
+        input_qubits = [0, 1, 2];
+        output_qubits = [3];
+        ancilla_qubits = [4, 5];
+        push(compute_gates, _mk_ccnot(0, 1, 4, "compute"));
+        push(compute_gates, _mk_ccnot(4, 2, 5, "compute"));
+        push(copy_gates, _mk_cnot(5, 3, "copy_out"));
+        gates = _append_bennett(compute_gates, copy_gates);
+    } else {
+        throw "reversible_qmorph_compiler: unknown reversible primitive '" + str(op_name) + "'";
+    }
+
+    let total_qubits = len(input_qubits) + len(output_qubits) + len(ancilla_qubits);
+    return map{
+        format: "pblang.reversible.circuit.v1",
+        version: QMORPH_VERSION,
+        op_name: op,
+        n_qubits: total_qubits,
+        input_qubits: input_qubits,
+        output_qubits: output_qubits,
+        ancilla_qubits: ancilla_qubits,
+        compute_gate_count: len(compute_gates),
+        copy_out_gate_count: len(copy_gates),
+        uncompute_gate_count: len(compute_gates),
+        gate_count: len(gates),
+        ancilla_garbage_bits: 0,
+        bennett_uncomputed: true,
+        inverted: false,
+        gates: gates
+    };
+}
+
+fn invert_reversible_circuit(circuit) {
+    let inv_gates = [];
+    let i = len(circuit.gates) - 1;
+    while i >= 0 {
+        let g = _clone_gate(circuit.gates[i]);
+        g.phase = "adjoint";
+        push(inv_gates, g);
+        i = i - 1;
+    }
+    return map{
+        format: "pblang.reversible.circuit.v1",
+        version: QMORPH_VERSION,
+        op_name: circuit.op_name + "_dagger",
+        n_qubits: circuit.n_qubits,
+        input_qubits: _clone_int_arr(circuit.input_qubits),
+        output_qubits: _clone_int_arr(circuit.output_qubits),
+        ancilla_qubits: _clone_int_arr(circuit.ancilla_qubits),
+        compute_gate_count: circuit.uncompute_gate_count,
+        copy_out_gate_count: circuit.copy_out_gate_count,
+        uncompute_gate_count: circuit.compute_gate_count,
+        gate_count: len(inv_gates),
+        ancilla_garbage_bits: 0,
+        bennett_uncomputed: circuit.bennett_uncomputed,
+        inverted: true,
+        gates: inv_gates
+    };
+}
+
+fn simulate_reversible_circuit(circuit, input_bits) {
+    let n = circuit.n_qubits;
+    let init_bits = [];
+    let i = 0;
+    while i < n {
+        push(init_bits, 0);
+        i = i + 1;
+    }
+
+    if len(input_bits) == n {
+        let k = 0;
+        while k < n {
+            init_bits[k] = if input_bits[k] != 0 { 1 } else { 0 };
+            k = k + 1;
+        }
+    } else if len(input_bits) == len(circuit.input_qubits) {
+        let k = 0;
+        while k < len(circuit.input_qubits) {
+            let q = circuit.input_qubits[k];
+            init_bits[q] = if input_bits[k] != 0 { 1 } else { 0 };
+            k = k + 1;
+        }
+    } else {
+        throw "reversible_qmorph_compiler: input_bits length (" + str(len(input_bits)) + ") must match n_qubits (" + str(n) + ") or input_qubits (" + str(len(circuit.input_qubits)) + ")";
+    }
+
+    let state = _clone_int_arr(init_bits);
+    let gi = 0;
+    while gi < len(circuit.gates) {
+        state = _apply_gate_to_bits(state, circuit.gates[gi]);
+        gi = gi + 1;
+    }
+
+    let input_values = [];
+    let ii = 0;
+    while ii < len(circuit.input_qubits) {
+        push(input_values, state[circuit.input_qubits[ii]]);
+        ii = ii + 1;
+    }
+
+    let output_values = [];
+    let oi = 0;
+    while oi < len(circuit.output_qubits) {
+        push(output_values, state[circuit.output_qubits[oi]]);
+        oi = oi + 1;
+    }
+
+    let ancilla_values = [];
+    let garbage_bits = 0;
+    let ai = 0;
+    while ai < len(circuit.ancilla_qubits) {
+        let av = state[circuit.ancilla_qubits[ai]];
+        push(ancilla_values, av);
+        if av != 0 {
+            garbage_bits = garbage_bits + 1;
+        }
+        ai = ai + 1;
+    }
+
+    // Exact round-trip reversibility verification: apply U^\dagger to final state
+    let inv = invert_reversible_circuit(circuit);
+    let roundtrip = _clone_int_arr(state);
+    let ri = 0;
+    while ri < len(inv.gates) {
+        roundtrip = _apply_gate_to_bits(roundtrip, inv.gates[ri]);
+        ri = ri + 1;
+    }
+
+    let rev_exact = true;
+    let ci = 0;
+    while ci < n {
+        if roundtrip[ci] != init_bits[ci] {
+            rev_exact = false;
+        }
+        ci = ci + 1;
+    }
+
+    return map{
+        ok: true,
+        op_name: circuit.op_name,
+        initial_bits: init_bits,
+        final_bits: state,
+        input_values: input_values,
+        output_values: output_values,
+        ancilla_values: ancilla_values,
+        ancilla_garbage_bits: garbage_bits,
+        roundtrip_bits: roundtrip,
+        reversible_exact: rev_exact,
+        gates_executed: len(circuit.gates)
+    };
+}
+
+fn emit_openqasm3_dynamic(circuit, feed_forward_rules) {
+    let rules = if is_array(feed_forward_rules) { feed_forward_rules } else { [] };
+    let n_q = circuit.n_qubits;
+    let max_clbit = len(circuit.output_qubits);
+    let ri = 0;
+    while ri < len(rules) {
+        let rule = rules[ri];
+        if map_has(rule, "bit_index") {
+            let need = num_floor(rule.bit_index) + 1;
+            if need > max_clbit {
+                max_clbit = need;
+            }
+        }
+        ri = ri + 1;
+    }
+    if max_clbit < 1 {
+        max_clbit = 1;
+    }
+
+    let qasm = "OPENQASM 3.0;\n";
+    qasm = qasm + "include \"stdgates.inc\";\n";
+    qasm = qasm + "// PBLang v" + QMORPH_VERSION + " Reversible & Dynamic Feed-Forward Kernel (" + circuit.op_name + ")\n";
+    qasm = qasm + "qubit[" + str(n_q) + "] q;\n";
+    qasm = qasm + "bit[" + str(max_clbit) + "] c;\n\n";
+
+    let gi = 0;
+    while gi < len(circuit.gates) {
+        qasm = qasm + _emit_qasm3_gate_line(circuit.gates[gi], "");
+        gi = gi + 1;
+    }
+
+    let has_mid_ff = false;
+    if len(rules) > 0 {
+        has_mid_ff = true;
+        qasm = qasm + "\n// Mid-Circuit Measurement & Real-Time Feed-Forward\n";
+        let rj = 0;
+        while rj < len(rules) {
+            let rule = rules[rj];
+            let mq = if map_has(rule, "measure_qubit") { num_floor(rule.measure_qubit) } else { 0 };
+            let bi = if map_has(rule, "bit_index") { num_floor(rule.bit_index) } else { rj };
+            let cond_val = if map_has(rule, "condition_val") { num_floor(rule.condition_val) } else { 1 };
+            qasm = qasm + "c[" + str(bi) + "] = measure q[" + str(mq) + "];\n";
+            if map_has(rule, "actions") and is_array(rule.actions) and len(rule.actions) > 0 {
+                qasm = qasm + "if (c[" + str(bi) + "] == " + str(cond_val) + ") {\n";
+                let ak = 0;
+                while ak < len(rule.actions) {
+                    qasm = qasm + _emit_qasm3_gate_line(rule.actions[ak], "    ");
+                    ak = ak + 1;
+                }
+                qasm = qasm + "}\n";
+            }
+            rj = rj + 1;
+        }
+    } else {
+        qasm = qasm + "\n// Terminal Output Measurement\n";
+        let oi = 0;
+        while oi < len(circuit.output_qubits) {
+            qasm = qasm + "c[" + str(oi) + "] = measure q[" + str(circuit.output_qubits[oi]) + "];\n";
+            oi = oi + 1;
+        }
+    }
+
+    return map{
+        format: "openqasm.3.0",
+        version: QMORPH_VERSION,
+        op_name: circuit.op_name,
+        n_qubits: n_q,
+        n_clbits: max_clbit,
+        feed_forward_branches: len(rules),
+        has_mid_circuit_measurement: has_mid_ff,
+        qasm: qasm
+    };
+}
+
+// ── 2. Fail-Closed Q-MORPH Auto-Detector & Policy Engine (Q0 -> Q1 -> Q2 -> Q3)
+
+fn _regime_rank(regime_name) {
+    let r = str_upper(str_trim(str(regime_name)));
+    if r == "Q0" { return 0; }
+    if r == "Q1" { return 1; }
+    if r == "Q2" { return 2; }
+    if r == "Q3" { return 3; }
+    throw "reversible_qmorph_compiler: invalid Q-MORPH regime '" + str(regime_name) + "' (expected Q0, Q1, Q2, or Q3)";
+}
+
+fn _substrate_plan_for(regime) {
+    if regime == "Q3" {
+        return map{
+            pager: "quantum_native_uncompute_gc",
+            vm_mode: "q3_quantum_native_qpc_vm",
+            mesh_mode: "quantum_teleport_ipc_mesh",
+            collapse_boundary: "explicit_io_collapse_only"
+        };
+    }
+    if regime == "Q2" {
+        return map{
+            pager: "unified_qram_bucket_brigade",
+            vm_mode: "coherent_qram_dynamic_ff",
+            mesh_mode: "hybrid_qram_entangled_bridge",
+            collapse_boundary: "deferred_observable_boundary"
+        };
+    }
+    if regime == "Q1" {
+        return map{
+            pager: "nuqp_wirecut_shadows",
+            vm_mode: "hybrid_nisq_circuit_offload",
+            mesh_mode: "classical_orchestrated_ubqc",
+            collapse_boundary: "circuit_end_and_wire_cut"
+        };
+    }
+    return map{
+        pager: "classical_vm_pager",
+        vm_mode: "classical_deterministic",
+        mesh_mode: "classical_tcp_pqc",
+        collapse_boundary: "classical_everywhere"
+    };
+}
+
+fn qmorph_detect_regime(hw_probe) {
+    let p = if is_map(hw_probe) { hw_probe } else { map{} };
+    let has_qpu = if map_has(p, "has_qpu") { p.has_qpu == true } else { false };
+    let qpu_qubits = if map_has(p, "qpu_qubits") { num_floor(p.qpu_qubits) } else { 0 };
+    let has_ff = if map_has(p, "has_mid_circuit_ff") { p.has_mid_circuit_ff == true } else { false };
+    let has_qram = if map_has(p, "has_qram") { p.has_qram == true } else { false };
+    let ft_logical = if map_has(p, "fault_tolerant_logical_qubits") { num_floor(p.fault_tolerant_logical_qubits) } else { 0 };
+    let q_interconnect = if map_has(p, "quantum_interconnect") { p.quantum_interconnect == true } else { false };
+
+    let regime = "Q0";
+    if has_qpu and qpu_qubits > 0 {
+        regime = "Q1";
+        if has_qram and has_ff and (qpu_qubits >= 16 or ft_logical > 0) {
+            regime = "Q2";
+            if ft_logical >= 64 and q_interconnect {
+                regime = "Q3";
+            }
+        }
+    }
+
+    let rank = _regime_rank(regime);
+    return map{
+        format: "pblang.qmorph.state.v1",
+        version: QMORPH_VERSION,
+        regime: regime,
+        rank: rank,
+        substrate_plan: _substrate_plan_for(regime),
+        probe_summary: map{
+            has_qpu: has_qpu,
+            qpu_qubits: qpu_qubits,
+            has_mid_circuit_ff: has_ff,
+            has_qram: has_qram,
+            fault_tolerant_logical_qubits: ft_logical,
+            quantum_interconnect: q_interconnect
+        },
+        fail_closed_ready: true
+    };
+}
+
+fn qmorph_transition(current_state, new_hw_probe, policy) {
+    let cur_regime = if is_map(current_state) and map_has(current_state, "regime") {
+        str_upper(str_trim(str(current_state.regime)))
+    } else {
+        "Q0"
+    };
+    let cur_rank = _regime_rank(cur_regime);
+
+    let detected = qmorph_detect_regime(new_hw_probe);
+    let target_regime = detected.regime;
+    let target_rank = detected.rank;
+
+    let pol = if is_map(policy) { policy } else { map{} };
+    let min_regime = if map_has(pol, "min_regime") {
+        str_upper(str_trim(str(pol.min_regime)))
+    } else {
+        "Q0"
+    };
+    let min_rank = _regime_rank(min_regime);
+    let allow_bridge = if map_has(pol, "allow_explicit_channel_bridge") {
+        pol.allow_explicit_channel_bridge == true
+    } else {
+        false
+    };
+    let channel_id = if map_has(pol, "channel_id") { str(pol.channel_id) } else { "default-channel" };
+
+    // Fail-Closed Enforcement: block any silent downgrade below policy.min_regime
+    if target_rank < min_rank and (not allow_bridge) {
+        return map{
+            ok: false,
+            halted: true,
+            silent_downgrade_blocked: true,
+            requires_human_quorum: true,
+            explicit_bridge_active: false,
+            direction: "blocked_downgrade",
+            from_regime: cur_regime,
+            attempted_regime: target_regime,
+            min_regime: min_regime,
+            active_regime: cur_regime,
+            active_state: current_state,
+            reason: "FAIL_CLOSED_MIN_REGIME_PINNING_VIOLATION",
+            audit_record: map{
+                event: "QMORPH_SILENT_DOWNGRADE_BLOCKED",
+                from_regime: cur_regime,
+                attempted_regime: target_regime,
+                min_regime: min_regime,
+                channel_id: channel_id,
+                action: "HALT_AND_REQUIRE_HUMAN_QUORUM"
+            }
+        };
+    }
+
+    if target_rank < min_rank and allow_bridge {
+        return map{
+            ok: true,
+            halted: false,
+            silent_downgrade_blocked: false,
+            requires_human_quorum: false,
+            explicit_bridge_active: true,
+            direction: "explicit_channel_bridge",
+            from_regime: cur_regime,
+            attempted_regime: target_regime,
+            min_regime: min_regime,
+            active_regime: target_regime,
+            active_state: detected,
+            reason: "EXPLICIT_PER_CHANNEL_BRIDGE_AUTHORIZED",
+            audit_record: map{
+                event: "QMORPH_EXPLICIT_CHANNEL_BRIDGE",
+                from_regime: cur_regime,
+                to_regime: target_regime,
+                min_regime: min_regime,
+                channel_id: channel_id,
+                action: "BRIDGE_WITH_AUDIT_TRAIL"
+            }
+        };
+    }
+
+    let dir = "steady";
+    if target_rank > cur_rank {
+        dir = "upgrade";
+    } else if target_rank < cur_rank {
+        dir = "permitted_downgrade";
+    }
+
+    return map{
+        ok: true,
+        halted: false,
+        silent_downgrade_blocked: false,
+        requires_human_quorum: false,
+        explicit_bridge_active: false,
+        direction: dir,
+        from_regime: cur_regime,
+        attempted_regime: target_regime,
+        min_regime: min_regime,
+        active_regime: target_regime,
+        active_state: detected,
+        reason: "QMORPH_TRANSITION_ACCEPTED",
+        audit_record: map{
+            event: "QMORPH_REGIME_TRANSITION",
+            direction: dir,
+            from_regime: cur_regime,
+            to_regime: target_regime,
+            min_regime: min_regime,
+            channel_id: channel_id,
+            action: "COMMITTED"
+        }
+    };
+}
+
+export QMORPH_VERSION,
+       compile_reversible_expr,
+       invert_reversible_circuit,
+       simulate_reversible_circuit,
+       emit_openqasm3_dynamic,
+       qmorph_detect_regime,
+       qmorph_transition;

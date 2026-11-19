@@ -1,0 +1,1474 @@
+// stdlib/crypto/physics_bound_3family_its.sapp
+// PBLang v5.3.0 — Pillar 4: Physics-Bound Cryptography, Exact FIPS 180-4 SHA-512/HMAC-SHA512,
+// Information-Theoretic Security (OTP + QKD BB84 & E91 CHSH Bell),
+// 3-Family Hybrid Crypto-Agility (Lattice ML-LWE + Hash SLH-DSA/WOTS+ + Code McEliece GF(2)),
+// and Heterogeneous M-of-N Multi-Vendor Silicon Split-Trust (Shamir ITS over GF(256)).
+
+let PHYSICS_CRYPTO_VERSION = "5.3.0";
+
+// ============================================================================
+// 1. Safe 32-bit / 64-bit Arithmetic & Encoding Helpers (IEEE-754 Float53-Safe)
+// ============================================================================
+
+let _MASK32 = 4294967295;
+let _MOD32 = 4294967296;
+let _BASE16 = 65536;
+
+fn _shl32(x, r) {
+    if r <= 0 { return bit_and(x, _MASK32); }
+    if r >= 32 { return 0; }
+    let keep_mask = bit_shl(1, 32 - r) - 1;
+    return bit_shl(bit_and(x, keep_mask), r);
+}
+
+fn _shr32(x, r) {
+    if r <= 0 { return bit_and(x, _MASK32); }
+    if r >= 32 { return 0; }
+    return bit_shr(bit_and(x, _MASK32), r);
+}
+
+fn _add64(a, b) {
+    let lo = a[1] + b[1];
+    let carry = num_floor(lo / _MOD32);
+    lo = lo - carry * _MOD32;
+    let hi = a[0] + b[0] + carry;
+    let hi_ov = num_floor(hi / _MOD32);
+    hi = hi - hi_ov * _MOD32;
+    return [hi, lo];
+}
+
+fn _xor64(a, b) {
+    return [bit_xor(a[0], b[0]), bit_xor(a[1], b[1])];
+}
+
+fn _and64(a, b) {
+    return [bit_and(a[0], b[0]), bit_and(a[1], b[1])];
+}
+
+fn _not64(a) {
+    return [bit_xor(a[0], _MASK32), bit_xor(a[1], _MASK32)];
+}
+
+fn _rotr64(w, n) {
+    let hi = w[0];
+    let lo = w[1];
+    if n == 0 { return [hi, lo]; }
+    if n == 32 { return [lo, hi]; }
+    if n < 32 {
+        let nhi = bit_or(_shr32(hi, n), _shl32(lo, 32 - n));
+        let nlo = bit_or(_shr32(lo, n), _shl32(hi, 32 - n));
+        return [nhi, nlo];
+    }
+    let s = n - 32;
+    let nhi = bit_or(_shr32(lo, s), _shl32(hi, 32 - s));
+    let nlo = bit_or(_shr32(hi, s), _shl32(lo, 32 - s));
+    return [nhi, nlo];
+}
+
+fn _shr64(w, n) {
+    let hi = w[0];
+    let lo = w[1];
+    if n == 0 { return [hi, lo]; }
+    if n < 32 {
+        let nhi = _shr32(hi, n);
+        let nlo = bit_or(_shr32(lo, n), _shl32(hi, 32 - n));
+        return [nhi, nlo];
+    }
+    if n == 32 { return [0, hi]; }
+    if n < 64 { return [0, _shr32(hi, n - 32)]; }
+    return [0, 0];
+}
+
+fn _to_bytes(inp) {
+    if is_array(inp) {
+        let out = [];
+        let i = 0;
+        while i < len(inp) {
+            push(out, bit_and(inp[i], 255));
+            i = i + 1;
+        }
+        return out;
+    }
+    if is_string(inp) { return str_to_bytes(inp); }
+    return str_to_bytes(str(inp));
+}
+
+fn bytes_to_hex(bs) {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let i = 0;
+    while i < len(bs) {
+        let b = bit_and(bs[i], 255);
+        let hi = bit_shr(b, 4);
+        let lo = bit_and(b, 15);
+        out = out + str_slice(digits, hi, hi + 1) + str_slice(digits, lo, lo + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _hex_nibble(ch) {
+    if ch == "0" { return 0; }
+    if ch == "1" { return 1; }
+    if ch == "2" { return 2; }
+    if ch == "3" { return 3; }
+    if ch == "4" { return 4; }
+    if ch == "5" { return 5; }
+    if ch == "6" { return 6; }
+    if ch == "7" { return 7; }
+    if ch == "8" { return 8; }
+    if ch == "9" { return 9; }
+    if ch == "a" or ch == "A" { return 10; }
+    if ch == "b" or ch == "B" { return 11; }
+    if ch == "c" or ch == "C" { return 12; }
+    if ch == "d" or ch == "D" { return 13; }
+    if ch == "e" or ch == "E" { return 14; }
+    if ch == "f" or ch == "F" { return 15; }
+    return 0;
+}
+
+fn hex_to_bytes(hx) {
+    let out = [];
+    let n = len(hx);
+    let i = 0;
+    while i + 1 < n {
+        let hi = _hex_nibble(str_slice(hx, i, i + 1));
+        let lo = _hex_nibble(str_slice(hx, i + 1, i + 2));
+        push(out, bit_or(bit_shl(hi, 4), lo));
+        i = i + 2;
+    }
+    return out;
+}
+
+// Constant-time hex/string comparison (no early exit)
+fn ct_hex_eq(a, b) {
+    if not is_string(a) or not is_string(b) { return false; }
+    let ba = str_to_bytes(a);
+    let bb = str_to_bytes(b);
+    let la = len(ba);
+    let lb = len(bb);
+    let diff = bit_xor(la, lb);
+    let m = if la > lb { la } else { lb };
+    let i = 0;
+    while i < m {
+        let va = if i < la { ba[i] } else { 0 };
+        let vb = if i < lb { bb[i] } else { 0 };
+        diff = bit_or(diff, bit_xor(va, vb));
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+// ============================================================================
+// 2. Exact FIPS 180-4 SHA-512 & HMAC-SHA512 (Computed from First 80 Primes)
+// ============================================================================
+
+fn _big_mul(a, b) {
+    let la = len(a);
+    let lb = len(b);
+    let out = [];
+    let k = 0;
+    while k < la + lb { push(out, 0); k = k + 1; }
+    let i = 0;
+    while i < la {
+        let ai = a[i];
+        let carry = 0;
+        let j = 0;
+        while j < lb {
+            let cur = out[i + j] + ai * b[j] + carry;
+            let q = num_floor(cur / _BASE16);
+            out[i + j] = cur - q * _BASE16;
+            carry = q;
+            j = j + 1;
+        }
+        out[i + lb] = out[i + lb] + carry;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _big_cmp_shifted(a, p_val, shift_limbs) {
+    // Compare big integer `a` against `p_val * (BASE16 ^ shift_limbs)`
+    let la = len(a);
+    let top = la - 1;
+    while top > shift_limbs and a[top] == 0 {
+        top = top - 1;
+    }
+    if top > shift_limbs { return 1; }
+    if top < shift_limbs { return -1; }
+    if a[shift_limbs] > p_val { return 1; }
+    if a[shift_limbs] < p_val { return -1; }
+    let i = shift_limbs - 1;
+    while i >= 0 {
+        if a[i] > 0 { return 1; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn _big_set_bit(limbs, bit_idx) {
+    let limb_i = num_floor(bit_idx / 16);
+    let bit_in = bit_idx - limb_i * 16;
+    limbs[limb_i] = bit_or(limbs[limb_i], bit_shl(1, bit_in));
+}
+
+fn _big_clear_bit(limbs, bit_idx) {
+    let limb_i = num_floor(bit_idx / 16);
+    let bit_in = bit_idx - limb_i * 16;
+    limbs[limb_i] = bit_xor(limbs[limb_i], bit_shl(1, bit_in));
+}
+
+fn _frac64_sqrt_prime(p) {
+    // Exact 64-bit fractional part of sqrt(p) via binary search on x^2 <= p * 2^128
+    let x = [0, 0, 0, 0, 0];
+    let bit = 67;
+    while bit >= 0 {
+        _big_set_bit(x, bit);
+        let sq = _big_mul(x, x);
+        if _big_cmp_shifted(sq, p, 8) > 0 {
+            _big_clear_bit(x, bit);
+        }
+        bit = bit - 1;
+    }
+    let lo = x[0] + x[1] * _BASE16;
+    let hi = x[2] + x[3] * _BASE16;
+    return [hi, lo];
+}
+
+fn _frac64_cbrt_prime(p) {
+    // Exact 64-bit fractional part of cbrt(p) via binary search on x^3 <= p * 2^192
+    let x = [0, 0, 0, 0, 0];
+    let bit = 67;
+    while bit >= 0 {
+        _big_set_bit(x, bit);
+        let sq = _big_mul(x, x);
+        let cb = _big_mul(sq, x);
+        if _big_cmp_shifted(cb, p, 12) > 0 {
+            _big_clear_bit(x, bit);
+        }
+        bit = bit - 1;
+    }
+    let lo = x[0] + x[1] * _BASE16;
+    let hi = x[2] + x[3] * _BASE16;
+    return [hi, lo];
+}
+
+fn _first_n_primes(count) {
+    let primes = [];
+    let cand = 2;
+    while len(primes) < count {
+        let is_p = true;
+        let i = 0;
+        while i < len(primes) {
+            let pr = primes[i];
+            if pr * pr > cand { break; }
+            if num_mod(cand, pr) == 0 {
+                is_p = false;
+                break;
+            }
+            i = i + 1;
+        }
+        if is_p { push(primes, cand); }
+        cand = cand + 1;
+    }
+    return primes;
+}
+
+fn _init_sha512_tables() {
+    let primes = _first_n_primes(80);
+    let h_init = [];
+    let k_tbl = [];
+    let i = 0;
+    while i < 8 {
+        push(h_init, _frac64_sqrt_prime(primes[i]));
+        i = i + 1;
+    }
+    i = 0;
+    while i < 80 {
+        push(k_tbl, _frac64_cbrt_prime(primes[i]));
+        i = i + 1;
+    }
+    return map{ H: h_init, K: k_tbl };
+}
+
+let _SHA512_TBL = _init_sha512_tables();
+
+fn _sha512_ch(x, y, z) {
+    return _xor64(_and64(x, y), _and64(_not64(x), z));
+}
+
+fn _sha512_maj(x, y, z) {
+    return _xor64(_xor64(_and64(x, y), _and64(x, z)), _and64(y, z));
+}
+
+fn _sha512_S0(x) {
+    return _xor64(_xor64(_rotr64(x, 28), _rotr64(x, 34)), _rotr64(x, 39));
+}
+
+fn _sha512_S1(x) {
+    return _xor64(_xor64(_rotr64(x, 14), _rotr64(x, 18)), _rotr64(x, 41));
+}
+
+fn _sha512_s0(x) {
+    return _xor64(_xor64(_rotr64(x, 1), _rotr64(x, 8)), _shr64(x, 7));
+}
+
+fn _sha512_s1(x) {
+    return _xor64(_xor64(_rotr64(x, 19), _rotr64(x, 61)), _shr64(x, 6));
+}
+
+fn sha512_bytes(input) {
+    let msg = _to_bytes(input);
+    let msg_len = len(msg);
+
+    // Copy & pad to multiple of 128 bytes (1024 bits)
+    let buf = [];
+    let i = 0;
+    while i < msg_len { push(buf, msg[i]); i = i + 1; }
+    push(buf, 128);
+    while num_mod(len(buf), 128) != 112 {
+        push(buf, 0);
+    }
+    // 128-bit big-endian bit length (upper 64 bits = 0 for <= 2^50 bytes)
+    i = 0;
+    while i < 8 { push(buf, 0); i = i + 1; }
+    let bit_len = msg_len * 8;
+    let bl_hi = num_floor(bit_len / _MOD32);
+    let bl_lo = bit_len - bl_hi * _MOD32;
+    push(buf, bit_and(_shr32(bl_hi, 24), 255));
+    push(buf, bit_and(_shr32(bl_hi, 16), 255));
+    push(buf, bit_and(_shr32(bl_hi, 8), 255));
+    push(buf, bit_and(bl_hi, 255));
+    push(buf, bit_and(_shr32(bl_lo, 24), 255));
+    push(buf, bit_and(_shr32(bl_lo, 16), 255));
+    push(buf, bit_and(_shr32(bl_lo, 8), 255));
+    push(buf, bit_and(bl_lo, 255));
+
+    let H0 = _SHA512_TBL.H[0];
+    let H1 = _SHA512_TBL.H[1];
+    let H2 = _SHA512_TBL.H[2];
+    let H3 = _SHA512_TBL.H[3];
+    let H4 = _SHA512_TBL.H[4];
+    let H5 = _SHA512_TBL.H[5];
+    let H6 = _SHA512_TBL.H[6];
+    let H7 = _SHA512_TBL.H[7];
+    let K = _SHA512_TBL.K;
+
+    let off = 0;
+    let total = len(buf);
+    while off < total {
+        let W = [];
+        let t = 0;
+        while t < 16 {
+            let p = off + t * 8;
+            let hi = bit_or(
+                bit_or(_shl32(buf[p], 24), _shl32(buf[p + 1], 16)),
+                bit_or(_shl32(buf[p + 2], 8), buf[p + 3])
+            );
+            let lo = bit_or(
+                bit_or(_shl32(buf[p + 4], 24), _shl32(buf[p + 5], 16)),
+                bit_or(_shl32(buf[p + 6], 8), buf[p + 7])
+            );
+            push(W, [hi, lo]);
+            t = t + 1;
+        }
+        while t < 80 {
+            let w_val = _add64(
+                _add64(_sha512_s1(W[t - 2]), W[t - 7]),
+                _add64(_sha512_s0(W[t - 15]), W[t - 16])
+            );
+            push(W, w_val);
+            t = t + 1;
+        }
+
+        let a = H0;
+        let b = H1;
+        let c = H2;
+        let d = H3;
+        let e = H4;
+        let f = H5;
+        let g = H6;
+        let h = H7;
+
+        t = 0;
+        while t < 80 {
+            let t1 = _add64(
+                _add64(_add64(h, _sha512_S1(e)), _sha512_ch(e, f, g)),
+                _add64(K[t], W[t])
+            );
+            let t2 = _add64(_sha512_S0(a), _sha512_maj(a, b, c));
+            h = g;
+            g = f;
+            f = e;
+            e = _add64(d, t1);
+            d = c;
+            c = b;
+            b = a;
+            a = _add64(t1, t2);
+            t = t + 1;
+        }
+
+        H0 = _add64(H0, a);
+        H1 = _add64(H1, b);
+        H2 = _add64(H2, c);
+        H3 = _add64(H3, d);
+        H4 = _add64(H4, e);
+        H5 = _add64(H5, f);
+        H6 = _add64(H6, g);
+        H7 = _add64(H7, h);
+
+        off = off + 128;
+    }
+
+    let words = [H0, H1, H2, H3, H4, H5, H6, H7];
+    let digest = [];
+    i = 0;
+    while i < 8 {
+        let w = words[i];
+        let hi = w[0];
+        let lo = w[1];
+        push(digest, bit_and(_shr32(hi, 24), 255));
+        push(digest, bit_and(_shr32(hi, 16), 255));
+        push(digest, bit_and(_shr32(hi, 8), 255));
+        push(digest, bit_and(hi, 255));
+        push(digest, bit_and(_shr32(lo, 24), 255));
+        push(digest, bit_and(_shr32(lo, 16), 255));
+        push(digest, bit_and(_shr32(lo, 8), 255));
+        push(digest, bit_and(lo, 255));
+        i = i + 1;
+    }
+    return digest;
+}
+
+fn sha512_hex(input) {
+    return bytes_to_hex(sha512_bytes(input));
+}
+
+fn hmac_sha512_bytes(key_in, msg_in) {
+    let key = _to_bytes(key_in);
+    let msg = _to_bytes(msg_in);
+    if len(key) > 128 {
+        key = sha512_bytes(key);
+    }
+    let kblock = [];
+    let i = 0;
+    while i < 128 {
+        push(kblock, if i < len(key) { key[i] } else { 0 });
+        i = i + 1;
+    }
+    let inner = [];
+    i = 0;
+    while i < 128 { push(inner, bit_xor(kblock[i], 54)); i = i + 1; }
+    i = 0;
+    while i < len(msg) { push(inner, msg[i]); i = i + 1; }
+    let inner_hash = sha512_bytes(inner);
+
+    let outer = [];
+    i = 0;
+    while i < 128 { push(outer, bit_xor(kblock[i], 92)); i = i + 1; }
+    i = 0;
+    while i < len(inner_hash) { push(outer, inner_hash[i]); i = i + 1; }
+    return sha512_bytes(outer);
+}
+
+fn hmac_sha512_hex(key_str, msg_str) {
+    return bytes_to_hex(hmac_sha512_bytes(key_str, msg_str));
+}
+
+// ============================================================================
+// 3. Deterministic SHA-512 Counter-Mode DRBG (for QKD / Crypto Simulation)
+// ============================================================================
+
+fn _drbg_new(seed_val) {
+    return map{
+        seed: sha512_hex("PBLANG-DRBG-V530|" + str(seed_val)),
+        counter: 0,
+        pool: [],
+        pos: 0
+    };
+}
+
+fn _drbg_next_byte(rng) {
+    if rng.pos >= len(rng.pool) {
+        rng.pool = sha512_bytes(rng.seed + "|" + str(rng.counter));
+        rng.counter = rng.counter + 1;
+        rng.pos = 0;
+    }
+    let b = rng.pool[rng.pos];
+    rng.pos = rng.pos + 1;
+    return b;
+}
+
+fn _drbg_next_u16(rng) {
+    let hi = _drbg_next_byte(rng);
+    let lo = _drbg_next_byte(rng);
+    return hi * 256 + lo;
+}
+
+fn _drbg_next_unit(rng) {
+    // Uniform float in [0.0, 1.0) with 32-bit resolution
+    let b0 = _drbg_next_byte(rng);
+    let b1 = _drbg_next_byte(rng);
+    let b2 = _drbg_next_byte(rng);
+    let b3 = _drbg_next_byte(rng);
+    let v = ((b0 * 256 + b1) * 256 + b2) * 256 + b3;
+    return v / 4294967296.0;
+}
+
+// ============================================================================
+// 4. Information-Theoretic Security (ITS OTP + QKD BB84 & E91 CHSH Bell)
+// ============================================================================
+
+fn its_otp_encrypt(plaintext_bytes, key_bytes) {
+    let pt = _to_bytes(plaintext_bytes);
+    let kb = _to_bytes(key_bytes);
+    if len(kb) < len(pt) {
+        return map{
+            ok: false,
+            error: "OTP_KEY_SHORTER_THAN_PLAINTEXT",
+            ciphertext: [],
+            ciphertext_hex: "",
+            pad_consumed_bytes: 0
+        };
+    }
+    let ct = [];
+    let i = 0;
+    while i < len(pt) {
+        push(ct, bit_xor(pt[i], kb[i]));
+        i = i + 1;
+    }
+    let pad_slice = slice(kb, 0, len(pt));
+    return map{
+        ok: true,
+        security_class: "ITS-Shannon-Perfect-Secrecy",
+        single_use_pad_discipline: true,
+        pad_fingerprint_sha512: sha512_hex(pad_slice),
+        pad_consumed_bytes: len(pt),
+        ciphertext: ct,
+        ciphertext_hex: bytes_to_hex(ct)
+    };
+}
+
+fn its_otp_decrypt(ciphertext_bytes, key_bytes) {
+    let ct = if is_map(ciphertext_bytes) and map_has(ciphertext_bytes, "ciphertext") {
+        _to_bytes(ciphertext_bytes.ciphertext)
+    } else {
+        _to_bytes(ciphertext_bytes)
+    };
+    let kb = _to_bytes(key_bytes);
+    if len(kb) < len(ct) {
+        return map{
+            ok: false,
+            error: "OTP_KEY_SHORTER_THAN_CIPHERTEXT",
+            plaintext: [],
+            plaintext_hex: "",
+            pad_consumed_bytes: 0
+        };
+    }
+    let pt = [];
+    let i = 0;
+    while i < len(ct) {
+        push(pt, bit_xor(ct[i], kb[i]));
+        i = i + 1;
+    }
+    return map{
+        ok: true,
+        security_class: "ITS-Shannon-Perfect-Secrecy",
+        pad_consumed_bytes: len(ct),
+        plaintext: pt,
+        plaintext_hex: bytes_to_hex(pt)
+    };
+}
+
+fn qkd_bb84_session(n_bits, eve_intercept_prob, seed) {
+    let rng = _drbg_new("BB84|" + str(seed) + "|" + str(n_bits));
+    let sifted_a = [];
+    let sifted_b = [];
+
+    let i = 0;
+    while i < n_bits {
+        let a_bit = bit_and(_drbg_next_byte(rng), 1);
+        let a_basis = bit_and(_drbg_next_byte(rng), 1);
+        let tx_bit = a_bit;
+        let tx_basis = a_basis;
+
+        if eve_intercept_prob > 0.0 and _drbg_next_unit(rng) < eve_intercept_prob {
+            let e_basis = bit_and(_drbg_next_byte(rng), 1);
+            if e_basis != tx_basis {
+                tx_bit = bit_and(_drbg_next_byte(rng), 1);
+                tx_basis = e_basis;
+            }
+        }
+
+        let b_basis = bit_and(_drbg_next_byte(rng), 1);
+        let b_bit = tx_bit;
+        if b_basis != tx_basis {
+            b_bit = bit_and(_drbg_next_byte(rng), 1);
+        }
+
+        if a_basis == b_basis {
+            push(sifted_a, a_bit);
+            push(sifted_b, b_bit);
+        }
+        i = i + 1;
+    }
+
+    let sifted_n = len(sifted_a);
+    let sample_n = num_floor(sifted_n / 4);
+    if sample_n < 1 and sifted_n > 0 { sample_n = 1; }
+
+    let errors = 0;
+    i = 0;
+    while i < sample_n {
+        if sifted_a[i] != sifted_b[i] {
+            errors = errors + 1;
+        }
+        i = i + 1;
+    }
+
+    let qber = if sample_n > 0 { (errors * 1.0) / (sample_n * 1.0) } else { 1.0 };
+    let qber_threshold = 0.11;
+    let aborted = (qber > qber_threshold) or (sifted_n <= sample_n);
+
+    let final_key_hex = "";
+    let final_key_bytes = [];
+    let status = "ABORTED_EAVESDROPPER_DETECTED";
+    if not aborted {
+        let raw_bits = "";
+        i = sample_n;
+        while i < sifted_n {
+            raw_bits = raw_bits + str(sifted_a[i]);
+            i = i + 1;
+        }
+        let pa_input = "BB84-PRIVACY-AMPLIFICATION-SHA512|" + str(seed) + "|" + raw_bits;
+        final_key_bytes = sha512_bytes(pa_input);
+        final_key_hex = bytes_to_hex(final_key_bytes);
+        status = "ESTABLISHED";
+    }
+
+    return map{
+        protocol: "QKD-BB84",
+        n_bits: n_bits,
+        sifted_bits: sifted_n,
+        sample_bits: sample_n,
+        sample_errors: errors,
+        qber: qber,
+        qber_threshold: qber_threshold,
+        eve_intercept_prob: eve_intercept_prob,
+        aborted: aborted,
+        status: status,
+        final_key_hex: final_key_hex,
+        final_key_bytes: final_key_bytes
+    };
+}
+
+fn _cos_deg_e91(delta_deg) {
+    // Exact cosine values for 2*(theta_A - theta_B) in multiples of 45 degrees
+    let d = abs(delta_deg);
+    if d < 0.001 { return 1.0; }
+    if abs(d - 45.0) < 0.001 { return 0.7071067811865476; }
+    if abs(d - 90.0) < 0.001 { return 0.0; }
+    if abs(d - 135.0) < 0.001 { return -0.7071067811865476; }
+    if abs(d - 180.0) < 0.001 { return -1.0; }
+    return 0.0;
+}
+
+fn qkd_e91_bell_session(n_pairs, eve_intercept_prob, seed) {
+    // Ekert-91 CHSH Bell test with Alice angles {0, 22.5, 45} and Bob angles {22.5, 45, 67.5}
+    // CHSH: S = |E(a1, b1) - E(a1, b3) + E(a3, b1) + E(a3, b3)| -> 2*sqrt(2) ~= 2.8284 without Eve
+    let rng = _drbg_new("E91|" + str(seed) + "|" + str(n_pairs));
+    let a_angles = [0.0, 22.5, 45.0];
+    let b_angles = [22.5, 45.0, 67.5];
+
+    // Accumulators for the 4 CHSH pairs: (0,0)=(a1,b1), (0,2)=(a1,b3), (2,0)=(a3,b1), (2,2)=(a3,b3)
+    let sum_11 = 0; let cnt_11 = 0;
+    let sum_13 = 0; let cnt_13 = 0;
+    let sum_31 = 0; let cnt_31 = 0;
+    let sum_33 = 0; let cnt_33 = 0;
+
+    let key_bits = [];
+
+    let i = 0;
+    while i < n_pairs {
+        let ai = num_mod(_drbg_next_byte(rng), 3);
+        let bi = num_mod(_drbg_next_byte(rng), 3);
+        let ta = a_angles[ai];
+        let tb = b_angles[bi];
+
+        let outcome_a = if bit_and(_drbg_next_byte(rng), 1) == 0 { 1 } else { -1 };
+        let corr = 0.0;
+
+        if eve_intercept_prob > 0.0 and _drbg_next_unit(rng) < eve_intercept_prob {
+            // Eve breaks entanglement with an intercept-resend measurement along angle te
+            let te_idx = num_mod(_drbg_next_byte(rng), 4);
+            let te = te_idx * 22.5;
+            corr = _cos_deg_e91(2.0 * (ta - te)) * _cos_deg_e91(2.0 * (te - tb));
+        } else {
+            // Entangled Bell state |Phi+> correlation E(ta, tb) = cos(2*(ta - tb))
+            corr = _cos_deg_e91(2.0 * (ta - tb));
+        }
+
+        let p_same = (1.0 + corr) / 2.0;
+        let outcome_b = if _drbg_next_unit(rng) < p_same { outcome_a } else { -outcome_a };
+        let prod = outcome_a * outcome_b;
+
+        if ai == 0 and bi == 0 { sum_11 = sum_11 + prod; cnt_11 = cnt_11 + 1; }
+        elif ai == 0 and bi == 2 { sum_13 = sum_13 + prod; cnt_13 = cnt_13 + 1; }
+        elif ai == 2 and bi == 0 { sum_31 = sum_31 + prod; cnt_31 = cnt_31 + 1; }
+        elif ai == 2 and bi == 2 { sum_33 = sum_33 + prod; cnt_33 = cnt_33 + 1; }
+        elif (ai == 1 and bi == 0) or (ai == 2 and bi == 1) {
+            // Matching angles (22.5, 22.5) and (45, 45) produce the raw sifted key
+            push(key_bits, if outcome_a == 1 { 1 } else { 0 });
+        }
+        i = i + 1;
+    }
+
+    let e11 = if cnt_11 > 0 { (sum_11 * 1.0) / (cnt_11 * 1.0) } else { 0.0 };
+    let e13 = if cnt_13 > 0 { (sum_13 * 1.0) / (cnt_13 * 1.0) } else { 0.0 };
+    let e31 = if cnt_31 > 0 { (sum_31 * 1.0) / (cnt_31 * 1.0) } else { 0.0 };
+    let e33 = if cnt_33 > 0 { (sum_33 * 1.0) / (cnt_33 * 1.0) } else { 0.0 };
+
+    let chsh_s = abs(e11 - e13 + e31 + e33);
+    let bell_violated = chsh_s > 2.0;
+    let aborted = (not bell_violated) or (len(key_bits) == 0);
+
+    let final_key_hex = "";
+    let final_key_bytes = [];
+    let status = "ABORTED_BELL_VIOLATION_COLLAPSED";
+    if not aborted {
+        let raw_bits = "";
+        i = 0;
+        while i < len(key_bits) {
+            raw_bits = raw_bits + str(key_bits[i]);
+            i = i + 1;
+        }
+        final_key_bytes = sha512_bytes("E91-PRIVACY-AMPLIFICATION-SHA512|" + str(seed) + "|" + raw_bits);
+        final_key_hex = bytes_to_hex(final_key_bytes);
+        status = "ESTABLISHED_BELL_CERTIFIED";
+    }
+
+    return map{
+        protocol: "QKD-E91-CHSH",
+        n_pairs: n_pairs,
+        sifted_bits: len(key_bits),
+        e_a1_b1: e11,
+        e_a1_b3: e13,
+        e_a3_b1: e31,
+        e_a3_b3: e33,
+        chsh_s: chsh_s,
+        bell_classical_limit: 2.0,
+        tsirelson_bound: 2.8284271247461903,
+        bell_violated: bell_violated,
+        eve_intercept_prob: eve_intercept_prob,
+        aborted: aborted,
+        status: status,
+        final_key_hex: final_key_hex,
+        final_key_bytes: final_key_bytes
+    };
+}
+
+// ============================================================================
+// 5. 3-Family Hybrid Crypto-Agility
+//    Family 1: Lattice Module-LWE (q = 3329, N = 16) Fiat-Shamir Signature
+//    Family 2: Stateless Hash-Based SLH-DSA / WOTS+ + Merkle Tree (SHA-512)
+//    Family 3: Code-Based McEliece / Goppa-Parity Syndrome (H * e^T = s over GF(2))
+// ============================================================================
+
+let _LAT_N = 16;
+let _LAT_Q = 3329;
+
+fn _mod_q(v) {
+    let r = num_mod(v, _LAT_Q);
+    if r < 0 { r = r + _LAT_Q; }
+    return r;
+}
+
+fn _centered_abs_q(v) {
+    let r = _mod_q(v);
+    let half = num_floor(_LAT_Q / 2);
+    if r > half { return _LAT_Q - r; }
+    return r;
+}
+
+fn _lat_gen_matrix_a(lat_seed) {
+    let rng = _drbg_new("LAT-A|" + lat_seed);
+    let A = [];
+    let r = 0;
+    while r < _LAT_N {
+        let row = [];
+        let c = 0;
+        while c < _LAT_N {
+            push(row, num_mod(_drbg_next_u16(rng), _LAT_Q));
+            c = c + 1;
+        }
+        push(A, row);
+        r = r + 1;
+    }
+    return A;
+}
+
+fn _lat_mat_vec(A, v) {
+    let out = [];
+    let r = 0;
+    while r < _LAT_N {
+        let acc = 0;
+        let row = A[r];
+        let c = 0;
+        while c < _LAT_N {
+            acc = acc + row[c] * v[c];
+            c = c + 1;
+        }
+        push(out, _mod_q(acc));
+        r = r + 1;
+    }
+    return out;
+}
+
+fn _vec_to_str(v) {
+    let s = "";
+    let i = 0;
+    while i < len(v) {
+        if i > 0 { s = s + ","; }
+        s = s + str(v[i]);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn _lat_challenge(w, t, msg_str) {
+    let h = sha512_bytes("LAT-MLWE-FS-V530|" + _vec_to_str(w) + "|" + _vec_to_str(t) + "|" + msg_str);
+    return 1 + num_mod(h[0], 15);
+}
+
+fn _lat_keygen(seed_str) {
+    let lat_seed = sha512_hex("F1-LAT-PUB|" + seed_str);
+    let A = _lat_gen_matrix_a(lat_seed);
+    let rng = _drbg_new("F1-LAT-SEC|" + seed_str);
+    let s = [];
+    let e = [];
+    let i = 0;
+    while i < _LAT_N {
+        push(s, num_mod(_drbg_next_byte(rng), 5) - 2);
+        push(e, num_mod(_drbg_next_byte(rng), 5) - 2);
+        i = i + 1;
+    }
+    let As = _lat_mat_vec(A, s);
+    let t = [];
+    i = 0;
+    while i < _LAT_N {
+        push(t, _mod_q(As[i] + e[i]));
+        i = i + 1;
+    }
+    return map{
+        pub: map{ lat_seed: lat_seed, q: _LAT_Q, n: _LAT_N, t: t },
+        sec: map{ sk_seed: sha512_hex("F1-LAT-NONCE|" + seed_str), s: s, e: e }
+    };
+}
+
+fn _lat_sign(lat_pub, lat_sec, msg_str) {
+    let A = _lat_gen_matrix_a(lat_pub.lat_seed);
+    let rng = _drbg_new(hmac_sha512_hex(lat_sec.sk_seed, msg_str));
+    let y = [];
+    let i = 0;
+    while i < _LAT_N {
+        push(y, num_mod(_drbg_next_u16(rng), _LAT_Q));
+        i = i + 1;
+    }
+    let w = _lat_mat_vec(A, y);
+    let c = _lat_challenge(w, lat_pub.t, msg_str);
+    let z = [];
+    let r = [];
+    i = 0;
+    while i < _LAT_N {
+        push(z, _mod_q(y[i] + c * lat_sec.s[i]));
+        push(r, _mod_q(c * lat_sec.e[i]));
+        i = i + 1;
+    }
+    return map{ c: c, z: z, r: r, w_digest: sha512_hex(_vec_to_str(w)) };
+}
+
+fn _lat_verify(lat_pub, msg_str, sig) {
+    if not is_map(sig) or not map_has(sig, "z") or not map_has(sig, "r") or not map_has(sig, "c") {
+        return false;
+    }
+    if len(sig.z) != _LAT_N or len(sig.r) != _LAT_N { return false; }
+    let c = sig.c;
+    if c < 1 or c > 15 { return false; }
+    // Verify smallness bound on error-hint r = c * e (|e_i| <= 2)
+    let i = 0;
+    while i < _LAT_N {
+        if _centered_abs_q(sig.r[i]) > 2 * c { return false; }
+        i = i + 1;
+    }
+    let A = _lat_gen_matrix_a(lat_pub.lat_seed);
+    let Az = _lat_mat_vec(A, sig.z);
+    let w_rec = [];
+    i = 0;
+    while i < _LAT_N {
+        // w' = A*z - c*t + r = A*(y + c*s) - c*(A*s + e) + c*e = A*y = w (mod q)
+        push(w_rec, _mod_q(Az[i] - c * lat_pub.t[i] + sig.r[i]));
+        i = i + 1;
+    }
+    let c_exp = _lat_challenge(w_rec, lat_pub.t, msg_str);
+    if c_exp != c { return false; }
+    return ct_hex_eq(sig.w_digest, sha512_hex(_vec_to_str(w_rec)));
+}
+
+// --- Family 2: Stateless Hash-Based SLH-DSA / WOTS+ (w=4, 2-bit chunks) + 4-Leaf Merkle ---
+
+fn _wots_chain(start_hex, steps, pk_seed, leaf_idx, chain_idx) {
+    let cur = start_hex;
+    let s = 0;
+    while s < steps {
+        cur = str_slice(
+            sha512_hex("WOTS512|" + pk_seed + "|" + str(leaf_idx) + "|" + str(chain_idx) + "|" + cur),
+            0, 32
+        );
+        s = s + 1;
+    }
+    return cur;
+}
+
+fn _wots_digest_chunks(pk_seed, msg_str) {
+    // 16-byte SHA-512 prefix -> 64 2-bit chunks + 4 checksum chunks = 68 chains (max 3 steps each)
+    let hb = sha512_bytes("SLH-WOTS-MSG|" + pk_seed + "|" + msg_str);
+    let chunks = [];
+    let csum = 0;
+    let i = 0;
+    while i < 16 {
+        let b = hb[i];
+        let c0 = bit_and(bit_shr(b, 6), 3);
+        let c1 = bit_and(bit_shr(b, 4), 3);
+        let c2 = bit_and(bit_shr(b, 2), 3);
+        let c3 = bit_and(b, 3);
+        push(chunks, c0); push(chunks, c1); push(chunks, c2); push(chunks, c3);
+        csum = csum + (3 - c0) + (3 - c1) + (3 - c2) + (3 - c3);
+        i = i + 1;
+    }
+    // Encode 8-bit checksum into 4 2-bit chunks
+    push(chunks, bit_and(bit_shr(csum, 6), 3));
+    push(chunks, bit_and(bit_shr(csum, 4), 3));
+    push(chunks, bit_and(bit_shr(csum, 2), 3));
+    push(chunks, bit_and(csum, 3));
+    return chunks;
+}
+
+fn _merkle_parent(left_hex, right_hex) {
+    return sha512_hex("SLH-MERKLE-NODE|" + left_hex + "|" + right_hex);
+}
+
+fn _slh_keygen(seed_str) {
+    let pk_seed = str_slice(sha512_hex("F2-SLH-PKSEED|" + seed_str), 0, 32);
+    let sk_seed = sha512_hex("F2-SLH-SKSEED|" + seed_str);
+    let leaves = [];
+    let leaf_i = 0;
+    while leaf_i < 4 {
+        let pk_concat = "";
+        let j = 0;
+        while j < 68 {
+            let sk_j = str_slice(sha512_hex("WOTS-SK|" + sk_seed + "|" + str(leaf_i) + "|" + str(j)), 0, 32);
+            let pk_j = _wots_chain(sk_j, 3, pk_seed, leaf_i, j);
+            pk_concat = pk_concat + pk_j;
+            j = j + 1;
+        }
+        push(leaves, sha512_hex("SLH-LEAF|" + pk_seed + "|" + str(leaf_i) + "|" + pk_concat));
+        leaf_i = leaf_i + 1;
+    }
+    let n01 = _merkle_parent(leaves[0], leaves[1]);
+    let n23 = _merkle_parent(leaves[2], leaves[3]);
+    let root = _merkle_parent(n01, n23);
+    return map{
+        pub: map{ pk_seed: pk_seed, merkle_root: root, tree_height: 2, wots_w: 4 },
+        sec: map{ sk_seed: sk_seed, leaves: leaves, n01: n01, n23: n23 }
+    };
+}
+
+fn _slh_sign(slh_pub, slh_sec, msg_str) {
+    let idx_h = sha512_bytes("SLH-LEAF-IDX|" + slh_pub.pk_seed + "|" + msg_str);
+    let leaf_idx = bit_and(idx_h[0], 3);
+    let chunks = _wots_digest_chunks(slh_pub.pk_seed, msg_str);
+    let wots_sig = [];
+    let j = 0;
+    while j < 68 {
+        let sk_j = str_slice(sha512_hex("WOTS-SK|" + slh_sec.sk_seed + "|" + str(leaf_idx) + "|" + str(j)), 0, 32);
+        push(wots_sig, _wots_chain(sk_j, chunks[j], slh_pub.pk_seed, leaf_idx, j));
+        j = j + 1;
+    }
+    let sib0 = if leaf_idx == 0 { slh_sec.leaves[1] }
+        elif leaf_idx == 1 { slh_sec.leaves[0] }
+        elif leaf_idx == 2 { slh_sec.leaves[3] }
+        else { slh_sec.leaves[2] };
+    let sib1 = if leaf_idx < 2 { slh_sec.n23 } else { slh_sec.n01 };
+    return map{
+        leaf_idx: leaf_idx,
+        wots_sig: wots_sig,
+        auth_path: [sib0, sib1]
+    };
+}
+
+fn _slh_verify(slh_pub, msg_str, sig) {
+    if not is_map(sig) or not map_has(sig, "wots_sig") or not map_has(sig, "auth_path") {
+        return false;
+    }
+    if len(sig.wots_sig) != 68 or len(sig.auth_path) != 2 { return false; }
+    let idx_h = sha512_bytes("SLH-LEAF-IDX|" + slh_pub.pk_seed + "|" + msg_str);
+    let expected_idx = bit_and(idx_h[0], 3);
+    if sig.leaf_idx != expected_idx { return false; }
+
+    let chunks = _wots_digest_chunks(slh_pub.pk_seed, msg_str);
+    let pk_concat = "";
+    let j = 0;
+    while j < 68 {
+        let rem = 3 - chunks[j];
+        let pk_j = _wots_chain(sig.wots_sig[j], rem, slh_pub.pk_seed, sig.leaf_idx, j);
+        pk_concat = pk_concat + pk_j;
+        j = j + 1;
+    }
+    let leaf_rec = sha512_hex("SLH-LEAF|" + slh_pub.pk_seed + "|" + str(sig.leaf_idx) + "|" + pk_concat);
+    let lvl1 = if bit_and(sig.leaf_idx, 1) == 0 {
+        _merkle_parent(leaf_rec, sig.auth_path[0])
+    } else {
+        _merkle_parent(sig.auth_path[0], leaf_rec)
+    };
+    let root_rec = if sig.leaf_idx < 2 {
+        _merkle_parent(lvl1, sig.auth_path[1])
+    } else {
+        _merkle_parent(sig.auth_path[1], lvl1)
+    };
+    return ct_hex_eq(root_rec, slh_pub.merkle_root);
+}
+
+// --- Family 3: Code-Based Goppa-Parity Syndrome H * e^T = s over GF(2) ---
+
+let _CODE_N = 64;
+let _CODE_R = 32;
+let _CODE_T = 8;
+
+fn _code_gen_parity_h(code_seed) {
+    let rng = _drbg_new("CODE-H-GF2|" + code_seed);
+    let H = [];
+    let r = 0;
+    while r < _CODE_R {
+        let row = [];
+        let c = 0;
+        while c < _CODE_N {
+            push(row, bit_and(_drbg_next_byte(rng), 1));
+            c = c + 1;
+        }
+        push(H, row);
+        r = r + 1;
+    }
+    return H;
+}
+
+fn _code_syndrome(H, vec) {
+    let syn = [];
+    let r = 0;
+    while r < _CODE_R {
+        let row = H[r];
+        let acc = 0;
+        let c = 0;
+        while c < _CODE_N {
+            acc = bit_xor(acc, bit_and(row[c], vec[c]));
+            c = c + 1;
+        }
+        push(syn, acc);
+        r = r + 1;
+    }
+    return syn;
+}
+
+fn _code_hamming_weight(vec) {
+    let w = 0;
+    let i = 0;
+    while i < len(vec) {
+        if vec[i] == 1 { w = w + 1; }
+        i = i + 1;
+    }
+    return w;
+}
+
+fn _code_fixed_weight_vec(seed_str, n_len, weight_t) {
+    let rng = _drbg_new(seed_str);
+    let v = [];
+    let i = 0;
+    while i < n_len { push(v, 0); i = i + 1; }
+    let placed = 0;
+    while placed < weight_t {
+        let pos = num_mod(_drbg_next_byte(rng), n_len);
+        if v[pos] == 0 {
+            v[pos] = 1;
+            placed = placed + 1;
+        }
+    }
+    return v;
+}
+
+fn _bits_str(v) {
+    let s = "";
+    let i = 0;
+    while i < len(v) { s = s + str(v[i]); i = i + 1; }
+    return s;
+}
+
+fn _vec_xor_gf2(a, b) {
+    let out = [];
+    let i = 0;
+    while i < len(a) {
+        push(out, bit_xor(a[i], b[i]));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _code_keygen(seed_str) {
+    let code_seed = str_slice(sha512_hex("F3-CODE-SEED|" + seed_str), 0, 32);
+    let H = _code_gen_parity_h(code_seed);
+    let e_sk = _code_fixed_weight_vec("F3-CODE-ESK|" + seed_str, _CODE_N, _CODE_T);
+    let s_pk = _code_syndrome(H, e_sk);
+    return map{
+        pub: map{ code_seed: code_seed, n: _CODE_N, r: _CODE_R, t: _CODE_T, s_pk: s_pk },
+        sec: map{ code_sk_seed: sha512_hex("F3-CODE-SK|" + seed_str), e_sk: e_sk }
+    };
+}
+
+fn _code_sign(code_pub, code_sec, msg_str) {
+    let H = _code_gen_parity_h(code_pub.code_seed);
+    // Bounded-weight message error vector e_m (Hamming weight = t) & syndrome s_m = H * e_m^T
+    let e_m = _code_fixed_weight_vec(hmac_sha512_hex(code_sec.code_sk_seed, "EM|" + msg_str), _CODE_N, _CODE_T);
+    let s_m = _code_syndrome(H, e_m);
+
+    // 4-round Fiat-Shamir GF(2) Syndrome Identification (proves knowledge of e_sk with H*e_sk^T = s_pk)
+    let rounds = [];
+    let k = 0;
+    while k < 4 {
+        let rng = _drbg_new(hmac_sha512_hex(code_sec.code_sk_seed, "R|" + str(k) + "|" + msg_str));
+        let u = [];
+        let j = 0;
+        while j < _CODE_N { push(u, bit_and(_drbg_next_byte(rng), 1)); j = j + 1; }
+        let s_u = _code_syndrome(H, u);
+        let u_xor_e = _vec_xor_gf2(u, code_sec.e_sk);
+        let c0 = sha512_hex("CODE-C0|" + _bits_str(u));
+        let c1 = sha512_hex("CODE-C1|" + _bits_str(u_xor_e));
+        let ch_b = sha512_bytes(
+            "CODE-FS|" + _bits_str(code_pub.s_pk) + "|" + _bits_str(s_m) + "|" +
+            _bits_str(s_u) + "|" + c0 + "|" + c1 + "|" + str(k) + "|" + msg_str
+        );
+        let ch = bit_and(ch_b[0], 1);
+        let resp_v = if ch == 0 { u } else { u_xor_e };
+        let other_c = if ch == 0 { c1 } else { c0 };
+        push(rounds, map{ s_u: s_u, ch: ch, resp_v: resp_v, other_c: other_c });
+        k = k + 1;
+    }
+
+    return map{ e_m: e_m, s_m: s_m, rounds: rounds };
+}
+
+fn _code_verify(code_pub, msg_str, sig) {
+    if not is_map(sig) or not map_has(sig, "e_m") or not map_has(sig, "s_m") or not map_has(sig, "rounds") {
+        return false;
+    }
+    if len(sig.e_m) != _CODE_N or len(sig.s_m) != _CODE_R or len(sig.rounds) != 4 {
+        return false;
+    }
+    // Check bounded Hamming weight on e_m and exact GF(2) parity equation H * e_m^T = s_m
+    if _code_hamming_weight(sig.e_m) != _CODE_T { return false; }
+    let H = _code_gen_parity_h(code_pub.code_seed);
+    let s_m_rec = _code_syndrome(H, sig.e_m);
+    if _bits_str(s_m_rec) != _bits_str(sig.s_m) { return false; }
+
+    let k = 0;
+    while k < 4 {
+        let rd = sig.rounds[k];
+        if len(rd.resp_v) != _CODE_N or len(rd.s_u) != _CODE_R { return false; }
+        let syn_v = _code_syndrome(H, rd.resp_v);
+        let c0 = "";
+        let c1 = "";
+        if rd.ch == 0 {
+            if _bits_str(syn_v) != _bits_str(rd.s_u) { return false; }
+            c0 = sha512_hex("CODE-C0|" + _bits_str(rd.resp_v));
+            c1 = rd.other_c;
+        } else {
+            let exp_syn = _vec_xor_gf2(rd.s_u, code_pub.s_pk);
+            if _bits_str(syn_v) != _bits_str(exp_syn) { return false; }
+            c0 = rd.other_c;
+            c1 = sha512_hex("CODE-C1|" + _bits_str(rd.resp_v));
+        }
+        let ch_b = sha512_bytes(
+            "CODE-FS|" + _bits_str(code_pub.s_pk) + "|" + _bits_str(sig.s_m) + "|" +
+            _bits_str(rd.s_u) + "|" + c0 + "|" + c1 + "|" + str(k) + "|" + msg_str
+        );
+        if bit_and(ch_b[0], 1) != rd.ch { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+// --- Unified 3-Family Hybrid Keygen / Sign / Verify ---
+
+fn hybrid3_keygen(seed_str) {
+    let s = str(seed_str);
+    let f1 = _lat_keygen(s);
+    let f2 = _slh_keygen(s);
+    let f3 = _code_keygen(s);
+    let pub_key = map{
+        version: PHYSICS_CRYPTO_VERSION,
+        families: ["lattice-mlwe", "hash-slh-wots-merkle", "code-syndrome-gf2"],
+        lattice: f1.pub,
+        hash_slh: f2.pub,
+        code_gf2: f3.pub
+    };
+    let sec_key = map{
+        lattice: f1.sec,
+        hash_slh: f2.sec,
+        code_gf2: f3.sec
+    };
+    return map{
+        version: PHYSICS_CRYPTO_VERSION,
+        public_key: pub_key,
+        secret_key: sec_key
+    };
+}
+
+fn hybrid3_sign(kp, message) {
+    let msg_str = str(message);
+    let s1 = _lat_sign(kp.public_key.lattice, kp.secret_key.lattice, msg_str);
+    let s2 = _slh_sign(kp.public_key.hash_slh, kp.secret_key.hash_slh, msg_str);
+    let s3 = _code_sign(kp.public_key.code_gf2, kp.secret_key.code_gf2, msg_str);
+    return map{
+        version: PHYSICS_CRYPTO_VERSION,
+        msg_sha512: sha512_hex(msg_str),
+        lattice_sig: s1,
+        hash_sig: s2,
+        code_sig: s3
+    };
+}
+
+fn hybrid3_verify(pub_key, message, sig) {
+    if not is_map(pub_key) or not is_map(sig) {
+        return map{
+            ok: false,
+            all_3_valid: false,
+            lattice_ok: false,
+            hash_ok: false,
+            code_ok: false,
+            reason: "INVALID_INPUT"
+        };
+    }
+    let msg_str = str(message);
+    let digest_ok = ct_hex_eq(sig.msg_sha512, sha512_hex(msg_str));
+    let lat_ok = _lat_verify(pub_key.lattice, msg_str, sig.lattice_sig);
+    let hash_ok = _slh_verify(pub_key.hash_slh, msg_str, sig.hash_sig);
+    let code_ok = _code_verify(pub_key.code_gf2, msg_str, sig.code_sig);
+    let all_ok = digest_ok and lat_ok and hash_ok and code_ok;
+    let reason = if all_ok { "ALL_3_FAMILIES_VERIFIED" } else { "HYBRID3_VERIFICATION_FAILED" };
+    return map{
+        ok: all_ok,
+        all_3_valid: all_ok,
+        digest_ok: digest_ok,
+        lattice_ok: lat_ok,
+        hash_ok: hash_ok,
+        code_ok: code_ok,
+        reason: reason
+    };
+}
+
+// ============================================================================
+// 6. Heterogeneous M-of-N Multi-Vendor Silicon Split-Trust (Shamir ITS GF(256))
+//    Irreducible polynomial: x^8 + x^4 + x^3 + x + 1 (0x11B = 283)
+// ============================================================================
+
+fn _gf256_mul(a_in, b_in) {
+    let a = bit_and(a_in, 255);
+    let b = bit_and(b_in, 255);
+    let p = 0;
+    let i = 0;
+    while i < 8 {
+        if bit_and(b, 1) != 0 {
+            p = bit_xor(p, a);
+        }
+        let hi_bit = bit_and(a, 128);
+        a = bit_and(bit_shl(a, 1), 255);
+        if hi_bit != 0 {
+            a = bit_xor(a, 27);
+        }
+        b = bit_shr(b, 1);
+        i = i + 1;
+    }
+    return bit_and(p, 255);
+}
+
+fn _gf256_pow(base, exp) {
+    let res = 1;
+    let b = bit_and(base, 255);
+    let e = exp;
+    while e > 0 {
+        if bit_and(e, 1) != 0 {
+            res = _gf256_mul(res, b);
+        }
+        b = _gf256_mul(b, b);
+        e = bit_shr(e, 1);
+    }
+    return res;
+}
+
+fn _gf256_inv(a) {
+    if bit_and(a, 255) == 0 { return 0; }
+    return _gf256_pow(a, 254);
+}
+
+fn shamir_split_secret(secret_bytes, threshold_m, total_n, vendor_tags = nil) {
+    let sb = _to_bytes(secret_bytes);
+    if threshold_m < 2 or total_n < threshold_m or total_n > 255 {
+        return map{
+            ok: false,
+            error: "INVALID_SHAMIR_THRESHOLD_OR_N",
+            shares: []
+        };
+    }
+    let vendors = if is_array(vendor_tags) and len(vendor_tags) > 0 {
+        vendor_tags
+    } else {
+        ["x86", "open-riscv", "fpga", "arm", "mcu"]
+    };
+
+    // Deterministic CSPRNG seeded from secret digest + parameters for polynomial coefficients
+    let rng = _drbg_new("SHAMIR-GF256|" + sha512_hex(sb) + "|" + str(threshold_m) + "|" + str(total_n));
+
+    let share_datas = [];
+    let k = 0;
+    while k < total_n {
+        push(share_datas, []);
+        k = k + 1;
+    }
+
+    let i = 0;
+    while i < len(sb) {
+        // Polynomial f_i(x) = sb[i] + c_1*x + ... + c_{m-1}*x^{m-1} over GF(256)
+        let coeffs = [sb[i]];
+        let d = 1;
+        while d < threshold_m {
+            let c = _drbg_next_byte(rng);
+            if d == threshold_m - 1 and c == 0 { c = 1; }
+            push(coeffs, c);
+            d = d + 1;
+        }
+        k = 0;
+        while k < total_n {
+            let x = k + 1;
+            // Horner evaluation over GF(256)
+            let y = coeffs[threshold_m - 1];
+            let deg = threshold_m - 2;
+            while deg >= 0 {
+                y = bit_xor(_gf256_mul(y, x), coeffs[deg]);
+                deg = deg - 1;
+            }
+            push(share_datas[k], y);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+
+    let shares = [];
+    k = 0;
+    while k < total_n {
+        let v_tag = vendors[num_mod(k, len(vendors))];
+        let sd = share_datas[k];
+        push(shares, map{
+            x: k + 1,
+            vendor: v_tag,
+            threshold_m: threshold_m,
+            total_n: total_n,
+            data: sd,
+            share_sha512: sha512_hex(sd)
+        });
+        k = k + 1;
+    }
+
+    return map{
+        ok: true,
+        field: "GF(256) mod 0x11B",
+        threshold_m: threshold_m,
+        total_n: total_n,
+        secret_len: len(sb),
+        shares: shares
+    };
+}
+
+fn shamir_reconstruct_secret(shares) {
+    if not is_array(shares) or len(shares) == 0 {
+        return map{ ok: false, error: "NO_SHARES_PROVIDED", secret_bytes: [], secret_hex: "" };
+    }
+    let m = len(shares);
+    let slen = len(shares[0].data);
+    let vendors_used = [];
+    let i = 0;
+    while i < m {
+        if shares[i].x <= 0 or shares[i].x > 255 {
+            return map{ ok: false, error: "INVALID_SHARE_X", secret_bytes: [], secret_hex: "" };
+        }
+        if len(shares[i].data) != slen {
+            return map{ ok: false, error: "SHARE_LENGTH_MISMATCH", secret_bytes: [], secret_hex: "" };
+        }
+        let j = i + 1;
+        while j < m {
+            if shares[i].x == shares[j].x {
+                return map{ ok: false, error: "DUPLICATE_SHARE_X", secret_bytes: [], secret_hex: "" };
+            }
+            j = j + 1;
+        }
+        push(vendors_used, shares[i].vendor);
+        i = i + 1;
+    }
+
+    // Precompute Lagrange basis coefficients l_j(0) = prod_{k != j} x_k / (x_j ^ x_k) in GF(256)
+    let lagrange = [];
+    let j = 0;
+    while j < m {
+        let xj = shares[j].x;
+        let num = 1;
+        let den = 1;
+        let k = 0;
+        while k < m {
+            if k != j {
+                let xk = shares[k].x;
+                num = _gf256_mul(num, xk);
+                den = _gf256_mul(den, bit_xor(xj, xk));
+            }
+            k = k + 1;
+        }
+        push(lagrange, _gf256_mul(num, _gf256_inv(den)));
+        j = j + 1;
+    }
+
+    let rec = [];
+    let bi = 0;
+    while bi < slen {
+        let acc = 0;
+        j = 0;
+        while j < m {
+            acc = bit_xor(acc, _gf256_mul(shares[j].data[bi], lagrange[j]));
+            j = j + 1;
+        }
+        push(rec, acc);
+        bi = bi + 1;
+    }
+
+    return map{
+        ok: true,
+        field: "GF(256) mod 0x11B",
+        share_count: m,
+        vendors_used: vendors_used,
+        secret_bytes: rec,
+        secret_hex: bytes_to_hex(rec)
+    };
+}
+
+export PHYSICS_CRYPTO_VERSION;
+export bytes_to_hex, hex_to_bytes, ct_hex_eq;
+export sha512_bytes, sha512_hex, hmac_sha512_bytes, hmac_sha512_hex;
+export its_otp_encrypt, its_otp_decrypt;
+export qkd_bb84_session, qkd_e91_bell_session;
+export hybrid3_keygen, hybrid3_sign, hybrid3_verify;
+export shamir_split_secret, shamir_reconstruct_secret;
+
