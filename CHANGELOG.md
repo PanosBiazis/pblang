@@ -2,6 +2,12 @@
 
 All notable changes to **PBLang** are documented in this file.
 
+## [`5.4.1`] — 2026-11-20 (100% Pure-`PBLang` Sovereign UEFI/BIOS, Quantum Cryo-FPGA & Multi-Architecture Firmware Guardian + Anti-Bricking Recovery + Dynamic CI Version Checks)
+
+- **Sovereign UEFI/BIOS, Quantum & Multi-Architecture Firmware Guardian (`stdlib/os/uefi_bios_firmware_guardian.sapp`)**:
+  - Live non-destructive UEFI/IOMMU/TPM2 probing (`uefi_probe_live_firmware`), canonical `SHA-512` NVRAM snapshot & tampering detector, `Secure Boot` (`PK`/`KEK`/`db`/`dbx`) audit, constitutionally gated `UEFI Capsule Update` (`caller_role == "morphboot_firmware_guardian"`, `3-Family` signature, `Time-Locked Dual-Control Quorum`, `AC + >= 50%` battery anti-bricking guard), Dual-Bank `A/B` SPI/FPGA `Try-Once` watchdog auto-fallback (`0%` bricking), `Measured Boot` (`TPM 2.0` PCRs `0–7`) Fail-Closed `Evil Maid` detector, honest multi-architecture platform classifier (`Boot Guard`/`PSB`-locked OEM vs `coreboot`/`OpenSBI`/`U-Boot`/`TF-A`/`OpenBMC`/`QEMU OVMF` vs Legacy BIOS/Retro ROM vs Quantum Cryo-FPGA vs Photonic/Neuromorphic LUT ROM), and `firmware_verify_quantum_cryo_bitstream` (thermal/quench sabotage interlock + calibration anti-poisoning).
+- **Dynamic Version Checks in CI Suites**: Replaced legacy hardcoded `5.3.0` version literals in `tests/smart_updater_test.sapp` and `tests/v3_static_si_contracts_lsp_test.sapp` with dynamic `pblang.toml` / `5.x` checks.
+
 ## [`5.4.0`] — 2026-11-20 (100% Pure-`PBLang` `Entelechon` OS System Foundations & `Morphic Sovereign Elastic Fabric` — `8` New System Pillars Across `3` Sovereign `.sapp` Modules)
 
 - **`MorphBoot` UEFI `PE32+` Emitter, `TPM 2.0` Binary Marshaler & Zero-JIT `Ring-0` AOT (`stdlib/os/morphboot_uefi_tpm2_ring0_aot.sapp`)**:

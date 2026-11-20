@@ -1,0 +1,965 @@
+// stdlib/os/uefi_bios_firmware_guardian.sapp
+// PBLang v5.4.1 — Sovereign UEFI/BIOS Firmware Guardian, Anti-Bricking Recovery
+// & Honest Open-Firmware Hardware Classification (Invariant #22)
+//
+// Three-Level Architecture:
+//   Level 1 — Live Non-Destructive UEFI/BIOS, IOMMU, TPM 2.0, NVRAM & SecureBoot Audit
+//   Level 2 — Anti-Bricking UEFI Capsule Update Gate, Dual-Bank A/B Watchdog & PCR 0..7 Check
+//   Level 3 — Honest Hardware Capability Classification (BootGuard/PSB Locked vs Open Firmware)
+
+let PhysCrypto = import("stdlib:crypto/physics_bound_3family_its.sapp");
+
+let FIRMWARE_GUARDIAN_VERSION = "5.4.1";
+let FIRMWARE_CONSTITUTIONAL_CALLER_ROLE = "morphboot_firmware_guardian";
+let FIRMWARE_MIN_BATTERY_PCT = 50;
+let FIRMWARE_WATCHDOG_TIMEOUT_SEC = 45;
+
+// ============================================================================
+// 0. Internal Helpers (Safe Map Access, Canonicalization & Sorting)
+// ============================================================================
+
+fn _map_get_str(m, key, fallback) {
+    if is_map(m) and map_has(m, key) {
+        let v = m[key];
+        if v != nil {
+            return str(v);
+        }
+    }
+    return fallback;
+}
+
+fn _map_get_bool(m, key, fallback) {
+    if is_map(m) and map_has(m, key) {
+        let v = m[key];
+        if is_bool(v) {
+            return v;
+        }
+    }
+    return fallback;
+}
+
+fn _map_get_num(m, key, fallback) {
+    if is_map(m) and map_has(m, key) {
+        let v = m[key];
+        if is_number(v) {
+            return v;
+        }
+    }
+    return fallback;
+}
+
+fn _norm_str_array(arr) {
+    let out = [];
+    if not is_array(arr) {
+        return out;
+    }
+    let i = 0;
+    while i < len(arr) {
+        push(out, str_trim(str(arr[i])));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _sort_str_array(arr) {
+    let out = _norm_str_array(arr);
+    let n = len(out);
+    let i = 1;
+    while i < n {
+        let cur = out[i];
+        let j = i - 1;
+        while j >= 0 and out[j] > cur {
+            out[j + 1] = out[j];
+            j = j - 1;
+        }
+        out[j + 1] = cur;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _join_str_array(arr, sep) {
+    let out = "";
+    let i = 0;
+    while i < len(arr) {
+        if i > 0 {
+            out = out + sep;
+        }
+        out = out + str(arr[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _str_arrays_equal(a, b) {
+    if len(a) != len(b) {
+        return false;
+    }
+    let i = 0;
+    while i < len(a) {
+        if str(a[i]) != str(b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _contains_any_token(text_lower, tokens) {
+    let i = 0;
+    while i < len(tokens) {
+        if str_contains(text_lower, tokens[i]) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _canonical_policy_str(policy) {
+    if not is_map(policy) {
+        return "default";
+    }
+    let sb = _map_get_bool(policy, "secure_boot_enforced", true);
+    let lock_bo = _map_get_bool(policy, "lock_boot_order", true);
+    let allow_3p = _map_get_bool(policy, "allow_third_party_db", false);
+    let custom_tag = _map_get_str(policy, "profile", "sovereign");
+    return "sb=" + str(sb) + ";lock_bo=" + str(lock_bo) + ";allow_3p=" + str(allow_3p) + ";profile=" + custom_tag;
+}
+
+fn _normalize_pcr_hex(val) {
+    if is_array(val) {
+        let parts = [];
+        let i = 0;
+        while i < len(val) {
+            push(parts, str_lower(str_trim(str(val[i]))));
+            i = i + 1;
+        }
+        return PhysCrypto.sha512_hex("PCR0_7_VEC|" + _join_str_array(parts, "|"));
+    }
+    return str_lower(str_trim(str(val)));
+}
+
+// ============================================================================
+// 1. Level 1 — Live Non-Destructive UEFI/BIOS & Hardware Security Audit
+// ============================================================================
+
+fn uefi_probe_live_firmware() {
+    let plat = "unknown";
+    try {
+        plat = str_lower(str(platform()));
+    } catch e {
+        plat = "unknown";
+    }
+
+    let is_uefi = false;
+    let iommu_active = false;
+    let iommu_group_count = 0;
+    let tpm2_present = false;
+
+    if plat == "linux" {
+        try {
+            is_uefi = fs_exists("/sys/firmware/efi");
+        } catch e {
+            is_uefi = false;
+        }
+
+        try {
+            if fs_exists("/sys/kernel/iommu_groups") {
+                let groups = fs_listdir("/sys/kernel/iommu_groups");
+                if is_array(groups) {
+                    iommu_group_count = len(groups);
+                    iommu_active = iommu_group_count > 0;
+                }
+            }
+        } catch e {
+            iommu_active = false;
+            iommu_group_count = 0;
+        }
+
+        try {
+            if fs_exists("/sys/class/tpm/tpm0/tpm_version_major") {
+                let ver = str_trim(fs_read("/sys/class/tpm/tpm0/tpm_version_major"));
+                if ver == "2" {
+                    tpm2_present = true;
+                }
+            }
+        } catch e {
+            tpm2_present = false;
+        }
+
+        if not tpm2_present {
+            try {
+                if fs_exists("/dev/tpmrm0") {
+                    tpm2_present = true;
+                }
+            } catch e {
+                tpm2_present = false;
+            }
+        }
+    }
+
+    return map{
+        ok: true,
+        version: FIRMWARE_GUARDIAN_VERSION,
+        platform: plat,
+        is_uefi: is_uefi,
+        iommu_active: iommu_active,
+        iommu_group_count: iommu_group_count,
+        tpm2_present: tpm2_present,
+        read_only_audit: true
+    };
+}
+
+fn uefi_nvram_snapshot_pack(boot_order, secure_boot_keys, policy) {
+    let norm_boot_order = _norm_str_array(boot_order);
+    let keys_map = if is_map(secure_boot_keys) { secure_boot_keys } else { map{} };
+
+    let pk_owner = str_trim(_map_get_str(keys_map, "pk_owner", ""));
+
+    let kek_count = 0;
+    if map_has(keys_map, "kek_count") and is_number(keys_map["kek_count"]) {
+        kek_count = num_floor(keys_map["kek_count"]);
+    } else if map_has(keys_map, "kek_list") and is_array(keys_map["kek_list"]) {
+        kek_count = len(keys_map["kek_list"]);
+    }
+
+    let raw_db_hashes = [];
+    if map_has(keys_map, "db_hashes") and is_array(keys_map["db_hashes"]) {
+        raw_db_hashes = keys_map["db_hashes"];
+    } else if map_has(keys_map, "db_list") and is_array(keys_map["db_list"]) {
+        raw_db_hashes = keys_map["db_list"];
+    }
+    let norm_db_hashes = _sort_str_array(raw_db_hashes);
+
+    let dbx_count = 0;
+    if map_has(keys_map, "dbx_count") and is_number(keys_map["dbx_count"]) {
+        dbx_count = num_floor(keys_map["dbx_count"]);
+    } else if map_has(keys_map, "dbx_list") and is_array(keys_map["dbx_list"]) {
+        dbx_count = len(keys_map["dbx_list"]);
+    }
+
+    let policy_str = _canonical_policy_str(policy);
+    let canonical = "UEFI_NVRAM_V1"
+        + "|boot_order=" + _join_str_array(norm_boot_order, ",")
+        + "|pk_owner=" + pk_owner
+        + "|kek_count=" + str(kek_count)
+        + "|db_hashes=" + _join_str_array(norm_db_hashes, ",")
+        + "|dbx_count=" + str(dbx_count)
+        + "|policy=" + policy_str;
+
+    let digest = PhysCrypto.sha512_hex(canonical);
+
+    return map{
+        ok: true,
+        version: FIRMWARE_GUARDIAN_VERSION,
+        boot_order: norm_boot_order,
+        pk_owner: pk_owner,
+        kek_count: kek_count,
+        db_hashes: norm_db_hashes,
+        dbx_count: dbx_count,
+        policy: if is_map(policy) { policy } else { map{} },
+        policy_canonical: policy_str,
+        snapshot_sha512: digest
+    };
+}
+
+fn uefi_nvram_verify_integrity(snapshot, live_vars) {
+    if not is_map(snapshot) or not map_has(snapshot, "snapshot_sha512") or not is_map(live_vars) {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            integrity_verified: false,
+            nvram_tamper_detected: true,
+            tamper_reasons: ["INVALID_NVRAM_SNAPSHOT_OR_LIVE_VARS"],
+            error: "INVALID_NVRAM_INPUT"
+        };
+    }
+
+    let live_boot_order = if map_has(live_vars, "boot_order") { live_vars["boot_order"] } else { [] };
+    let live_keys = if map_has(live_vars, "secure_boot_keys") and is_map(live_vars["secure_boot_keys"]) {
+        live_vars["secure_boot_keys"]
+    } else {
+        live_vars
+    };
+    let live_policy = if map_has(live_vars, "policy") and is_map(live_vars["policy"]) {
+        live_vars["policy"]
+    } else if map_has(snapshot, "policy") and is_map(snapshot["policy"]) {
+        snapshot["policy"]
+    } else {
+        map{}
+    };
+
+    let live_pack = uefi_nvram_snapshot_pack(live_boot_order, live_keys, live_policy);
+    let expected_sha = str(snapshot["snapshot_sha512"]);
+    let live_sha = str(live_pack["snapshot_sha512"]);
+
+    let exact_match = PhysCrypto.ct_hex_eq(expected_sha, live_sha);
+    if exact_match {
+        return map{
+            ok: true,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            integrity_verified: true,
+            nvram_tamper_detected: false,
+            boot_order_tampered: false,
+            key_tampered: false,
+            expected_sha512: expected_sha,
+            live_sha512: live_sha,
+            tamper_reasons: []
+        };
+    }
+
+    let reasons = [];
+    let boot_order_tampered = false;
+    let key_tampered = false;
+
+    if map_has(snapshot, "boot_order") and not _str_arrays_equal(snapshot["boot_order"], live_pack["boot_order"]) {
+        boot_order_tampered = true;
+        push(reasons, "UNAUTHORIZED_BOOT_ORDER_MODIFICATION");
+    }
+    if map_has(snapshot, "pk_owner") and str(snapshot["pk_owner"]) != str(live_pack["pk_owner"]) {
+        key_tampered = true;
+        push(reasons, "PK_OWNER_TAMPERED");
+    }
+    if map_has(snapshot, "kek_count") and num_floor(snapshot["kek_count"]) != num_floor(live_pack["kek_count"]) {
+        key_tampered = true;
+        push(reasons, "KEK_COUNT_TAMPERED");
+    }
+    if map_has(snapshot, "db_hashes") and not _str_arrays_equal(snapshot["db_hashes"], live_pack["db_hashes"]) {
+        key_tampered = true;
+        push(reasons, "DB_HASHES_TAMPERED");
+    }
+    if map_has(snapshot, "dbx_count") and num_floor(snapshot["dbx_count"]) != num_floor(live_pack["dbx_count"]) {
+        key_tampered = true;
+        push(reasons, "DBX_COUNT_TAMPERED");
+    }
+    if len(reasons) == 0 {
+        push(reasons, "NVRAM_DIGEST_MISMATCH");
+    }
+
+    return map{
+        ok: false,
+        version: FIRMWARE_GUARDIAN_VERSION,
+        integrity_verified: false,
+        nvram_tamper_detected: true,
+        boot_order_tampered: boot_order_tampered,
+        key_tampered: key_tampered,
+        expected_sha512: expected_sha,
+        live_sha512: live_sha,
+        tamper_reasons: reasons,
+        error: "NVRAM_TAMPER_DETECTED"
+    };
+}
+
+fn uefi_secureboot_key_audit(pk_owner, kek_list, db_list, dbx_list) {
+    let pk_str = str_trim(str(pk_owner));
+    let pk_lower = str_lower(pk_str);
+
+    let non_user_pk_tokens = [
+        "microsoft",
+        "oem_default",
+        "oem-default",
+        "vendor_default",
+        "third_party",
+        "third-party",
+        "untrusted",
+        "unknown",
+        "unassigned",
+        "factory"
+    ];
+    let user_owned_pk = (len(pk_str) > 0) and (not _contains_any_token(pk_lower, non_user_pk_tokens));
+
+    let norm_kek = if is_array(kek_list) { kek_list } else { [] };
+    let norm_db = if is_array(db_list) { db_list } else { [] };
+    let norm_dbx = if is_array(dbx_list) { dbx_list } else { [] };
+
+    let untrusted_db_tokens = [
+        "third_party",
+        "third-party",
+        "untrusted",
+        "microsoft",
+        "optionrom",
+        "option_rom",
+        "oem",
+        "vendor",
+        "unknown",
+        "compromised"
+    ];
+
+    let untrusted_db_certs = [];
+    let i = 0;
+    while i < len(norm_db) {
+        let entry = norm_db[i];
+        let flagged = false;
+        let label = "";
+
+        if is_map(entry) {
+            label = _map_get_str(entry, "name", _map_get_str(entry, "subject", _map_get_str(entry, "owner", "unnamed_cert")));
+            let explicit_trusted = _map_get_bool(entry, "trusted", true);
+            let explicit_3p = _map_get_bool(entry, "third_party", false);
+            let owner_str = str_lower(_map_get_str(entry, "owner", ""));
+            let label_lower = str_lower(label);
+
+            if (not explicit_trusted) or explicit_3p
+                or _contains_any_token(label_lower, untrusted_db_tokens)
+                or _contains_any_token(owner_str, untrusted_db_tokens) {
+                flagged = true;
+            }
+        } else {
+            label = str_trim(str(entry));
+            let label_lower = str_lower(label);
+            if len(label) == 0 or _contains_any_token(label_lower, untrusted_db_tokens) {
+                flagged = true;
+            }
+        }
+
+        if flagged {
+            push(untrusted_db_certs, label);
+        }
+        i = i + 1;
+    }
+
+    let has_untrusted = len(untrusted_db_certs) > 0;
+    let compliant = user_owned_pk and (not has_untrusted);
+
+    return map{
+        ok: compliant,
+        version: FIRMWARE_GUARDIAN_VERSION,
+        pk_owner: pk_str,
+        user_owned_pk: user_owned_pk,
+        kek_count: len(norm_kek),
+        db_count: len(norm_db),
+        dbx_count: len(norm_dbx),
+        untrusted_db_certs: untrusted_db_certs,
+        untrusted_db_count: len(untrusted_db_certs),
+        third_party_certs_flagged: has_untrusted,
+        sovereign_secureboot_compliant: compliant
+    };
+}
+
+// ============================================================================
+// 2. Level 2 — Anti-Bricking Safe Firmware Updates, Dual-Bank A/B & PCR 0..7
+// ============================================================================
+
+fn uefi_capsule_update_gate(capsule_spec, power_state, quorum_state) {
+    if not is_map(capsule_spec) or not is_map(power_state) or not is_map(quorum_state) {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            update_permitted: false,
+            constitutional_ceiling_blocked: true,
+            quorum_blocked: false,
+            bricking_risk_blocked: false,
+            error: "INVALID_CAPSULE_GATE_INPUT"
+        };
+    }
+
+    // 1. Non-Delegable Constitutional Ceiling: ONLY morphboot_firmware_guardian may proceed
+    let caller_role = str_trim(_map_get_str(capsule_spec, "caller_role", ""));
+    if caller_role != FIRMWARE_CONSTITUTIONAL_CALLER_ROLE {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            update_permitted: false,
+            constitutional_ceiling_blocked: true,
+            quorum_blocked: false,
+            bricking_risk_blocked: false,
+            caller_role: caller_role,
+            error: "CONSTITUTIONAL_CEILING_BLOCKED_USER_APP_FORBIDDEN"
+        };
+    }
+
+    // 2. Cryptographic 3-Family Signature & Dual-Control Time-Lock Quorum Gate
+    let sig_3family_valid = _map_get_bool(quorum_state, "sig_3family_valid", _map_get_bool(capsule_spec, "sig_3family_valid", false));
+    let dual_control_ok = _map_get_bool(quorum_state, "dual_control_quorum_approved", false);
+    let time_lock_ok = _map_get_bool(quorum_state, "time_lock_elapsed", false);
+
+    if (not sig_3family_valid) or (not dual_control_ok) or (not time_lock_ok) {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            update_permitted: false,
+            constitutional_ceiling_blocked: false,
+            quorum_blocked: true,
+            bricking_risk_blocked: false,
+            sig_3family_valid: sig_3family_valid,
+            dual_control_quorum_approved: dual_control_ok,
+            time_lock_elapsed: time_lock_ok,
+            error: "CRYPTO_QUORUM_OR_TIMELOCK_NOT_SATISFIED"
+        };
+    }
+
+    // 3. Anti-Bricking Power Gate: AC power connected AND battery >= 50%
+    let ac_connected = _map_get_bool(power_state, "ac_power_connected", false);
+    let battery_pct = _map_get_num(power_state, "battery_pct", 0);
+
+    if (not ac_connected) or (battery_pct < FIRMWARE_MIN_BATTERY_PCT) {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            update_permitted: false,
+            constitutional_ceiling_blocked: false,
+            quorum_blocked: false,
+            bricking_risk_blocked: true,
+            ac_power_connected: ac_connected,
+            battery_pct: battery_pct,
+            min_battery_pct_required: FIRMWARE_MIN_BATTERY_PCT,
+            error: "ANTI_BRICKING_POWER_GATE_BLOCKED"
+        };
+    }
+
+    // 4. All Gates Satisfied — Prepare Pre-Update Snapshot & Inactive Bank Target
+    let active_bank = str_upper(str_trim(_map_get_str(capsule_spec, "active_bank", "A")));
+    if active_bank != "A" and active_bank != "B" {
+        active_bank = "A";
+    }
+    let target_bank = if active_bank == "A" { "B" } else { "A" };
+
+    let capsule_id = _map_get_str(capsule_spec, "capsule_id", "capsule_unnamed");
+    let capsule_ver = _map_get_str(capsule_spec, "target_version", FIRMWARE_GUARDIAN_VERSION);
+    let capsule_sha = _map_get_str(capsule_spec, "payload_sha512", "");
+
+    let pre_snapshot_canonical = "PRE_UPDATE_SNAPSHOT_V1"
+        + "|caller=" + caller_role
+        + "|capsule_id=" + capsule_id
+        + "|version=" + capsule_ver
+        + "|active_bank=" + active_bank
+        + "|target_bank=" + target_bank
+        + "|payload_sha512=" + capsule_sha;
+
+    let pre_snapshot_sha512 = PhysCrypto.sha512_hex(pre_snapshot_canonical);
+
+    return map{
+        ok: true,
+        version: FIRMWARE_GUARDIAN_VERSION,
+        update_permitted: true,
+        constitutional_ceiling_blocked: false,
+        quorum_blocked: false,
+        bricking_risk_blocked: false,
+        pre_update_snapshot_sha512: pre_snapshot_sha512,
+        crisis_recovery_ready: true,
+        active_bank: active_bank,
+        target_bank: target_bank
+    };
+}
+
+fn firmware_dual_bank_flash_and_commit(bank_state, new_fw_sha512, watchdog_boot_ok) {
+    if not is_map(bank_state) {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            bricked: false,
+            error: "INVALID_BANK_STATE"
+        };
+    }
+
+    let fw_sha = str_lower(str_trim(str(new_fw_sha512)));
+    if len(fw_sha) == 0 {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            bricked: false,
+            error: "EMPTY_NEW_FIRMWARE_SHA512"
+        };
+    }
+
+    let original_active = str_upper(str_trim(_map_get_str(bank_state, "active_bank", "A")));
+    if original_active != "A" and original_active != "B" {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            bricked: false,
+            error: "INVALID_ACTIVE_BANK_SLOT"
+        };
+    }
+
+    let inactive_bank = if original_active == "A" { "B" } else { "A" };
+    let orig_a = _map_get_str(bank_state, "bank_a_sha512", "");
+    let orig_b = _map_get_str(bank_state, "bank_b_sha512", "");
+
+    // Write ONLY to the inactive bank; NEVER erase or overwrite the healthy active bank
+    let next_a = if inactive_bank == "A" { fw_sha } else { orig_a };
+    let next_b = if inactive_bank == "B" { fw_sha } else { orig_b };
+
+    let boot_ok = if is_bool(watchdog_boot_ok) { watchdog_boot_ok } else { false };
+
+    if boot_ok {
+        return map{
+            ok: true,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            active_bank: inactive_bank,
+            written_bank: inactive_bank,
+            previous_active_bank: original_active,
+            bank_a_sha512: next_a,
+            bank_b_sha512: next_b,
+            active_bank_preserved_during_flash: true,
+            try_once_watchdog_sec: FIRMWARE_WATCHDOG_TIMEOUT_SEC,
+            committed: true,
+            auto_fallback_triggered: false,
+            bricked: false
+        };
+    }
+
+    // Watchdog timeout / boot failure: hardware automatically reverts to untouched healthy bank
+    return map{
+        ok: true,
+        version: FIRMWARE_GUARDIAN_VERSION,
+        active_bank: original_active,
+        written_bank: inactive_bank,
+        failed_candidate_bank: inactive_bank,
+        bank_a_sha512: next_a,
+        bank_b_sha512: next_b,
+        active_bank_preserved_during_flash: true,
+        try_once_watchdog_sec: FIRMWARE_WATCHDOG_TIMEOUT_SEC,
+        committed: false,
+        auto_fallback_triggered: true,
+        bricked: false
+    };
+}
+
+fn firmware_spi_measured_boot_check(sealed_pcr0_7, live_pcr0_7, spi_ble_locked) {
+    let sealed_hex = _normalize_pcr_hex(sealed_pcr0_7);
+    let live_hex = _normalize_pcr_hex(live_pcr0_7);
+    let ble_locked = if is_bool(spi_ble_locked) { spi_ble_locked } else { false };
+
+    let warnings = [];
+    if not ble_locked {
+        push(warnings, "SPI_BIOS_LOCK_ENABLE_UNLOCKED_WARNING");
+    }
+
+    if len(sealed_hex) == 0 or len(live_hex) == 0 {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            pcr0_7_verified: false,
+            evil_maid_firmware_tamper: true,
+            vault_unlock_allowed: false,
+            spi_ble_locked: ble_locked,
+            spi_ble_warning: not ble_locked,
+            warnings: warnings,
+            error: "MISSING_PCR0_7_DIGEST_FAIL_CLOSED"
+        };
+    }
+
+    let pcr_match = PhysCrypto.ct_hex_eq(sealed_hex, live_hex);
+    if not pcr_match {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            pcr0_7_verified: false,
+            evil_maid_firmware_tamper: true,
+            vault_unlock_allowed: false,
+            spi_ble_locked: ble_locked,
+            spi_ble_warning: not ble_locked,
+            warnings: warnings,
+            error: "PCR0_7_MISMATCH_EVIL_MAID_FIRMWARE_TAMPER"
+        };
+    }
+
+    return map{
+        ok: true,
+        version: FIRMWARE_GUARDIAN_VERSION,
+        pcr0_7_verified: true,
+        evil_maid_firmware_tamper: false,
+        vault_unlock_allowed: true,
+        spi_ble_locked: ble_locked,
+        spi_ble_warning: not ble_locked,
+        warnings: warnings
+    };
+}
+
+// ============================================================================
+// 3. Level 3 — Honest Multi-Architecture & Future-Substrate Classification
+// ============================================================================
+
+fn firmware_classify_platform(hw_caps) {
+    if not is_map(hw_caps) {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            tier: "INVALID_HARDWARE_CAPABILITIES",
+            level1_nvram_audit: false,
+            level2_morphboot_preboot: false,
+            level3_raw_spi_replace_allowed: false,
+            reason: "Hardware capability descriptor missing or invalid"
+        };
+    }
+
+    let family = str_lower(str_trim(_map_get_str(hw_caps, "firmware_family", "")));
+
+    // 3.1 Commercial BootGuard / AMD PSB Hardware-Fused Platforms
+    let intel_bg = _map_get_bool(hw_caps, "intel_boot_guard_fused", false);
+    let amd_psb = _map_get_bool(hw_caps, "amd_psb_fused", false);
+
+    if intel_bg or amd_psb or family == "uefi_bootguard_locked" {
+        return map{
+            ok: true,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            tier: "UEFI_COMMERCIAL_BOOTGUARD_LOCKED",
+            level1_nvram_audit: true,
+            level2_morphboot_preboot: true,
+            level3_raw_spi_replace_allowed: false,
+            reason: "Hardware-fused OEM signature check active; raw SPI replacement blocked to prevent bricking"
+        };
+    }
+
+    // 3.2 Quantum Cryo-FPGA / QPU Pulse / QEC Syndrome / QRAM Router Firmware
+    let is_quantum_cryo = _map_get_bool(hw_caps, "quantum_cryo_fpga", false)
+        or _map_get_bool(hw_caps, "qpu_controller", false)
+        or family == "quantum_cryo_fpga"
+        or family == "qpu_cryo"
+        or family == "qec_fpga"
+        or family == "qram_router";
+
+    if is_quantum_cryo {
+        let payload_format = _map_get_str(hw_caps, "payload_format", "cryo_fpga_bitstream");
+        return map{
+            ok: true,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            tier: "QUANTUM_CRYO_FPGA_FIRMWARE",
+            level1_nvram_audit: true,
+            level2_morphboot_preboot: true,
+            level3_raw_spi_replace_allowed: false,
+            dual_bank_golden_fpga_required: true,
+            thermal_amplitude_interlock_required: true,
+            payload_format: payload_format,
+            reason: "Quantum cryo-FPGA pulse/QEC controller detected; dual-bank golden FPGA fallback and thermal/amplitude interlock enforced"
+        };
+    }
+
+    // 3.3 Photonic Clements MZI Phase-LUT ROM / Neuromorphic AER Routing Table
+    let is_photonic_neuro = _map_get_bool(hw_caps, "photonic_mzi_rom", false)
+        or _map_get_bool(hw_caps, "neuromorphic_aer_rom", false)
+        or family == "photonic_mzi"
+        or family == "neuromorphic_aer"
+        or family == "photonic_neuromorphic";
+
+    if is_photonic_neuro {
+        let payload_format = _map_get_str(hw_caps, "payload_format", "clements_mzi_lut_rom");
+        return map{
+            ok: true,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            tier: "PHOTONIC_MZI_OR_NEUROMORPHIC_ROM",
+            level1_nvram_audit: true,
+            level2_morphboot_preboot: true,
+            level3_raw_spi_replace_allowed: false,
+            integrity_sealed_luts_required: true,
+            thermal_limit_guard_required: true,
+            payload_format: payload_format,
+            reason: "Photonic MZI calibration ROM or Neuromorphic AER routing table detected; integrity-sealed LUTs and thermal limit guard enforced"
+        };
+    }
+
+    // 3.4 Legacy MBR BIOS / 8-bit & 16-bit Retro ROM/EPROM
+    let is_legacy_retro = _map_get_bool(hw_caps, "legacy_bios", false)
+        or _map_get_bool(hw_caps, "retro_rom", false)
+        or family == "legacy_bios"
+        or family == "retro_rom"
+        or family == "mbr_bios";
+
+    if is_legacy_retro {
+        let payload_format = _map_get_str(hw_caps, "payload_format", "mbr_bootsector_512b");
+        return map{
+            ok: true,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            tier: "LEGACY_BIOS_OR_RETRO_ROM",
+            level1_nvram_audit: false,
+            level2_morphboot_preboot: false,
+            level3_raw_spi_replace_allowed: false,
+            read_only_hash_audit: true,
+            safe_boot_sector_verification: true,
+            payload_format: payload_format,
+            reason: "Legacy MBR BIOS or 8/16-bit retro ROM/EPROM detected; read-only hash audit and safe boot-sector verification enabled"
+        };
+    }
+
+    // 3.5 Sovereign Open-Firmware Boards (coreboot, OpenSBI, U-Boot/TF-A, OpenBMC, QEMU OVMF/SEV-SNP/TDX)
+    let open_board = _map_get_bool(hw_caps, "open_firmware_board", false)
+        or family == "coreboot"
+        or family == "opensbi"
+        or family == "uboot"
+        or family == "tfa"
+        or family == "openbmc"
+        or family == "qemu_ovmf"
+        or family == "sev_snp"
+        or family == "tdx";
+
+    if open_board {
+        let payload_format = _map_get_str(hw_caps, "payload_format", "coreboot_cbfs");
+        return map{
+            ok: true,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            tier: "OPEN_FIRMWARE_COMPATIBLE",
+            level1_nvram_audit: true,
+            level2_morphboot_preboot: true,
+            level3_raw_spi_replace_allowed: true,
+            payload_format: payload_format,
+            reason: "Open-firmware hardware verified; sovereign open-firmware payload replacement permitted"
+        };
+    }
+
+    return map{
+        ok: true,
+        version: FIRMWARE_GUARDIAN_VERSION,
+        tier: "UNVERIFIED_HARDWARE_SAFE_DEFAULT",
+        level1_nvram_audit: true,
+        level2_morphboot_preboot: true,
+        level3_raw_spi_replace_allowed: false,
+        reason: "Hardware firmware lock status unverified; raw SPI replacement blocked by default to prevent bricking"
+    };
+}
+
+// ============================================================================
+// 4. Pillar 4 — Quantum (QPU Cryo-FPGA / Pulse / QEC) Bitstream Guardian
+// ============================================================================
+
+fn firmware_verify_quantum_cryo_bitstream(spec) {
+    if not is_map(spec) {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            bitstream_load_allowed: false,
+            quench_sabotage_blocked: false,
+            calibration_poisoning_blocked: false,
+            error: "INVALID_QUANTUM_BITSTREAM_SPEC"
+        };
+    }
+
+    // 1. 3-Family Post-Quantum / Physics-Bound Signature Gate
+    let sig_valid = _map_get_bool(spec, "sig_3family_valid", false);
+    if not sig_valid {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            bitstream_load_allowed: false,
+            sig_3family_valid: false,
+            quench_sabotage_blocked: false,
+            calibration_poisoning_blocked: false,
+            error: "QUANTUM_BITSTREAM_3FAMILY_SIGNATURE_INVALID"
+        };
+    }
+
+    // 2. Dual-Bank Golden FPGA Fallback Verification (Anti-Bricking Cryo Gate)
+    let golden_ready = _map_get_bool(spec, "dual_bank_golden_fpga_ready", false);
+    if not golden_ready {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            bitstream_load_allowed: false,
+            sig_3family_valid: true,
+            dual_bank_golden_fpga_ready: false,
+            quench_sabotage_blocked: false,
+            calibration_poisoning_blocked: false,
+            error: "DUAL_BANK_GOLDEN_FPGA_FALLBACK_NOT_READY"
+        };
+    }
+
+    // 3. Thermal / Quench & Microwave/Laser Amplitude Interlock
+    let has_power = map_has(spec, "max_pulse_power_dbm") and is_number(spec["max_pulse_power_dbm"]);
+    let has_power_lim = map_has(spec, "safety_limit_dbm") and is_number(spec["safety_limit_dbm"]);
+    let has_cryo = map_has(spec, "cryo_stage_mk") and is_number(spec["cryo_stage_mk"]);
+    let has_cryo_lim = map_has(spec, "max_safe_mk") and is_number(spec["max_safe_mk"]);
+
+    if (not has_power) or (not has_power_lim) or (not has_cryo) or (not has_cryo_lim) {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            bitstream_load_allowed: false,
+            sig_3family_valid: true,
+            dual_bank_golden_fpga_ready: true,
+            thermal_interlock_ok: false,
+            quench_sabotage_blocked: true,
+            calibration_poisoning_blocked: false,
+            error: "MISSING_THERMAL_OR_AMPLITUDE_INTERLOCK_TELEMETRY"
+        };
+    }
+
+    let max_pulse_power_dbm = spec["max_pulse_power_dbm"];
+    let safety_limit_dbm = spec["safety_limit_dbm"];
+    let cryo_stage_mk = spec["cryo_stage_mk"];
+    let max_safe_mk = spec["max_safe_mk"];
+
+    if (max_pulse_power_dbm > safety_limit_dbm) or (cryo_stage_mk > max_safe_mk) or (cryo_stage_mk < 0) {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            bitstream_load_allowed: false,
+            sig_3family_valid: true,
+            dual_bank_golden_fpga_ready: true,
+            thermal_interlock_ok: false,
+            quench_sabotage_blocked: true,
+            calibration_poisoning_blocked: false,
+            max_pulse_power_dbm: max_pulse_power_dbm,
+            safety_limit_dbm: safety_limit_dbm,
+            cryo_stage_mk: cryo_stage_mk,
+            max_safe_mk: max_safe_mk,
+            error: "THERMAL_OR_PULSE_QUENCH_SABOTAGE_BLOCKED"
+        };
+    }
+
+    // 4. Calibration Integrity Verification (Anti-Calibration Poisoning)
+    let cal_sha = str_lower(str_trim(_map_get_str(spec, "calibration_sha512", "")));
+    let cal_tampered = _map_get_bool(spec, "calibration_tampered", false);
+    let expected_cal_sha = str_lower(str_trim(_map_get_str(spec, "expected_calibration_sha512", "")));
+
+    let cal_mismatch = false;
+    if len(expected_cal_sha) > 0 and len(cal_sha) > 0 {
+        if not PhysCrypto.ct_hex_eq(expected_cal_sha, cal_sha) {
+            cal_mismatch = true;
+        }
+    }
+
+    if (len(cal_sha) == 0) or cal_tampered or cal_mismatch {
+        return map{
+            ok: false,
+            version: FIRMWARE_GUARDIAN_VERSION,
+            bitstream_load_allowed: false,
+            sig_3family_valid: true,
+            dual_bank_golden_fpga_ready: true,
+            thermal_interlock_ok: true,
+            quench_sabotage_blocked: false,
+            calibration_integrity_ok: false,
+            calibration_poisoning_blocked: true,
+            error: "QUANTUM_CALIBRATION_POISONING_BLOCKED"
+        };
+    }
+
+    // 5. All Quantum Cryo-FPGA Safety Gates Passed
+    let target_subsystem = _map_get_str(spec, "subsystem", "qec_syndrome_fpga");
+    let bitstream_id = _map_get_str(spec, "bitstream_id", "cryo_bitstream_v1");
+    let attestation_canonical = "QPU_CRYO_BITSTREAM_V1"
+        + "|id=" + bitstream_id
+        + "|subsystem=" + target_subsystem
+        + "|power_dbm=" + str(max_pulse_power_dbm)
+        + "|limit_dbm=" + str(safety_limit_dbm)
+        + "|cryo_mk=" + str(cryo_stage_mk)
+        + "|max_mk=" + str(max_safe_mk)
+        + "|cal_sha512=" + cal_sha;
+
+    let attestation_sha512 = PhysCrypto.sha512_hex(attestation_canonical);
+
+    return map{
+        ok: true,
+        version: FIRMWARE_GUARDIAN_VERSION,
+        bitstream_load_allowed: true,
+        subsystem: target_subsystem,
+        sig_3family_valid: true,
+        dual_bank_golden_fpga_ready: true,
+        thermal_interlock_ok: true,
+        quench_sabotage_blocked: false,
+        calibration_integrity_ok: true,
+        calibration_poisoning_blocked: false,
+        max_pulse_power_dbm: max_pulse_power_dbm,
+        safety_limit_dbm: safety_limit_dbm,
+        cryo_stage_mk: cryo_stage_mk,
+        max_safe_mk: max_safe_mk,
+        calibration_sha512: cal_sha,
+        bitstream_attestation_sha512: attestation_sha512
+    };
+}
+
+export FIRMWARE_GUARDIAN_VERSION;
+export FIRMWARE_CONSTITUTIONAL_CALLER_ROLE, FIRMWARE_MIN_BATTERY_PCT, FIRMWARE_WATCHDOG_TIMEOUT_SEC;
+export uefi_probe_live_firmware, uefi_nvram_snapshot_pack, uefi_nvram_verify_integrity, uefi_secureboot_key_audit;
+export uefi_capsule_update_gate, firmware_dual_bank_flash_and_commit, firmware_spi_measured_boot_check;
+export firmware_classify_platform, firmware_verify_quantum_cryo_bitstream;

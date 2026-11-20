@@ -1,23 +1,23 @@
-# Security & Privacy Policy (`PBLang 5.4.0`)
+# Security & Privacy Policy (`PBLang 5.4.1`)
 
 ## Supported Versions
 
 | Version | Channel | Supported | Security Updates |
 | :--- | :--- | :--- | :--- |
 | **`5.4.x`** | **`stable`** | ✅ **Yes** | Active support — `MorphBoot` UEFI `PE32+` & bounded `.vault` parser, `TPM 2.0` binary marshaler + anti-rollback, Zero-JIT `Ring-0` AOT verifier (`stdlib/os/morphboot_uefi_tpm2_ring0_aot.sapp`), `Virtualized Ring-0 Micro-VM Prism` (`/dev/kvm`/`WHP`) + `Foreign ABI Prism` & `Non-Breaking Egress Containment` (`stdlib/os/microvm_prism_foreign_abi.sapp`), `240Hz` `Sovereign Morphic Glass` + `Trusted Path` + `Virtual Privacy Shutter`, `--strict-taint` + PII redaction + backoff quotas, and **`Morphic Sovereign Elastic Fabric`** (Attested Scale Up/Down/Out/In + One-Way Quarantine + Crypto-Shredding, `stdlib/os/morphic_glass_240hz_taint_elastic.sapp`) |
-| `5.3.x` | `maintenance` | ✅ Yes | Previous `5.3` Quantum-Native `Q-MORPH` & Physics-Bound Crypto release; upgrade to `5.4.0` recommended |
-| `5.2.x` | `maintenance` | ✅ Yes | Previous `5.2` Post-Transformer release; upgrade to `5.4.0` recommended |
-| `5.1.x` | `maintenance` | ✅ Yes | Previous `5.1` pure-microkernel release; upgrade to `5.4.0` recommended |
-| `5.0.x` | `maintenance` | ✅ Yes | Sovereign `5.0` series; upgrade to `5.4.0` recommended |
-| `4.0.x – 4.2.x` | `maintenance` | ⚠️ Security fixes only | `4.x` Dual-Lock / Closed-Shield series; upgrade to `5.4.0` recommended |
-| `2.0.x – 3.0.x` | `legacy` | ❌ No | Superseded by `5.4.0` |
+| `5.3.x` | `maintenance` | ✅ Yes | Previous `5.3` Quantum-Native `Q-MORPH` & Physics-Bound Crypto release; upgrade to `5.4.1` recommended |
+| `5.2.x` | `maintenance` | ✅ Yes | Previous `5.2` Post-Transformer release; upgrade to `5.4.1` recommended |
+| `5.1.x` | `maintenance` | ✅ Yes | Previous `5.1` pure-microkernel release; upgrade to `5.4.1` recommended |
+| `5.0.x` | `maintenance` | ✅ Yes | Sovereign `5.0` series; upgrade to `5.4.1` recommended |
+| `4.0.x – 4.2.x` | `maintenance` | ⚠️ Security fixes only | `4.x` Dual-Lock / Closed-Shield series; upgrade to `5.4.1` recommended |
+| `2.0.x – 3.0.x` | `legacy` | ❌ No | Superseded by `5.4.1` |
 | `< 2.0.0` | `legacy` | ❌ No | Unsupported historical series |
 
 ---
 
-## Built-In Security Architecture (`PBLang 5.4.0`)
+## Built-In Security Architecture (`PBLang 5.4.1`)
 
-PBLang `5.4.0` is engineered around **100% Pure-PBLang Sovereign Auditable Subsystems**, **Zero-Trust Capability Isolation**, **Unprivileged OS Kernel Sandboxing**, **Constant-Time & Post-Quantum Cryptography**, and **By-Default Supply-Chain & Public Privacy Hardening**:
+PBLang `5.4.1` is engineered around **100% Pure-PBLang Sovereign Auditable Subsystems**, **Zero-Trust Capability Isolation**, **Unprivileged OS Kernel Sandboxing**, **Constant-Time & Post-Quantum Cryptography**, and **By-Default Supply-Chain & Public Privacy Hardening**:
 
 1. **Capability-Gated Execution & Unprivileged OS Kernel Sandbox (`--sandbox`, `stdlib/vm/sovereign_pure_microkernel.sapp`, `stdlib/concurrency/green_fibers_doh_sandbox.sapp`)**:
    - `pblang run script.sapp --sandbox` permits canonicalized, symlink-free `stdlib:...` imports while denying ambient file system (`--deny-fs`), network (`--deny-net`), HTTP (`--deny-http`), SQLite, subprocess (`--deny-exec`), environment, and native FFI (`--deny-ffi`) capabilities unless explicitly granted.

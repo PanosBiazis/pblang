@@ -39,7 +39,7 @@
 #include <sys/resource.h>
 #endif
 
-#define PBLANG_ZR_VERSION_STR "pblang 5.4.0 (sovereign zero-rust runtime; compat 1.5.0)"
+#define PBLANG_ZR_VERSION_STR "pblang 5.4.1 (sovereign zero-rust runtime; compat 1.5.0)"
 
 static void zr_print_version(void) {
     printf("%s\n", PBLANG_ZR_VERSION_STR);
