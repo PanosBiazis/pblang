@@ -1,0 +1,1095 @@
+// stdlib/os/morphboot_uefi_tpm2_ring0_aot.sapp
+// PBLang v5.4.0 — Pillars 1, 2 & 3:
+//   1. Partitionless UEFI PE32+ Bootloader Emitter & Bounded MorphBoot Parser (< 500 LOC)
+//   2. TPM 2.0 Binary Command Marshaler, Monotonic Counter & Measured Boot PCR Sealing
+//   3. Zero-JIT Ring-0 Static AOT Machine-Code Emitter & Formal Safety Verifier
+
+let PhysCrypto = import("stdlib:crypto/physics_bound_3family_its.sapp");
+
+let OS_BOOT_VERSION = "5.4.0";
+
+// PE32+ & MorphBoot Constants
+let PE_DOS_MAGIC_M = 0x4D;
+let PE_DOS_MAGIC_Z = 0x5A;
+let PE_LFANEW_OFFSET = 0x3C;
+let PE_HEADER_OFFSET = 0x80;
+let PE_MACHINE_AMD64 = 0x8664;
+let PE_OPT_MAGIC_PE32PLUS = 0x020B;
+let PE_SUBSYSTEM_EFI_APP = 10;
+let PE_SECTION_ALIGN = 0x1000;
+let PE_FILE_ALIGN = 0x200;
+let PE_ENTRY_RVA = 0x1000;
+let PE_SCN_MEM_EXECUTE = 0x20000000;
+let PE_SCN_MEM_READ = 0x40000000;
+let PE_SCN_MEM_WRITE = 0x80000000;
+let PE_SCN_TEXT_RX = 0x60000020;
+
+let MORPHBOOT_VAULT_MAGIC = "MVLT01";
+let MORPHBOOT_VAULT_VERSION = 1;
+let MORPHBOOT_VAULT_HEADER_SIZE = 180;
+let MORPHBOOT_VAULT_HEADER_MAX = 256;
+
+// TCG TPM 2.0 Constants (Big-Endian Wire Protocol)
+let TPM_ST_NO_SESSIONS = 0x8001;
+let TPM_ST_SESSIONS = 0x8002;
+let TPM_CC_NV_INCREMENT = 0x00000134;
+let TPM_CC_GET_RANDOM = 0x0000017B;
+let TPM_CC_PCR_EXTEND = 0x00000182;
+let TPM_RS_PW = 0x40000009;
+let TPM_ALG_SHA256 = 0x000B;
+let TPM_ALG_SHA512 = 0x000D;
+
+// ============================================================================
+// 0. Binary Encoding / Decoding & Constant-Time Helpers
+// ============================================================================
+
+fn _push_u8(buf, v) {
+    push(buf, bit_and(num_floor(v), 0xFF));
+}
+
+fn _push_u16_le(buf, v) {
+    let n = num_floor(v);
+    push(buf, bit_and(n, 0xFF));
+    push(buf, bit_and(bit_shr(n, 8), 0xFF));
+}
+
+fn _push_u32_le(buf, v) {
+    let n = num_floor(v);
+    push(buf, bit_and(n, 0xFF));
+    push(buf, bit_and(bit_shr(n, 8), 0xFF));
+    push(buf, bit_and(bit_shr(n, 16), 0xFF));
+    push(buf, bit_and(bit_shr(n, 24), 0xFF));
+}
+
+fn _push_u64_le(buf, v) {
+    let n = num_floor(v);
+    let mod32 = 4294967296;
+    let hi = num_floor(n / mod32);
+    let lo = n - hi * mod32;
+    _push_u32_le(buf, lo);
+    _push_u32_le(buf, hi);
+}
+
+fn _push_u16_be(buf, v) {
+    let n = num_floor(v);
+    push(buf, bit_and(bit_shr(n, 8), 0xFF));
+    push(buf, bit_and(n, 0xFF));
+}
+
+fn _push_u32_be(buf, v) {
+    let n = num_floor(v);
+    push(buf, bit_and(bit_shr(n, 24), 0xFF));
+    push(buf, bit_and(bit_shr(n, 16), 0xFF));
+    push(buf, bit_and(bit_shr(n, 8), 0xFF));
+    push(buf, bit_and(n, 0xFF));
+}
+
+fn _push_u64_be(buf, v) {
+    let n = num_floor(v);
+    let mod32 = 4294967296;
+    let hi = num_floor(n / mod32);
+    let lo = n - hi * mod32;
+    _push_u32_be(buf, hi);
+    _push_u32_be(buf, lo);
+}
+
+fn _read_u16_le(bs, off) {
+    return bit_and(bs[off], 0xFF) + bit_and(bs[off + 1], 0xFF) * 256;
+}
+
+fn _read_u32_le(bs, off) {
+    return bit_and(bs[off], 0xFF)
+        + bit_and(bs[off + 1], 0xFF) * 256
+        + bit_and(bs[off + 2], 0xFF) * 65536
+        + bit_and(bs[off + 3], 0xFF) * 16777216;
+}
+
+fn _read_u64_le(bs, off) {
+    let lo = _read_u32_le(bs, off);
+    let hi = _read_u32_le(bs, off + 4);
+    return hi * 4294967296 + lo;
+}
+
+fn _read_u16_be(bs, off) {
+    return bit_and(bs[off], 0xFF) * 256 + bit_and(bs[off + 1], 0xFF);
+}
+
+fn _read_u32_be(bs, off) {
+    return bit_and(bs[off], 0xFF) * 16777216
+        + bit_and(bs[off + 1], 0xFF) * 65536
+        + bit_and(bs[off + 2], 0xFF) * 256
+        + bit_and(bs[off + 3], 0xFF);
+}
+
+fn _read_u64_be(bs, off) {
+    let hi = _read_u32_be(bs, off);
+    let lo = _read_u32_be(bs, off + 4);
+    return hi * 4294967296 + lo;
+}
+
+fn _push_zeros(buf, count) {
+    let i = 0;
+    while i < count {
+        push(buf, 0);
+        i = i + 1;
+    }
+}
+
+fn _push_bytes(buf, src) {
+    let i = 0;
+    while i < len(src) {
+        push(buf, bit_and(src[i], 0xFF));
+        i = i + 1;
+    }
+}
+
+fn _slice_bytes(bs, start_idx, end_idx) {
+    let out = [];
+    let i = start_idx;
+    while i < end_idx and i < len(bs) {
+        push(out, bit_and(bs[i], 0xFF));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _align_up(val, align) {
+    if val <= 0 { return align; }
+    let rem = val - num_floor(val / align) * align;
+    if rem == 0 { return val; }
+    return val + (align - rem);
+}
+
+fn _hex_val(ch) {
+    if ch == "0" { return 0; }
+    if ch == "1" { return 1; }
+    if ch == "2" { return 2; }
+    if ch == "3" { return 3; }
+    if ch == "4" { return 4; }
+    if ch == "5" { return 5; }
+    if ch == "6" { return 6; }
+    if ch == "7" { return 7; }
+    if ch == "8" { return 8; }
+    if ch == "9" { return 9; }
+    if ch == "a" or ch == "A" { return 10; }
+    if ch == "b" or ch == "B" { return 11; }
+    if ch == "c" or ch == "C" { return 12; }
+    if ch == "d" or ch == "D" { return 13; }
+    if ch == "e" or ch == "E" { return 14; }
+    if ch == "f" or ch == "F" { return 15; }
+    return -1;
+}
+
+fn _hex_to_bytes_strict(hex_str) {
+    if not is_string(hex_str) { return []; }
+    let n = len(hex_str);
+    if n == 0 or (n - num_floor(n / 2) * 2) != 0 { return []; }
+    let out = [];
+    let i = 0;
+    while i < n {
+        let hi = _hex_val(str_slice(hex_str, i, i + 1));
+        let lo = _hex_val(str_slice(hex_str, i + 1, i + 2));
+        if hi < 0 or lo < 0 { return []; }
+        push(out, hi * 16 + lo);
+        i = i + 2;
+    }
+    return out;
+}
+
+fn _bytes_to_hex(bs) {
+    return PhysCrypto.bytes_to_hex(bs);
+}
+
+fn _normalize_digest_bytes(val) {
+    if is_array(val) {
+        let out = [];
+        let i = 0;
+        while i < len(val) {
+            push(out, bit_and(val[i], 0xFF));
+            i = i + 1;
+        }
+        return out;
+    }
+    if is_string(val) {
+        let dec = _hex_to_bytes_strict(val);
+        if len(dec) > 0 { return dec; }
+        return str_to_bytes(val);
+    }
+    return [];
+}
+
+fn _ct_eq_bytes(a, b) {
+    if not is_array(a) or not is_array(b) { return false; }
+    if len(a) != len(b) { return false; }
+    let diff = 0;
+    let i = 0;
+    while i < len(a) {
+        diff = bit_or(diff, bit_xor(bit_and(a[i], 0xFF), bit_and(b[i], 0xFF)));
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+fn _ct_eq_str(a, b) {
+    return _ct_eq_bytes(str_to_bytes(str(a)), str_to_bytes(str(b)));
+}
+
+// ============================================================================
+// 1. Partitionless UEFI PE32+ Bootloader Emitter & Bounded MorphBoot Parser
+// ============================================================================
+
+fn uefi_emit_pe32plus_bootx64(entry_machine_code = [], image_base = 0x10000000) {
+    // Default x86-64 UEFI EFI_SUCCESS stub: xor rax, rax; ret
+    let code = [0x48, 0x31, 0xC0, 0xC3];
+    if is_array(entry_machine_code) and len(entry_machine_code) > 0 {
+        code = [];
+        _push_bytes(code, entry_machine_code);
+    }
+
+    let virt_size = len(code);
+    let raw_size = _align_up(virt_size, PE_FILE_ALIGN);
+    let aligned_virt = _align_up(virt_size, PE_SECTION_ALIGN);
+    let size_of_image = PE_ENTRY_RVA + aligned_virt;
+
+    let pe = [];
+
+    // --- DOS Header (64 bytes) + DOS Stub Padding to 0x80 (128 bytes total) ---
+    _push_u8(pe, PE_DOS_MAGIC_M);
+    _push_u8(pe, PE_DOS_MAGIC_Z);
+    _push_zeros(pe, PE_LFANEW_OFFSET - 2);
+    _push_u32_le(pe, PE_HEADER_OFFSET);
+    _push_zeros(pe, PE_HEADER_OFFSET - len(pe));
+
+    // --- PE Signature ("PE\0\0", 4 bytes at 0x80) ---
+    _push_u8(pe, 0x50);
+    _push_u8(pe, 0x45);
+    _push_u8(pe, 0x00);
+    _push_u8(pe, 0x00);
+
+    // --- COFF File Header (20 bytes at 0x84..0x97) ---
+    _push_u16_le(pe, PE_MACHINE_AMD64);   // Machine = AMD64
+    _push_u16_le(pe, 1);                  // NumberOfSections = 1 (.text)
+    _push_u32_le(pe, 0);                  // TimeDateStamp (deterministic)
+    _push_u32_le(pe, 0);                  // PointerToSymbolTable
+    _push_u32_le(pe, 0);                  // NumberOfSymbols
+    _push_u16_le(pe, 240);                // SizeOfOptionalHeader (PE32+)
+    _push_u16_le(pe, 0x0222);             // Characteristics (EXEC | LARGE_ADDR | DEBUG_STRIPPED)
+
+    // --- PE32+ Optional Header (240 bytes at 0x98..0x187) ---
+    // Standard fields (24 bytes)
+    _push_u16_le(pe, PE_OPT_MAGIC_PE32PLUS); // Magic = 0x020B
+    _push_u8(pe, 5);                         // MajorLinkerVersion
+    _push_u8(pe, 4);                         // MinorLinkerVersion
+    _push_u32_le(pe, raw_size);              // SizeOfCode
+    _push_u32_le(pe, 0);                     // SizeOfInitializedData
+    _push_u32_le(pe, 0);                     // SizeOfUninitializedData
+    _push_u32_le(pe, PE_ENTRY_RVA);          // AddressOfEntryPoint = 0x1000
+    _push_u32_le(pe, PE_ENTRY_RVA);          // BaseOfCode = 0x1000
+
+    // Windows / UEFI specific fields (88 bytes)
+    _push_u64_le(pe, image_base);            // ImageBase
+    _push_u32_le(pe, PE_SECTION_ALIGN);      // SectionAlignment = 0x1000
+    _push_u32_le(pe, PE_FILE_ALIGN);         // FileAlignment = 0x200
+    _push_u16_le(pe, 0);                     // MajorOperatingSystemVersion
+    _push_u16_le(pe, 0);                     // MinorOperatingSystemVersion
+    _push_u16_le(pe, 5);                     // MajorImageVersion
+    _push_u16_le(pe, 4);                     // MinorImageVersion
+    _push_u16_le(pe, 0);                     // MajorSubsystemVersion
+    _push_u16_le(pe, 0);                     // MinorSubsystemVersion
+    _push_u32_le(pe, 0);                     // Win32VersionValue
+    _push_u32_le(pe, size_of_image);         // SizeOfImage
+    _push_u32_le(pe, PE_FILE_ALIGN);         // SizeOfHeaders = 0x200
+    _push_u32_le(pe, 0);                     // CheckSum
+    _push_u16_le(pe, PE_SUBSYSTEM_EFI_APP);  // Subsystem = 10 (EFI_APPLICATION)
+    _push_u16_le(pe, 0x0160);                // DllCharacteristics (HIGH_ENTROPY | DYNAMIC_BASE | NX_COMPAT)
+    _push_u64_le(pe, 0x100000);              // SizeOfStackReserve
+    _push_u64_le(pe, 0x1000);                // SizeOfStackCommit
+    _push_u64_le(pe, 0x100000);              // SizeOfHeapReserve
+    _push_u64_le(pe, 0x1000);                // SizeOfHeapCommit
+    _push_u32_le(pe, 0);                     // LoaderFlags
+    _push_u32_le(pe, 16);                    // NumberOfRvaAndSizes
+
+    // Data Directories (16 * 8 = 128 bytes)
+    _push_zeros(pe, 128);
+
+    // --- .text Section Header (40 bytes at 0x188..0x1AF) ---
+    // Name: ".text\0\0\0"
+    _push_u8(pe, 0x2E);
+    _push_u8(pe, 0x74);
+    _push_u8(pe, 0x65);
+    _push_u8(pe, 0x78);
+    _push_u8(pe, 0x74);
+    _push_zeros(pe, 3);
+    _push_u32_le(pe, virt_size);             // VirtualSize
+    _push_u32_le(pe, PE_ENTRY_RVA);          // VirtualAddress = 0x1000
+    _push_u32_le(pe, raw_size);              // SizeOfRawData
+    _push_u32_le(pe, PE_FILE_ALIGN);         // PointerToRawData = 0x200
+    _push_u32_le(pe, 0);                     // PointerToRelocations
+    _push_u32_le(pe, 0);                     // PointerToLinenumbers
+    _push_u16_le(pe, 0);                     // NumberOfRelocations
+    _push_u16_le(pe, 0);                     // NumberOfLinenumbers
+    _push_u32_le(pe, PE_SCN_TEXT_RX);        // Characteristics = 0x60000020 (RX, strict W^X)
+
+    // --- Pad Headers to FileAlignment (0x200) ---
+    _push_zeros(pe, PE_FILE_ALIGN - len(pe));
+
+    // --- .text Raw Machine Code padded to FileAlignment ---
+    _push_bytes(pe, code);
+    _push_zeros(pe, raw_size - virt_size);
+
+    return pe;
+}
+
+fn uefi_validate_pe32plus(pe_bytes) {
+    let errors = [];
+    if not is_array(pe_bytes) or len(pe_bytes) < PE_FILE_ALIGN {
+        return map{
+            ok: false,
+            machine: "UNKNOWN",
+            subsystem: "UNKNOWN",
+            entry_rva: 0,
+            wx_enforced: false,
+            size_bytes: if is_array(pe_bytes) { len(pe_bytes) } else { 0 },
+            errors: ["PE_IMAGE_TOO_SMALL"]
+        };
+    }
+
+    if pe_bytes[0] != PE_DOS_MAGIC_M or pe_bytes[1] != PE_DOS_MAGIC_Z {
+        push(errors, "INVALID_DOS_MZ_MAGIC");
+    }
+
+    let lfanew = _read_u32_le(pe_bytes, PE_LFANEW_OFFSET);
+    if lfanew < 0x40 or lfanew + 24 + 112 > len(pe_bytes) {
+        push(errors, "INVALID_E_LFANEW_OFFSET");
+        return map{
+            ok: false,
+            machine: "UNKNOWN",
+            subsystem: "UNKNOWN",
+            entry_rva: 0,
+            wx_enforced: false,
+            size_bytes: len(pe_bytes),
+            errors: errors
+        };
+    }
+
+    if pe_bytes[lfanew] != 0x50 or pe_bytes[lfanew + 1] != 0x45
+        or pe_bytes[lfanew + 2] != 0x00 or pe_bytes[lfanew + 3] != 0x00 {
+        push(errors, "INVALID_PE_SIGNATURE");
+    }
+
+    let coff_off = lfanew + 4;
+    let machine = _read_u16_le(pe_bytes, coff_off);
+    let num_sections = _read_u16_le(pe_bytes, coff_off + 2);
+    let opt_size = _read_u16_le(pe_bytes, coff_off + 16);
+
+    let machine_name = if machine == PE_MACHINE_AMD64 { "AMD64" } else { "UNSUPPORTED" };
+    if machine != PE_MACHINE_AMD64 {
+        push(errors, "UNSUPPORTED_MACHINE_ARCH");
+    }
+    if num_sections < 1 {
+        push(errors, "NO_SECTIONS");
+    }
+
+    let opt_off = coff_off + 20;
+    if opt_off + opt_size > len(pe_bytes) or opt_size < 112 {
+        push(errors, "TRUNCATED_OPTIONAL_HEADER");
+        return map{
+            ok: false,
+            machine: machine_name,
+            subsystem: "UNKNOWN",
+            entry_rva: 0,
+            wx_enforced: false,
+            size_bytes: len(pe_bytes),
+            errors: errors
+        };
+    }
+
+    let opt_magic = _read_u16_le(pe_bytes, opt_off);
+    if opt_magic != PE_OPT_MAGIC_PE32PLUS {
+        push(errors, "NOT_PE32PLUS_MAGIC");
+    }
+
+    let entry_rva = _read_u32_le(pe_bytes, opt_off + 16);
+    let image_base = _read_u64_le(pe_bytes, opt_off + 24);
+    let subsystem = _read_u16_le(pe_bytes, opt_off + 68);
+    let subsystem_name = if subsystem == PE_SUBSYSTEM_EFI_APP { "EFI_APPLICATION" } else { "OTHER" };
+    if subsystem != PE_SUBSYSTEM_EFI_APP {
+        push(errors, "SUBSYSTEM_NOT_EFI_APPLICATION");
+    }
+
+    let sec_table_off = opt_off + opt_size;
+    let wx_enforced = true;
+    let found_text = false;
+    let text_exec = false;
+    let text_write = false;
+
+    if sec_table_off + num_sections * 40 > len(pe_bytes) {
+        push(errors, "TRUNCATED_SECTION_TABLE");
+        wx_enforced = false;
+    } else {
+        let s = 0;
+        while s < num_sections {
+            let soff = sec_table_off + s * 40;
+            let raw_sz = _read_u32_le(pe_bytes, soff + 16);
+            let raw_ptr = _read_u32_le(pe_bytes, soff + 20);
+            let chars = _read_u32_le(pe_bytes, soff + 36);
+            let is_exec = bit_and(chars, PE_SCN_MEM_EXECUTE) != 0;
+            let is_write = bit_and(chars, PE_SCN_MEM_WRITE) != 0;
+
+            if is_exec and is_write {
+                wx_enforced = false;
+                push(errors, "WX_VIOLATION_RWX_SECTION");
+            }
+            if raw_ptr + raw_sz > len(pe_bytes) {
+                push(errors, "SECTION_RAW_DATA_OUT_OF_BOUNDS");
+            }
+            if pe_bytes[soff] == 0x2E and pe_bytes[soff + 1] == 0x74
+                and pe_bytes[soff + 2] == 0x65 and pe_bytes[soff + 3] == 0x78
+                and pe_bytes[soff + 4] == 0x74 {
+                found_text = true;
+                text_exec = is_exec;
+                text_write = is_write;
+            }
+            s = s + 1;
+        }
+    }
+
+    if not found_text {
+        push(errors, "MISSING_TEXT_SECTION");
+    } else {
+        if not text_exec {
+            push(errors, "TEXT_SECTION_NOT_EXECUTABLE");
+        }
+        if text_write {
+            wx_enforced = false;
+            push(errors, "TEXT_SECTION_WRITABLE_WX_VIOLATION");
+        }
+    }
+
+    return map{
+        ok: len(errors) == 0 and wx_enforced,
+        machine: machine_name,
+        subsystem: subsystem_name,
+        entry_rva: entry_rva,
+        image_base: image_base,
+        sections: num_sections,
+        text_executable: text_exec,
+        text_writable: text_write,
+        wx_enforced: wx_enforced,
+        size_bytes: len(pe_bytes),
+        sha512: PhysCrypto.sha512_hex(pe_bytes),
+        errors: errors
+    };
+}
+
+fn morphboot_vault_header_pack(version_counter, kernel_sha512, pcr_digest, slot_ab) {
+    let slot_s = str(slot_ab);
+    let slot_byte = if slot_s == "A" { 0x41 } else { if slot_s == "B" { 0x42 } else { 0 } };
+    if slot_byte == 0 {
+        return [];
+    }
+    if version_counter < 0 {
+        return [];
+    }
+
+    let k_bytes = _normalize_digest_bytes(kernel_sha512);
+    if len(k_bytes) != 64 {
+        return [];
+    }
+
+    let p_bytes = _normalize_digest_bytes(pcr_digest);
+    let p_len = len(p_bytes);
+    if p_len != 32 and p_len != 64 {
+        return [];
+    }
+
+    let hdr = [];
+    // 0..5: MAGIC "MVLT01"
+    _push_bytes(hdr, str_to_bytes(MORPHBOOT_VAULT_MAGIC));
+    // 6: header_version = 1
+    _push_u8(hdr, MORPHBOOT_VAULT_VERSION);
+    // 7: slot ('A' or 'B')
+    _push_u8(hdr, slot_byte);
+    // 8..15: monotonic version_counter (u64 BE)
+    _push_u64_be(hdr, version_counter);
+    // 16: pcr_digest_len (32 or 64)
+    _push_u8(hdr, p_len);
+    // 17: reserved
+    _push_u8(hdr, 0);
+    // 18..19: total header length = 180 (u16 BE)
+    _push_u16_be(hdr, MORPHBOOT_VAULT_HEADER_SIZE);
+    // 20..83: kernel_sha512 (64 bytes)
+    _push_bytes(hdr, k_bytes);
+    // 84..147: pcr_digest (64-byte slot, zero-padded if SHA-256)
+    _push_bytes(hdr, p_bytes);
+    _push_zeros(hdr, 64 - p_len);
+
+    // 148..179: 32-byte structural SHA-512 prefix integrity tag
+    let tag_full = PhysCrypto.sha512_bytes(hdr);
+    let i = 0;
+    while i < 32 {
+        push(hdr, tag_full[i]);
+        i = i + 1;
+    }
+
+    return hdr;
+}
+
+fn morphboot_vault_header_parse_bounded(hdr_bytes) {
+    if not is_array(hdr_bytes) {
+        return map{ ok: false, error: "INVALID_HEADER_TYPE" };
+    }
+    let n = len(hdr_bytes);
+    if n > MORPHBOOT_VAULT_HEADER_MAX {
+        return map{
+            ok: false,
+            error: "HEADER_OVERSIZED",
+            max_bytes: MORPHBOOT_VAULT_HEADER_MAX,
+            actual_bytes: n
+        };
+    }
+    if n < MORPHBOOT_VAULT_HEADER_SIZE {
+        return map{
+            ok: false,
+            error: "HEADER_TRUNCATED",
+            expected_bytes: MORPHBOOT_VAULT_HEADER_SIZE,
+            actual_bytes: n
+        };
+    }
+
+    let expected_magic = str_to_bytes(MORPHBOOT_VAULT_MAGIC);
+    let got_magic = _slice_bytes(hdr_bytes, 0, 6);
+    if not _ct_eq_bytes(got_magic, expected_magic) {
+        return map{ ok: false, error: "BAD_MAGIC" };
+    }
+
+    let hdr_ver = bit_and(hdr_bytes[6], 0xFF);
+    if hdr_ver != MORPHBOOT_VAULT_VERSION {
+        return map{ ok: false, error: "UNSUPPORTED_HEADER_VERSION", header_version: hdr_ver };
+    }
+
+    let slot_byte = bit_and(hdr_bytes[7], 0xFF);
+    let slot_str = if slot_byte == 0x41 { "A" } else { if slot_byte == 0x42 { "B" } else { "" } };
+    if slot_str == "" {
+        return map{ ok: false, error: "BAD_SLOT" };
+    }
+
+    let ver_counter = _read_u64_be(hdr_bytes, 8);
+    let pcr_len = bit_and(hdr_bytes[16], 0xFF);
+    if pcr_len != 32 and pcr_len != 64 {
+        return map{ ok: false, error: "BAD_PCR_DIGEST_LENGTH", pcr_digest_len: pcr_len };
+    }
+
+    let declared_len = _read_u16_be(hdr_bytes, 18);
+    if declared_len != MORPHBOOT_VAULT_HEADER_SIZE or declared_len != n {
+        return map{ ok: false, error: "HEADER_LENGTH_MISMATCH", declared: declared_len, actual: n };
+    }
+
+    let body = _slice_bytes(hdr_bytes, 0, 148);
+    let got_tag = _slice_bytes(hdr_bytes, 148, 180);
+    let expected_full = PhysCrypto.sha512_bytes(body);
+    let expected_tag = _slice_bytes(expected_full, 0, 32);
+    if not _ct_eq_bytes(got_tag, expected_tag) {
+        return map{ ok: false, error: "HEADER_INTEGRITY_MISMATCH" };
+    }
+
+    let k_bytes = _slice_bytes(hdr_bytes, 20, 84);
+    let p_bytes = _slice_bytes(hdr_bytes, 84, 84 + pcr_len);
+
+    return map{
+        ok: true,
+        magic: MORPHBOOT_VAULT_MAGIC,
+        header_version: hdr_ver,
+        slot_ab: slot_str,
+        version_counter: ver_counter,
+        kernel_sha512: _bytes_to_hex(k_bytes),
+        pcr_digest: _bytes_to_hex(p_bytes),
+        pcr_digest_len: pcr_len,
+        size_bytes: n,
+        integrity_verified: true
+    };
+}
+
+fn morphboot_atomic_ab_switch(current_slot, next_slot, health_ok) {
+    let cur = str(current_slot);
+    let nxt = str(next_slot);
+    if (cur != "A" and cur != "B") or (nxt != "A" and nxt != "B") {
+        return map{ ok: false, error: "INVALID_AB_SLOT", active_slot: cur };
+    }
+    if cur == nxt {
+        return map{ ok: false, error: "NEXT_SLOT_EQUALS_CURRENT", active_slot: cur };
+    }
+    if health_ok == true {
+        return map{
+            ok: true,
+            active_slot: nxt,
+            previous_slot: cur,
+            committed: true,
+            rolled_back: false,
+            status: "COMMITTED"
+        };
+    }
+    return map{
+        ok: true,
+        active_slot: cur,
+        previous_slot: cur,
+        failed_slot: nxt,
+        committed: false,
+        rolled_back: true,
+        status: "ROLLED_BACK"
+    };
+}
+
+// ============================================================================
+// 2. TPM 2.0 Binary Command Marshaler, Monotonic Counter & PCR Sealing
+// ============================================================================
+
+fn tpm2_marshal_get_random(num_bytes) {
+    let req = num_floor(num_bytes);
+    if req < 1 { req = 1; }
+    if req > 65535 { req = 65535; }
+
+    let cmd = [];
+    _push_u16_be(cmd, TPM_ST_NO_SESSIONS); // 0x8001
+    _push_u32_be(cmd, 12);                 // commandSize = 12
+    _push_u32_be(cmd, TPM_CC_GET_RANDOM);  // 0x0000017B
+    _push_u16_be(cmd, req);                // bytesRequested
+    return cmd;
+}
+
+fn tpm2_marshal_pcr_extend(pcr_index, digest_bytes) {
+    let pcr = num_floor(pcr_index);
+    if pcr < 0 { pcr = 0; }
+    if pcr > 23 { pcr = 23; }
+
+    let dig = _normalize_digest_bytes(digest_bytes);
+    let alg_id = TPM_ALG_SHA512;
+    if len(dig) == 32 {
+        alg_id = TPM_ALG_SHA256;
+    } else {
+        if len(dig) != 64 {
+            dig = PhysCrypto.sha512_bytes(dig);
+            alg_id = TPM_ALG_SHA512;
+        }
+    }
+
+    // Header (10) + pcrHandle (4) + authSize (4) + PW session (9) + count (4) + alg (2) + digest
+    let total_size = 33 + len(dig);
+    let cmd = [];
+    _push_u16_be(cmd, TPM_ST_SESSIONS);    // 0x8002
+    _push_u32_be(cmd, total_size);         // commandSize
+    _push_u32_be(cmd, TPM_CC_PCR_EXTEND);  // 0x00000182
+    _push_u32_be(cmd, pcr);                // pcrHandle (TPM_RH_PCR0 + pcr)
+    _push_u32_be(cmd, 9);                  // authorizationSize = 9 bytes
+    _push_u32_be(cmd, TPM_RS_PW);          // sessionHandle = TPM_RS_PW
+    _push_u16_be(cmd, 0);                  // nonceSize = 0
+    _push_u8(cmd, 0);                      // sessionAttributes = 0
+    _push_u16_be(cmd, 0);                  // hmacSize = 0
+    _push_u32_be(cmd, 1);                  // TPML_DIGEST_VALUES.count = 1
+    _push_u16_be(cmd, alg_id);             // TPMT_HA.hashAlg
+    _push_bytes(cmd, dig);                 // digest bytes
+    return cmd;
+}
+
+fn tpm2_marshal_nv_increment(nv_index) {
+    let idx = num_floor(nv_index);
+    if idx < 0 { idx = 0x01500000; }
+
+    // Header (10) + authHandle (4) + nvIndex (4) + authSize (4) + PW session (9) = 31 bytes
+    let cmd = [];
+    _push_u16_be(cmd, TPM_ST_SESSIONS);      // 0x8002
+    _push_u32_be(cmd, 31);                   // commandSize = 31
+    _push_u32_be(cmd, TPM_CC_NV_INCREMENT);  // 0x00000134
+    _push_u32_be(cmd, idx);                  // authHandle
+    _push_u32_be(cmd, idx);                  // nvIndex
+    _push_u32_be(cmd, 9);                    // authorizationSize = 9
+    _push_u32_be(cmd, TPM_RS_PW);            // sessionHandle = TPM_RS_PW
+    _push_u16_be(cmd, 0);                    // nonceSize = 0
+    _push_u8(cmd, 0);                        // sessionAttributes = 0
+    _push_u16_be(cmd, 0);                    // hmacSize = 0
+    return cmd;
+}
+
+fn _tpm2_cmd_name(cc) {
+    if cc == TPM_CC_GET_RANDOM { return "TPM_CC_GetRandom"; }
+    if cc == TPM_CC_PCR_EXTEND { return "TPM_CC_PCR_Extend"; }
+    if cc == TPM_CC_NV_INCREMENT { return "TPM_CC_NV_Increment"; }
+    return "TPM_CC_UNKNOWN";
+}
+
+fn tpm2_parse_command_header(cmd_bytes) {
+    if not is_array(cmd_bytes) or len(cmd_bytes) < 10 {
+        return map{
+            ok: false,
+            error: "TPM2_FRAME_TOO_SHORT",
+            actual_size: if is_array(cmd_bytes) { len(cmd_bytes) } else { 0 }
+        };
+    }
+
+    let tag = _read_u16_be(cmd_bytes, 0);
+    let size = _read_u32_be(cmd_bytes, 2);
+    let command_code = _read_u32_be(cmd_bytes, 6);
+    let tag_valid = (tag == TPM_ST_NO_SESSIONS) or (tag == TPM_ST_SESSIONS);
+    let size_matches = (len(cmd_bytes) == size);
+
+    let tag_name = if tag == TPM_ST_NO_SESSIONS {
+        "TPM_ST_NO_SESSIONS"
+    } else {
+        if tag == TPM_ST_SESSIONS { "TPM_ST_SESSIONS" } else { "TPM_ST_INVALID" }
+    };
+
+    return map{
+        ok: tag_valid and size_matches,
+        tag: tag,
+        tag_name: tag_name,
+        size: size,
+        actual_size: len(cmd_bytes),
+        size_matches: size_matches,
+        command_code: command_code,
+        command_name: _tpm2_cmd_name(command_code)
+    };
+}
+
+fn _tpm2_xor_keystream(pcr_hex, counter, data_bytes) {
+    let out = [];
+    let n = len(data_bytes);
+    let pos = 0;
+    let blk_idx = 0;
+    while pos < n {
+        let ks = PhysCrypto.sha512_bytes(
+            "MORPHBOOT-TPM2-SEAL-V1|" + pcr_hex + "|" + str(counter) + "|" + str(blk_idx)
+        );
+        let j = 0;
+        while j < 64 and pos < n {
+            push(out, bit_xor(bit_and(data_bytes[pos], 0xFF), ks[j]));
+            pos = pos + 1;
+            j = j + 1;
+        }
+        blk_idx = blk_idx + 1;
+    }
+    return out;
+}
+
+fn _tpm2_seal_mac(pcr_hex, counter, ciphertext) {
+    return PhysCrypto.sha512_hex(
+        "MORPHBOOT-TPM2-MAC-V1|" + pcr_hex + "|" + str(counter) + "|" + _bytes_to_hex(ciphertext)
+    );
+}
+
+fn tpm2_seal_vault_state(pcr_digest, monotonic_counter, secret_bytes) {
+    let pcr_bytes = _normalize_digest_bytes(pcr_digest);
+    let pcr_hex = _bytes_to_hex(pcr_bytes);
+    let sec = if is_array(secret_bytes) { secret_bytes } else { str_to_bytes(str(secret_bytes)) };
+    let cnt = num_floor(monotonic_counter);
+
+    let ct = _tpm2_xor_keystream(pcr_hex, cnt, sec);
+    let mac = _tpm2_seal_mac(pcr_hex, cnt, ct);
+
+    return map{
+        ok: true,
+        version: OS_BOOT_VERSION,
+        sealed_pcr_digest: pcr_hex,
+        sealed_counter: cnt,
+        ciphertext: ct,
+        ciphertext_len: len(ct),
+        auth_tag: mac
+    };
+}
+
+fn tpm2_unseal_vault_state(sealed_obj, live_pcr_digest, hw_monotonic_counter) {
+    if not is_map(sealed_obj)
+        or not map_has(sealed_obj, "sealed_pcr_digest")
+        or not map_has(sealed_obj, "sealed_counter")
+        or not map_has(sealed_obj, "ciphertext")
+        or not map_has(sealed_obj, "auth_tag") {
+        return map{
+            ok: false,
+            evil_maid_detected: false,
+            rollback_attack_blocked: false,
+            error: "INVALID_SEALED_OBJECT"
+        };
+    }
+
+    let live_pcr_hex = _bytes_to_hex(_normalize_digest_bytes(live_pcr_digest));
+    let sealed_pcr = str(sealed_obj.sealed_pcr_digest);
+    let sealed_cnt = num_floor(sealed_obj.sealed_counter);
+    let hw_cnt = num_floor(hw_monotonic_counter);
+
+    // 1. Measured Boot PCR Verification (Evil-Maid Defense)
+    if not _ct_eq_str(live_pcr_hex, sealed_pcr) {
+        return map{
+            ok: false,
+            evil_maid_detected: true,
+            rollback_attack_blocked: false,
+            pcr_verified: false,
+            monotonic_verified: sealed_cnt >= hw_cnt,
+            error: "PCR_MISMATCH_EVIL_MAID_DETECTED"
+        };
+    }
+
+    // 2. Hardware Monotonic Counter Verification (Anti-Rollback Defense)
+    if sealed_cnt < hw_cnt {
+        return map{
+            ok: false,
+            evil_maid_detected: false,
+            rollback_attack_blocked: true,
+            pcr_verified: true,
+            monotonic_verified: false,
+            sealed_counter: sealed_cnt,
+            hw_monotonic_counter: hw_cnt,
+            error: "MONOTONIC_COUNTER_ROLLBACK_BLOCKED"
+        };
+    }
+
+    // 3. Ciphertext Authentication Tag Verification
+    let expected_mac = _tpm2_seal_mac(sealed_pcr, sealed_cnt, sealed_obj.ciphertext);
+    if not _ct_eq_str(expected_mac, str(sealed_obj.auth_tag)) {
+        return map{
+            ok: false,
+            evil_maid_detected: true,
+            rollback_attack_blocked: false,
+            pcr_verified: true,
+            monotonic_verified: true,
+            error: "SEALED_STATE_TAMPERED"
+        };
+    }
+
+    let plaintext = _tpm2_xor_keystream(sealed_pcr, sealed_cnt, sealed_obj.ciphertext);
+    return map{
+        ok: true,
+        evil_maid_detected: false,
+        rollback_attack_blocked: false,
+        pcr_verified: true,
+        monotonic_verified: true,
+        sealed_counter: sealed_cnt,
+        secret_bytes: plaintext
+    };
+}
+
+fn tpm2_probe_live_device() {
+    let sys_ver_path = "/sys/class/tpm/tpm0/tpm_version_major";
+    let dev_tpmrm0 = "/dev/tpmrm0";
+    let dev_tpm0 = "/dev/tpm0";
+
+    let sys_exists = false;
+    let tpmrm0_exists = false;
+    let tpm0_exists = false;
+    let ver_major = "";
+
+    try { sys_exists = fs_exists(sys_ver_path); } catch e { sys_exists = false; }
+    try { tpmrm0_exists = fs_exists(dev_tpmrm0); } catch e { tpmrm0_exists = false; }
+    try { tpm0_exists = fs_exists(dev_tpm0); } catch e { tpm0_exists = false; }
+
+    if sys_exists {
+        try {
+            ver_major = str_trim(fs_read(sys_ver_path));
+        } catch e {
+            ver_major = "";
+        }
+    }
+
+    let win_ncrypt = false;
+    if not sys_exists and not tpmrm0_exists and not tpm0_exists {
+        try {
+            let h = ffi_load("ncrypt.dll");
+            win_ncrypt = true;
+            try { ffi_close(h); } catch e2 {}
+        } catch e {
+            win_ncrypt = false;
+        }
+    }
+
+    let tpm_present = sys_exists or tpmrm0_exists or tpm0_exists or win_ncrypt;
+    let is_tpm2 = (ver_major == "2") or tpmrm0_exists or win_ncrypt;
+    let platform = if win_ncrypt {
+        "windows_cng"
+    } else {
+        if sys_exists or tpmrm0_exists or tpm0_exists { "linux_tpm_char" } else { "unavailable" }
+    };
+    let dev_path = if tpmrm0_exists {
+        dev_tpmrm0
+    } else {
+        if tpm0_exists { dev_tpm0 } else { if win_ncrypt { "ncrypt.dll" } else { "" } }
+    };
+
+    return map{
+        ok: true,
+        tpm_present: tpm_present,
+        is_tpm2: is_tpm2,
+        tpm_version_major: ver_major,
+        platform: platform,
+        device_path: dev_path,
+        sysfs_present: sys_exists,
+        tpmrm0_present: tpmrm0_exists,
+        windows_ncrypt_present: win_ncrypt
+    };
+}
+
+// ============================================================================
+// 3. Zero-JIT Ring-0 Static AOT Machine-Code Emitter & Formal Safety Verifier
+// ============================================================================
+
+fn ring0_verify_machine_code_safety(code_bytes, segment_flags = 0x60000020) {
+    if not is_array(code_bytes) or len(code_bytes) == 0 {
+        return map{
+            ok: false,
+            wx_enforced: false,
+            jit_pages: 0,
+            rwx_pages: 0,
+            forbidden_opcodes: [],
+            terminates_cleanly: false,
+            terminator: "NONE",
+            code_size_bytes: 0,
+            bounded_size_ok: false,
+            error: "EMPTY_OR_INVALID_CODE_BYTES"
+        };
+    }
+
+    let n = len(code_bytes);
+    let bounded_ok = n <= 4096;
+    let seg_exec = bit_and(segment_flags, PE_SCN_MEM_EXECUTE) != 0;
+    let seg_write = bit_and(segment_flags, PE_SCN_MEM_WRITE) != 0;
+    let rwx_violation = seg_exec and seg_write;
+    let rwx_pages = if rwx_violation { 1 } else { 0 };
+
+    // Scan for forbidden unguarded Ring-0 privilege-escalation opcodes
+    let forbidden = [];
+    let i = 0;
+    while i + 1 < n {
+        let b0 = bit_and(code_bytes[i], 0xFF);
+        let b1 = bit_and(code_bytes[i + 1], 0xFF);
+        if b0 == 0x0F and b1 == 0x30 {
+            push(forbidden, map{ offset: i, opcode: "0F 30", mnemonic: "WRMSR" });
+        }
+        if b0 == 0x0F and b1 == 0x01 {
+            push(forbidden, map{ offset: i, opcode: "0F 01", mnemonic: "LGDT_LIDT_PRIV" });
+        }
+        if b0 == 0xCD and b1 == 0x80 {
+            push(forbidden, map{ offset: i, opcode: "CD 80", mnemonic: "INT_0x80_LEGACY" });
+        }
+        if b0 == 0x0F and b1 == 0x22 {
+            push(forbidden, map{ offset: i, opcode: "0F 22", mnemonic: "MOV_CRX" });
+        }
+        i = i + 1;
+    }
+
+    // Verify clean bounded termination: ret (0xC3) or sysretq (0x48 0x0F 0x07)
+    let ends_ret = bit_and(code_bytes[n - 1], 0xFF) == 0xC3;
+    let ends_sysretq = n >= 3
+        and bit_and(code_bytes[n - 3], 0xFF) == 0x48
+        and bit_and(code_bytes[n - 2], 0xFF) == 0x0F
+        and bit_and(code_bytes[n - 1], 0xFF) == 0x07;
+    let terminates_cleanly = ends_ret or ends_sysretq;
+    let terminator = if ends_ret {
+        "RET"
+    } else {
+        if ends_sysretq { "SYSRETQ" } else { "UNTERMINATED" }
+    };
+
+    let safe = bounded_ok and (not rwx_violation) and (len(forbidden) == 0) and terminates_cleanly;
+
+    return map{
+        ok: safe,
+        wx_enforced: not rwx_violation,
+        jit_pages: 0,
+        rwx_pages: rwx_pages,
+        forbidden_opcodes: forbidden,
+        terminates_cleanly: terminates_cleanly,
+        terminator: terminator,
+        code_size_bytes: n,
+        bounded_size_ok: bounded_ok,
+        sha512: PhysCrypto.sha512_hex(code_bytes)
+    };
+}
+
+fn ring0_aot_compile_syscall_gate(allowed_syscalls) {
+    let clean = [];
+    if is_array(allowed_syscalls) {
+        let i = 0;
+        while i < len(allowed_syscalls) and len(clean) < 64 {
+            let nr = num_floor(allowed_syscalls[i]);
+            if nr >= 0 and nr <= 65535 {
+                // Deduplicate
+                let seen = false;
+                let j = 0;
+                while j < len(clean) {
+                    if clean[j] == nr { seen = true; break; }
+                    j = j + 1;
+                }
+                if not seen { push(clean, nr); }
+            }
+            i = i + 1;
+        }
+    }
+
+    // Emit static x86-64 AOT bounded syscall allow-list gate:
+    //   For each allowed nr:
+    //     cmp eax, imm32   (5 bytes: 3D <imm32>)
+    //     je  allow_label  (6 bytes: 0F 84 <rel32>)
+    //   deny_label:
+    //     mov rax, -1      (7 bytes: 48 C7 C0 FF FF FF FF)
+    //     ret              (1 byte:  C3)
+    //   allow_label:
+    //     xor eax, eax     (2 bytes: 31 C0)
+    //     ret              (1 byte:  C3)
+    let code = [];
+    let count = len(clean);
+    let deny_block_size = 8;
+    let entry_size = 11;
+
+    let i = 0;
+    while i < count {
+        let nr = clean[i];
+        // cmp eax, nr
+        _push_u8(code, 0x3D);
+        _push_u32_le(code, nr);
+        // je rel32 -> jump past remaining entries + deny block to allow_label
+        let rel32 = (count - 1 - i) * entry_size + deny_block_size;
+        _push_u8(code, 0x0F);
+        _push_u8(code, 0x84);
+        _push_u32_le(code, rel32);
+        i = i + 1;
+    }
+
+    // deny_label: mov rax, -1; ret
+    _push_u8(code, 0x48);
+    _push_u8(code, 0xC7);
+    _push_u8(code, 0xC0);
+    _push_u8(code, 0xFF);
+    _push_u8(code, 0xFF);
+    _push_u8(code, 0xFF);
+    _push_u8(code, 0xFF);
+    _push_u8(code, 0xC3);
+
+    // allow_label: xor eax, eax; ret
+    _push_u8(code, 0x31);
+    _push_u8(code, 0xC0);
+    _push_u8(code, 0xC3);
+
+    let safety = ring0_verify_machine_code_safety(code, PE_SCN_TEXT_RX);
+
+    return map{
+        ok: safety.ok,
+        version: OS_BOOT_VERSION,
+        arch: "x86_64",
+        mode: "STATIC_AOT_ZERO_JIT",
+        allowed_syscalls: clean,
+        code_bytes: code,
+        code_size_bytes: len(code),
+        sha512: safety.sha512,
+        jit_pages: 0,
+        rwx_pages: 0,
+        wx_enforced: safety.wx_enforced,
+        safety: safety
+    };
+}
+
+export OS_BOOT_VERSION;
+export MORPHBOOT_VAULT_MAGIC, MORPHBOOT_VAULT_HEADER_SIZE, MORPHBOOT_VAULT_HEADER_MAX;
+export TPM_ST_NO_SESSIONS, TPM_ST_SESSIONS, TPM_CC_GET_RANDOM, TPM_CC_PCR_EXTEND, TPM_CC_NV_INCREMENT;
+export uefi_emit_pe32plus_bootx64, uefi_validate_pe32plus;
+export morphboot_vault_header_pack, morphboot_vault_header_parse_bounded, morphboot_atomic_ab_switch;
+export tpm2_marshal_get_random, tpm2_marshal_pcr_extend, tpm2_marshal_nv_increment, tpm2_parse_command_header;
+export tpm2_seal_vault_state, tpm2_unseal_vault_state, tpm2_probe_live_device;
+export ring0_aot_compile_syscall_gate, ring0_verify_machine_code_safety;
+

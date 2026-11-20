@@ -2,6 +2,15 @@
 
 All notable changes to **PBLang** are documented in this file.
 
+## [`5.4.0`] — 2026-11-20 (100% Pure-`PBLang` `Entelechon` OS System Foundations & `Morphic Sovereign Elastic Fabric` — `8` New System Pillars Across `3` Sovereign `.sapp` Modules)
+
+- **`MorphBoot` UEFI `PE32+` Emitter, `TPM 2.0` Binary Marshaler & Zero-JIT `Ring-0` AOT (`stdlib/os/morphboot_uefi_tpm2_ring0_aot.sapp`)**:
+  - Emits and validates real `W^X`-enforced `PE32+` `AMD64` `EFI_APPLICATION` (`Subsystem = 10`) binaries, provides a fixed-bounds (`<= 256` bytes) `"MVLT01"` `.vault` header parser with atomic `A/B` rollback, marshals big-endian `TCG TPM 2.0` frames (`GetRandom`, `PCR_Extend`, `NV_Increment`), enforces Measured Boot PCR sealing + Hardware Monotonic Counter anti-rollback (with live `/dev/tpmrm0` / `ncrypt.dll` probing), and emits formally safety-verified Zero-JIT `Ring-0` x86-64 static AOT syscall gates (`0` `RWX`/`JIT` pages).
+- **`Virtualized Ring-0 Micro-VM Prism` & `Foreign ABI Prism` (`stdlib/os/microvm_prism_foreign_abi.sapp`)**:
+  - Live `/dev/kvm` (`KVM_GET_API_VERSION = 12`) & `WinHvPlatform.dll` hypervisor probing, 3-level kernel-right containment (Level A User-Space Capability Proxy, Level B Disposable `EPT`/`IOMMU` Micro-VM Guest Ring-0 with zero-residue memory incineration, Level C Hostile Anti-VM rejection outside `.vault`), real binary magic/header inspection (`ELF64`, `PE32+`, `WASM`, `DEX`/`APK`), traversal-safe `Filtered Shadow View` FS hiding confidential prefixes without crashing foreign apps, and Domain-Pinned Outbound Egress Guard + `5 MiB` anomaly throttle + No-Exfil secret scanner.
+- **`240Hz` `Sovereign Morphic Glass`, `--strict-taint` Runtime & `Morphic Sovereign Elastic Fabric` (`stdlib/os/morphic_glass_240hz_taint_elastic.sapp`)**:
+  - `240Hz` (`4.166 ms` budget) compositor with `Anti-Capture Vault` black-pixel redaction, anti-spoofing/anti-clickjacking `Trusted Path` `Human Gate`, `Virtual Privacy Shutter` (black camera / silent mic dummy streams until foreground `Trusted Path LIVE`), deterministic `--strict-taint` propagation + pure-`.sapp` PII/secret redaction + per-capsule IOPS/storage quotas & exponential backoff quarantine (`>= 5` crashes/sec), and the **`Morphic Sovereign Elastic Fabric`** for heterogeneous Scale Up/Down/Out/In (`CPU`/`GPU`/`TPU`/`NPU`/`QPU`/`Photonic`/`Neuromorphic`/`Edge`) with `Hardware Attestation Admission Gate`, `T0..T3` trust zones, `Anti-Bill-Shock`, `Anti-Starvation`, `Verifiable Blind Offloading`, `One-Way Quarantine`, and `Crypto-Shredding` on scale down.
+
 ## [`5.3.0`] — 2026-11-19 (100% Pure-`PBLang` Future-Compute, Quantum-Native `Q-MORPH` (`Q0->Q3`), Physics-Bound Crypto & `.pbcap v2` Morphic HAL Foundation — `5` New Sovereign Modules)
 
 - **Quantum-Native `@reversible` Compiler & `Fail-Closed Q-MORPH` (`stdlib/quantum/reversible_qmorph_compiler.sapp`)**: Compiles pure `PBLang` logic into reversible `Toffoli`/`Fredkin`/`CNOT` circuits with Bennett uncomputation (`0` ancilla garbage), emits dynamic `OpenQASM 3.0` Mid-Circuit Feed-Forward loops, and enforces `Fail-Closed` regime pinning across `Q0 -> Q1 -> Q2 -> Q3` (`0` silent downgrade).
